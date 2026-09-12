@@ -63,13 +63,55 @@ Column {
   // before the machinery behind them.
   readonly property var categoryOrder: ["Bar widgets", "Panels", "Overlays", "Services", "Menus", "Bars", "Other"]
 
+  // Categories present under the CURRENT source filter, with their counts.
+  //
+  // Counted from the source-filtered set, not from every plugin: picking
+  // "Omarchy" left chips for categories that only contain third-party plugins,
+  // so half the row selected an empty list. A chip that leads nowhere is worse
+  // than a missing chip — it reads as "nothing installed here" rather than
+  // "filtered out by the choice you just made".
   readonly property var categories: {
-    var seen = {}
-    for (var i = 0; i < plugins.length; i++) seen[String(plugins[i].category || "Other")] = true
+    var counts = {}
+    for (var i = 0; i < plugins.length; i++) {
+      var p = plugins[i]
+      if (root.source === "omarchy" && !p.firstParty) continue
+      if (root.source === "addons" && p.firstParty) continue
+      var c = String(p.category || "Other")
+      counts[c] = (counts[c] || 0) + 1
+    }
     var out = []
-    for (var j = 0; j < categoryOrder.length; j++) if (seen[categoryOrder[j]]) out.push(categoryOrder[j])
-    for (var k in seen) if (out.indexOf(k) === -1) out.push(k)
+    for (var j = 0; j < categoryOrder.length; j++) {
+      var k = categoryOrder[j]
+      if (counts[k]) out.push({ name: k, count: counts[k] })
+    }
+    for (var extra in counts) {
+      var known = false
+      for (var m = 0; m < out.length; m++) if (out[m].name === extra) known = true
+      if (!known) out.push({ name: extra, count: counts[extra] })
+    }
     return out
+  }
+
+  // A category that vanishes when the source changes must not stay selected,
+  // or the list shows nothing with no visible reason why.
+  onSourceChanged: {
+    if (root.category === "") return
+    for (var i = 0; i < root.categories.length; i++) {
+      if (root.categories[i].name === root.category) return
+    }
+    root.category = ""
+  }
+
+  // How many the source filter alone leaves, for the "All" chip.
+  readonly property int shownPluginsForSource: {
+    var n = 0
+    for (var i = 0; i < plugins.length; i++) {
+      var p = plugins[i]
+      if (root.source === "omarchy" && !p.firstParty) continue
+      if (root.source === "addons" && p.firstParty) continue
+      n++
+    }
+    return n
   }
 
   readonly property var shownPlugins: {
@@ -176,7 +218,7 @@ Column {
       spacing: Style.space(4)
 
       Button {
-        text: "All"
+        text: "All " + root.shownPluginsForSource
         selected: root.category === ""
         foreground: root.category === "" ? root.accent : root.dim
         fontFamily: root.fontFamily
@@ -188,11 +230,13 @@ Column {
 
         Button {
           required property var modelData
-          text: String(modelData)
-          selected: root.category === String(modelData)
-          foreground: root.category === String(modelData) ? root.accent : root.dim
+          // The count on the chip answers "is it worth opening" before the
+          // click, which is most of what a filter row is for.
+          text: modelData.name + " " + modelData.count
+          selected: root.category === modelData.name
+          foreground: root.category === modelData.name ? root.accent : root.dim
           fontFamily: root.fontFamily
-          onClicked: { root.touched(); root.category = String(modelData) }
+          onClicked: { root.touched(); root.category = modelData.name }
         }
       }
     }

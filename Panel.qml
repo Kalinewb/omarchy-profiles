@@ -98,10 +98,24 @@ Panel {
   readonly property string catalogPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/plugins.json"
 
-  // A misclick on the bar should not leave this sitting open. Any interaction
-  // restarts the countdown, so it only closes when genuinely untouched.
-  readonly property int idleCloseMs: 8000
-  function keepAlive() { if (root.opened) idleClose.restart() }
+  // The auto-close exists for one case only: a misclick on the bar icon, which
+  // should not leave a panel sitting open.
+  //
+  // It used to restart on interaction instead, which closed the panel while it
+  // was being read — scrolling a sixty-row plugin list and hovering rows are
+  // not things that were calling keepAlive, so eight seconds of reading looked
+  // exactly like eight seconds of absence. Tracking every kind of interaction
+  // is the wrong fix; the question is not "have you touched it recently" but
+  // "did you mean to open it at all".
+  //
+  // So the timer is armed on open and cancelled for good by the first
+  // interaction of any kind. After that the panel stays until it is closed.
+  readonly property int idleCloseMs: 12000
+  property bool touchedSinceOpen: false
+  function keepAlive() {
+    root.touchedSinceOpen = true
+    idleClose.stop()
+  }
 
   // The switcher's list. Hidden profiles are still in `profiles` so the manage
   // view can unhide them; only this derived list drops them.
@@ -190,6 +204,8 @@ Panel {
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: if (opened) {
+    // Fresh arm: this open might be the misclick.
+    touchedSinceOpen = false
     cursorActive = false
     if (currentProfile !== "") cursor = Math.max(0, visibleIndexOf(currentProfile))
     stateFile.reload()
@@ -323,10 +339,12 @@ Panel {
     id: idleClose
     interval: root.idleCloseMs
     repeat: false
-    running: root.opened && root.pendingRemoval === ""
-    // A pending confirmation is a question waiting for an answer; timing that
-    // out would dismiss the dialog without the user deciding anything.
-    onTriggered: if (root.opened && root.pendingRemoval === "") root.close()
+    // Stops for good once anything has been touched, and never runs while a
+    // confirmation is open: that is a question waiting for an answer, and
+    // timing it out would dismiss the dialog without the user deciding.
+    running: root.opened && !root.touchedSinceOpen
+             && root.pendingRemoval === "" && root.pendingClose === ""
+    onTriggered: if (root.opened && !root.touchedSinceOpen) root.close()
   }
 
   // If the engine dies without writing state, stop showing "switching…".
@@ -425,6 +443,18 @@ Panel {
       id: keyCatcher
       anchors.fill: parent
 
+      // Anything at all: a hover, a click, a key. One of these fires long
+      // before twelve seconds if a person is actually looking at the panel.
+      // Inside the key catcher rather than beside it: KeyboardPanel's default
+      // property is a single contentItem, and a handler is not an Item.
+      HoverHandler {
+        onHoveredChanged: if (hovered) root.keepAlive()
+      }
+
+      TapHandler {
+        onTapped: root.keepAlive()
+      }
+
       onMoveRequested: function (dx, dy) {
         root.keepAlive()
         root.cursorActive = true
@@ -456,6 +486,9 @@ Panel {
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
         ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        // Scrolling a sixty-row list is the clearest possible sign this was
+        // not a misclick, and it was the main thing closing the panel mid-read.
+        onMovementStarted: root.keepAlive()
 
       Column {
         id: column
