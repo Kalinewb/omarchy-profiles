@@ -162,10 +162,27 @@ cmd_lock() {
 # The panel runs this script through the bar with no terminal attached, so a
 # password prompt has nowhere to appear. Hand the same command to a floating
 # themed terminal, which has a tty, and let that copy do the work.
+#
+# Deliberately NOT omarchy-launch-floating-terminal-with-presentation: that
+# wrapper ends with omarchy-show-done, which waits for a keypress. It is right
+# for an installer whose output you want to read, and wrong here — a profile
+# switch that succeeds should leave nothing behind to dismiss, especially when
+# a face unlocks it in a second and there was never anything to read.
+#
+# So: close on success, and linger only on failure, where there is an error
+# worth reading.
 relaunch_in_terminal() {
-  local self="${BASH_SOURCE[0]}"
-  if command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
-    omarchy-launch-floating-terminal-with-presentation "$self $*" >/dev/null 2>&1
+  local self="${BASH_SOURCE[0]}" cmd
+  printf -v cmd '%q ' "$self" "$@" 2>/dev/null || cmd="$self $*"
+  local script="$cmd || { printf '\\n'; read -rsn1 -p 'Failed. Press any key to close...'; }"
+
+  if command -v xdg-terminal-exec >/dev/null; then
+    # The app-id is what Omarchy's window rules float and centre.
+    setsid uwsm-app -- xdg-terminal-exec \
+      --app-id=org.omarchy.terminal --title=Omarchy \
+      -e bash -c "$script" >/dev/null 2>&1
+  elif command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
+    omarchy-launch-floating-terminal-with-presentation "$cmd" >/dev/null 2>&1
   else
     warn "no terminal available to ask for authentication"
     return 1
