@@ -362,7 +362,7 @@ Panel {
       anchors.fill: parent
       z: 10
       opened: root.pendingRemoval !== ""
-      message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar and plugin list are deleted. Windows still open on its workspaces are left where they are."
+      message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar and plugin list are deleted. Any windows still open on its workspaces move to " + (root.masterName === "" ? "the master" : root.masterName) + " — nothing is left stranded."
       confirmText: "Remove"
       cancelText: "Keep"
       foreground: root.foreground

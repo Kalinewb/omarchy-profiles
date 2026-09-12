@@ -208,7 +208,9 @@ Column {
     property int rowIndex: 0
 
     readonly property string name: row.entry ? String(row.entry.id || "") : ""
-    readonly property bool master: root.isMaster(row.name)
+    // From the index entry, not a name comparison: the flag travels with the
+    // row, so it cannot desync from a masterName that arrived late or empty.
+    readonly property bool master: !!(row.entry && row.entry.master)
     readonly property bool active: row.name === root.currentProfile
     // Visible now and the only one left: hiding it would empty the picker.
     readonly property bool hideWouldEmpty: !(row.entry && row.entry.hidden) && root.visibleCount <= 1
@@ -277,7 +279,12 @@ Column {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(2)
 
+        // Master carries neither of these: it cannot be removed, and it sees
+        // every app and plugin by definition, so there is nothing behind the
+        // gear. Hidden rather than disabled — a greyed button invites a click
+        // and then explains why it was pointless.
         PanelActionButton {
+          visible: !row.master
           iconText: "󰒓"
           tooltipText: "Apps and plugins for " + row.name
           foreground: root.foreground
@@ -288,24 +295,29 @@ Column {
 
         PanelActionButton {
           // Hiding only affects the picker; the profile and its windows stay.
+          // Master may be hidden like any other — the single rule is that the
+          // picker can never be emptied, so the last visible one is stuck.
           iconText: (row.entry && row.entry.hidden) ? "󰛐" : "󰛑"
-          tooltipText: (row.entry && row.entry.hidden) ? "Show in the picker" : "Hide from the picker"
+          tooltipText: (row.entry && row.entry.hidden)
+            ? "Show in the picker"
+            : (row.hideWouldEmpty
+               ? "The only profile in the picker — make another visible first"
+               : "Hide from the picker")
           foreground: root.foreground
           fontFamily: root.fontFamily
-          // Hiding the one you are in, or the master, leaves no way back.
-          enabled: !row.master && !row.active
+          enabled: (row.entry && row.entry.hidden) ? true : !row.hideWouldEmpty
           onClicked: root.runEngine(((row.entry && row.entry.hidden) ? "show " : "hide ") + row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
 
         PanelActionButton {
+          visible: !row.master
           iconText: "󰩹"
-          tooltipText: row.master ? "The master profile cannot be removed"
-                     : (row.active ? "Switch away before removing this profile" : "Remove " + row.name)
+          tooltipText: row.active ? "Switch away before removing this profile" : "Remove " + row.name
           foreground: root.foreground
           hoverColor: Color.urgent
           fontFamily: root.fontFamily
-          enabled: !row.master && !row.active
+          enabled: !row.active
           onClicked: root.confirmRemove(row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }

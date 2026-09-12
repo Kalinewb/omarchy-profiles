@@ -415,23 +415,48 @@ cmd_create() {
 }
 
 cmd_remove() {
-  local name=${1:-} force=${2:-}
-  [[ -n $name ]] || die "usage: omarchy-profile remove <name> [--force]"
+  local name=${1:-}
+  [[ -n $name ]] || die "usage: omarchy-profile remove <name>"
   exists "$name" || die "no such profile '$name'"
   is_master "$name" && die "refusing to remove the master profile"
   [[ $name == "$(current_profile)" ]] && die "refusing to remove the active profile — switch away first"
 
-  # Its windows live on workspaces nothing will reach once the profile is gone.
-  local offset span live=0
+  # Its windows have to go somewhere.
+  #
+  # Abandoning them was the original behaviour and it was wrong twice over: no
+  # profile maps to the freed block, so SUPER+1..0 can never reach those windows
+  # again, and next_offset hands the same block to the next profile created —
+  # which would then open onto a stranger's windows. Recovery meant knowing to
+  # type `hyprctl dispatch workspace 14` at a shell.
+  #
+  # So they move to the master's block, workspace for workspace: the profile's
+  # third workspace becomes the master's third. Master is the right destination
+  # because it always exists and always sees everything.
+  local offset span master_offset live=0
   offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$name")")
   span=$(jq -r '.workspaces.span // 10' "$(file_for "$name")")
+  local master; master=$(cfg .master)
+  master_offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$master")" 2>/dev/null)
+  [[ $master_offset =~ ^[0-9]+$ ]] || master_offset=0
+
   if command -v hyprctl >/dev/null; then
-    live=$(hyprctl -j workspaces 2>/dev/null |
+    live=$(hyprctl -j clients 2>/dev/null |
       jq --argjson o "$offset" --argjson s "$span" \
-         '[.[] | select(.id > $o and .id <= ($o + $s)) | .windows] | add // 0')
-  fi
-  if [[ ${live:-0} -gt 0 && $force != "--force" ]]; then
-    die "'$name' still has $live window(s) on workspaces $((offset + 1))-$((offset + span)). Close them, or re-run with --force to orphan them."
+         '[.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))] | length')
+    if [[ ${live:-0} -gt 0 ]]; then
+      # movetoworkspacesilent so the screen does not jump through every
+      # workspace being emptied.
+      while read -r addr ws; do
+        [[ -n $addr ]] || continue
+        hyprctl dispatch movetoworkspacesilent \
+          "$((master_offset + ws - offset)),address:$addr" >/dev/null 2>&1 ||
+          warn "could not move window $addr off workspace $ws"
+      done < <(hyprctl -j clients 2>/dev/null |
+        jq -r --argjson o "$offset" --argjson s "$span" \
+           '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))
+                | "\(.address) \(.workspace.id)"')
+      echo "moved $live window(s) to $master"
+    fi
   fi
   rm -f "$(file_for "$name")"
 
@@ -647,7 +672,7 @@ catalog) write_catalog ;;
 set) shift; cmd_set "${1:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
-remove) shift; cmd_remove "${1:-}" "${2:-}" ;;
+remove) shift; cmd_remove "${1:-}" ;;
 show) shift; cmd_visibility show "${1:-}" ;;
 hide) shift; cmd_visibility hide "${1:-}" ;;
 apps) shift; cmd_apps "${1:-}" "${2:-list}" "${3:-}" ;;
@@ -670,7 +695,7 @@ omarchy-profile — profiles for the Omarchy desktop
   capture                          save live state into the active profile now
 
   create <name> [--from-master|--clean]
-  remove <name> [--force]          refuses while the profile still has windows
+  remove <name>                    moves its windows to the master first
   show <name> | hide <name>        whether it appears in the picker
 
   apps <profile> [list|allow|deny] [app-id]
