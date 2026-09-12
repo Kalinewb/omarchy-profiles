@@ -171,15 +171,26 @@ authenticate() {
   fi
 
   if [[ -n $identity ]]; then
-    if ! command -v omarchy-face-identity >/dev/null 2>&1; then
-      # A bound identity with no way to check it: refusing would strand the
-      # profile on a machine where the face plugin was removed.
+    if [[ ! -x /usr/local/bin/omarchy-face-identity ]]; then
+      # A bound identity with no way to check it. Normally that falls through to
+      # the owner, because refusing would strand the profile on a machine where
+      # the face plugin was removed.
+      #
+      # But with owner_override off, falling through is the one thing the
+      # setting exists to prevent: the owner's password would open a profile
+      # marked as opening only for somebody else. Removing the helper -- or
+      # simply making it unreachable -- must not be a way to downgrade that.
+      if [[ $owner_override == false ]]; then
+        warn "'$profile' opens only for '$identity', and the face tooling is missing"
+        audit "unlock of $for_what REFUSED: identity '$identity' unverifiable and owner_override is off"
+        return 1
+      fi
       warn "'$profile' is bound to the face '$identity', but omarchy-face-identity is not installed"
       audit "unlock of $for_what: identity '$identity' unverifiable, face tooling missing"
-    elif omarchy-face-identity verify "$identity"; then
+    elif /usr/local/bin/omarchy-face-identity verify "$identity"; then
       audit "unlock of $for_what succeeded: face matched identity '$identity'"
       return 0
-    elif [[ $owner_override == false ]] && omarchy-face-identity verify "$identity"; then
+    elif [[ $owner_override == false ]] && /usr/local/bin/omarchy-face-identity verify "$identity"; then
       # One retry, and only on the path that has nowhere else to go. With
       # owner_override off there is no password to fall back to, so a camera
       # that simply did not see anyone would lock the owner out of their own
@@ -282,12 +293,12 @@ cmd_identity() {
     return 0
   fi
 
-  command -v omarchy-face-identity >/dev/null 2>&1 ||
+  [[ -x /usr/local/bin/omarchy-face-identity ]] ||
     die "omarchy-face is not installed, so named faces cannot be verified"
 
   # Refuse to point a profile at a face that was never enrolled: the profile
   # would look configured and silently never open for anyone but the owner.
-  if ! omarchy-face-identity list | grep -qx -- "$identity"; then
+  if ! /usr/local/bin/omarchy-face-identity list | grep -qx -- "$identity"; then
     rm -f "$tmp"
     die "no face enrolled as '$identity' — enrol it first with omarchy-face"
   fi
