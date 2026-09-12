@@ -28,3 +28,17 @@ if command -v omarchy >/dev/null; then
   omarchy plugin validate "$DEST" || { echo "install.sh: plugin failed validation" >&2; exit 1; }
 fi
 echo "installed $ID -> $DEST"
+
+# Restart the shell unless told not to.
+#
+# The plugin watcher's reload calls Qt.clearComponentCache() and re-instantiates
+# the entry point, but it does NOT recompile the other QML types in the folder:
+# an edit to ManageView.qml or SettingsView.qml keeps rendering the previously
+# compiled version, and a brand-new .qml type is not resolvable at all. Both
+# look exactly like "my change did nothing", which is a bad way to spend an
+# afternoon. A restart is one visible blip and always tells the truth.
+if [[ ${1:-} == --no-restart ]]; then
+  echo "(shell not restarted — edits to any .qml but the entry point will render stale)"
+elif command -v omarchy >/dev/null; then
+  omarchy restart shell >/dev/null 2>&1 && echo "restarted the shell"
+fi
