@@ -86,6 +86,7 @@ Panel {
   property string settingsProfile: ""
   property var pluginCatalog: []
   property var settingsDisabled: []
+  property var settingsAllowedApps: []
 
   readonly property string catalogPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/plugins.json"
@@ -232,8 +233,11 @@ Panel {
         var parsed = JSON.parse(text())
         var d = (parsed && parsed.plugins && parsed.plugins.disabled) || []
         root.settingsDisabled = Array.isArray(d) ? d : []
+        var a = (parsed && parsed.apps && parsed.apps.allowed) || []
+        root.settingsAllowedApps = Array.isArray(a) ? a : []
       } catch (e) {
         root.settingsDisabled = []
+        root.settingsAllowedApps = []
       }
     }
     onLoadFailed: root.settingsDisabled = []
@@ -537,6 +541,7 @@ Panel {
           isMaster: root.settingsProfile === root.masterName
           plugins: root.pluginCatalog
           disabled: root.settingsDisabled
+          allowedApps: root.settingsAllowedApps
           foreground: root.foreground
           accent: root.accent
           dim: root.dim

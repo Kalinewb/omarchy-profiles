@@ -1,12 +1,18 @@
 import QtQuick
+import Quickshell
 import qs.Commons
 import qs.Ui
 
-// What one profile is allowed to use.
+// What one profile is allowed to use: applications on one page, plugins on
+// another.
 //
-// Plugins are grouped by what they are — bar widgets, panels, services,
-// overlays — because a flat list of sixty ids is unreadable and the grouping is
-// the only thing that tells you what switching one off will actually change.
+// Two pages rather than one long column, because they are answers to different
+// questions — "what can I launch" and "what does my desktop show" — and mixing
+// them meant scrolling past sixty plugins to reach the apps.
+//
+// Within plugins, the categories are filter buttons at the top rather than
+// headings in the list. Headings still require scrolling to find the group you
+// want, which is the thing they were supposed to solve.
 //
 // A toggle records the choice in the profile and, when that profile is the
 // active one, applies it to the running shell in the same step. Recording
@@ -20,6 +26,8 @@ Column {
   property var plugins: []
   // Plugin ids this profile has switched off.
   property var disabled: []
+  // Desktop-entry ids this profile may launch. Master ignores it.
+  property var allowedApps: []
 
   property color foreground: Color.foreground
   property color accent: Color.accent
@@ -29,6 +37,15 @@ Column {
   signal runEngine(string args)
   signal touched()
 
+  // "plugins" | "apps"
+  property string page: "plugins"
+  // "" means every category.
+  property string category: ""
+  // "" all · "omarchy" first-party only · "addons" third-party only. Separate
+  // from the kind filter because "which of my add-ons is this" is a different
+  // question from "what kind of thing is it".
+  property string source: ""
+
   spacing: Style.space(10)
 
   function isDisabled(id) {
@@ -36,94 +53,251 @@ Column {
     return false
   }
 
-  // The categories present in the catalog, in a deliberate order: the ones a
-  // person recognises from looking at their screen come first.
+  function isAllowed(id) {
+    if (root.isMaster) return true
+    for (var i = 0; i < allowedApps.length; i++) if (allowedApps[i] === id) return true
+    return false
+  }
+
+  // The recognisable-first order: things you can point at on your own screen
+  // before the machinery behind them.
   readonly property var categoryOrder: ["Bar widgets", "Panels", "Overlays", "Services", "Menus", "Bars", "Other"]
 
   readonly property var categories: {
     var seen = {}
-    for (var i = 0; i < plugins.length; i++) {
-      var c = String(plugins[i].category || "Other")
-      seen[c] = true
-    }
+    for (var i = 0; i < plugins.length; i++) seen[String(plugins[i].category || "Other")] = true
     var out = []
     for (var j = 0; j < categoryOrder.length; j++) if (seen[categoryOrder[j]]) out.push(categoryOrder[j])
     for (var k in seen) if (out.indexOf(k) === -1) out.push(k)
     return out
   }
 
-  function pluginsIn(category) {
+  readonly property var shownPlugins: {
     var out = []
     for (var i = 0; i < plugins.length; i++) {
-      if (String(plugins[i].category || "Other") === category) out.push(plugins[i])
+      var p = plugins[i]
+      if (root.category !== "" && String(p.category || "Other") !== root.category) continue
+      if (root.source === "omarchy" && !p.firstParty) continue
+      if (root.source === "addons" && p.firstParty) continue
+      out.push(p)
     }
     return out
   }
 
+  // Every launchable application on the machine. Read straight from
+  // DesktopEntries rather than through the engine: it is always current and
+  // needs no refresh step.
+  readonly property var allApps: {
+    var out = []
+    var values = DesktopEntries.applications.values || []
+    for (var i = 0; i < values.length; i++) {
+      var e = values[i]
+      if (!e || e.noDisplay) continue
+      out.push({ id: String(e.id || ""), name: String(e.name || e.id || "") })
+    }
+    out.sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1 })
+    return out
+  }
+
+  // ------------------------------------------------------------- page chips
+
+  Row {
+    width: parent.width
+    spacing: Style.space(6)
+
+    Button {
+      text: "Plugins"
+      selected: root.page === "plugins"
+      foreground: root.page === "plugins" ? root.accent : root.dim
+      fontFamily: root.fontFamily
+      onClicked: { root.touched(); root.page = "plugins" }
+    }
+
+    Button {
+      text: "Apps"
+      selected: root.page === "apps"
+      foreground: root.page === "apps" ? root.accent : root.dim
+      fontFamily: root.fontFamily
+      onClicked: { root.touched(); root.page = "apps" }
+    }
+  }
+
   Text {
     width: parent.width
+    visible: root.isMaster
     textFormat: Text.PlainText
     wrapMode: Text.WordWrap
-    text: root.isMaster
-      ? "The master sees everything, so there is nothing to restrict here."
-      : "Switch off what this profile should not have. Changes are saved to the profile; if you are in it now, they apply immediately."
+    text: "The master sees everything, so there is nothing to restrict here."
     color: root.dim
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption
   }
 
-  // ------------------------------------------------------------------- apps
+  // ----------------------------------------------------------- plugins page
 
   Column {
     width: parent.width
-    spacing: Style.space(4)
+    spacing: Style.space(8)
+    visible: root.page === "plugins" && !root.isMaster
 
-    PanelSectionHeader {
+    Row {
       width: parent.width
-      text: "APPLICATIONS"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
+      spacing: Style.space(4)
+
+      Button {
+        text: "Everything"
+        selected: root.source === ""
+        foreground: root.source === "" ? root.accent : root.dim
+        fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.source = "" }
+      }
+
+      Button {
+        text: "Omarchy"
+        selected: root.source === "omarchy"
+        foreground: root.source === "omarchy" ? root.accent : root.dim
+        fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.source = "omarchy" }
+      }
+
+      Button {
+        text: "Add-ons"
+        selected: root.source === "addons"
+        foreground: root.source === "addons" ? root.accent : root.dim
+        fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.source = "addons" }
+      }
     }
 
-    // Said plainly rather than shown as a list of switches that do nothing:
-    // hiding an app needs the launcher to filter on the active profile, and
-    // that part is not built yet.
+    // Categories as buttons, so picking a group is one click rather than a
+    // hunt through headings.
+    Flow {
+      width: parent.width
+      spacing: Style.space(4)
+
+      Button {
+        text: "All"
+        selected: root.category === ""
+        foreground: root.category === "" ? root.accent : root.dim
+        fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.category = "" }
+      }
+
+      Repeater {
+        model: root.categories
+
+        Button {
+          required property var modelData
+          text: String(modelData)
+          selected: root.category === String(modelData)
+          foreground: root.category === String(modelData) ? root.accent : root.dim
+          fontFamily: root.fontFamily
+          onClicked: { root.touched(); root.category = String(modelData) }
+        }
+      }
+    }
+
+    Row {
+      width: parent.width
+      spacing: Style.space(6)
+
+      Button {
+        // Scoped to what is on screen, so "all" from a filtered view means the
+        // filter rather than the whole machine.
+        text: root.category === "" ? "Enable all" : "Enable all " + root.category.toLowerCase()
+        foreground: root.foreground
+        fontFamily: root.fontFamily
+        onClicked: {
+          root.touched()
+          root.runEngine("plugin " + root.profile + " enable-all" + (root.category === "" ? "" : " " + JSON.stringify(root.category)))
+        }
+      }
+
+      Button {
+        text: root.category === "" ? "Disable all" : "Disable all " + root.category.toLowerCase()
+        foreground: root.dim
+        fontFamily: root.fontFamily
+        onClicked: {
+          root.touched()
+          root.runEngine("plugin " + root.profile + " disable-all" + (root.category === "" ? "" : " " + JSON.stringify(root.category)))
+        }
+      }
+    }
+
     Text {
       width: parent.width
       textFormat: Text.PlainText
-      wrapMode: Text.WordWrap
-      text: "Not yet. Per-profile app visibility needs the launcher to filter on the active profile — until that lands, every profile sees every app."
+      text: root.shownPlugins.length + (root.shownPlugins.length === 1 ? " plugin" : " plugins")
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption
     }
+
+    Repeater {
+      model: root.shownPlugins
+
+      PluginToggleRow {
+        required property var modelData
+        width: root.width
+        plugin: modelData
+      }
+    }
   }
 
-  // ---------------------------------------------------------------- plugins
+  // -------------------------------------------------------------- apps page
 
-  Repeater {
-    model: root.categories
+  Column {
+    width: parent.width
+    spacing: Style.space(8)
+    visible: root.page === "apps" && !root.isMaster
 
-    Column {
-      required property var modelData
-      width: root.width
-      spacing: Style.space(2)
+    // Honest about the gap: the list is real and the choices are saved, but
+    // nothing filters the launcher on them yet.
+    Text {
+      width: parent.width
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      text: "Choices here are saved to the profile, but not enforced yet — the launcher still shows every app until it filters on the active profile."
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
 
-      PanelSectionHeader {
-        width: parent.width
-        text: String(modelData).toUpperCase()
+    Row {
+      width: parent.width
+      spacing: Style.space(6)
+
+      Button {
+        text: "Allow all"
         foreground: root.foreground
         fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.runEngine("apps " + root.profile + " allow-all") }
       }
 
-      Repeater {
-        model: root.pluginsIn(modelData)
+      Button {
+        text: "Allow none"
+        foreground: root.dim
+        fontFamily: root.fontFamily
+        onClicked: { root.touched(); root.runEngine("apps " + root.profile + " deny-all") }
+      }
+    }
 
-        PluginToggleRow {
-          required property var modelData
-          width: root.width
-          plugin: modelData
-        }
+    Text {
+      width: parent.width
+      textFormat: Text.PlainText
+      text: root.allowedApps.length + " of " + root.allApps.length + " allowed"
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
+    Repeater {
+      model: root.allApps
+
+      AppToggleRow {
+        required property var modelData
+        width: root.width
+        app: modelData
       }
     }
   }
@@ -160,11 +334,10 @@ Column {
 
       Text {
         width: nameCol.width
-        visible: prow.pinned
+        visible: prow.pinned || !!(prow.plugin && prow.plugin.firstParty)
         textFormat: Text.PlainText
-        // The picker is pinned for a concrete reason, so say it rather than
-        // leaving a greyed-out switch unexplained.
-        text: "Pinned — switching this off would leave no way back"
+        text: prow.pinned ? "Pinned — switching this off would leave no way back"
+                          : "An Omarchy default — on unless you turn it off"
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
@@ -177,13 +350,51 @@ Column {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       checked: prow.on
-      interactive: !prow.locked && !root.isMaster
+      interactive: !prow.locked
       foreground: root.foreground
       accent: root.accent
       onToggled: {
-        if (prow.locked || root.isMaster) return
+        if (prow.locked) return
         root.touched()
         root.runEngine("plugin " + root.profile + (prow.on ? " disable " : " enable ") + prow.pid)
+      }
+    }
+  }
+
+  // One application: its name, and whether this profile may launch it.
+  component AppToggleRow: Item {
+    id: arow
+    property var app: null
+
+    readonly property string aid: arow.app ? String(arow.app.id || "") : ""
+    readonly property bool on: root.isAllowed(arow.aid)
+
+    implicitHeight: Math.max(appName.implicitHeight, asw.implicitHeight) + Style.space(6)
+
+    Text {
+      id: appName
+      anchors.left: parent.left
+      anchors.right: asw.left
+      anchors.rightMargin: Style.space(8)
+      anchors.verticalCenter: parent.verticalCenter
+      textFormat: Text.PlainText
+      text: arow.app ? String(arow.app.name || arow.aid) : ""
+      color: root.foreground
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.body
+      elide: Text.ElideRight
+    }
+
+    ToggleSwitch {
+      id: asw
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      checked: arow.on
+      foreground: root.foreground
+      accent: root.accent
+      onToggled: {
+        root.touched()
+        root.runEngine("apps " + root.profile + (arow.on ? " deny " : " allow ") + arow.aid)
       }
     }
   }

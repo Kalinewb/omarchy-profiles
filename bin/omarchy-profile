@@ -368,13 +368,24 @@ cmd_create() {
        "$(file_for "$master")" >"$(file_for "$name")"
     ;;
   --clean)
-    jq -n --arg d "Clean profile" --argjson o "$offset" '{
+    # Clean means "a stock Omarchy desktop with none of my add-ons", not "an
+    # empty screen". First-party plugins stay on — a profile with no clock, no
+    # tray and no network indicator is broken rather than clean — and so do the
+    # pinned ones. Everything remains individually switchable afterwards;
+    # this only decides where a new profile starts.
+    local all_off
+    all_off=$(omarchy plugin list --json 2>/dev/null |
+      jq -c --argjson pinned "$(cfg -c '.pinned_plugins // []')" '
+        [ .[] | . as $p | select(($pinned | index($p.id)) == null)
+              | select(.firstParty // false | not)
+              | select(.canDisable // true) | .id ]') || all_off="[]"
+    jq -n --arg d "Clean profile" --argjson o "$offset" --argjson off "${all_off:-[]}" '{
       _description: $d, master: false, hidden: false, icon: "󰆼",
       theme: "tokyo-night", wallpaper: "",
       dnd: false, idle: {screensaver: 150, lock: 300, inhibit: false},
       workspaces: {offset: $o, span: 10},
       browser_profile: "default",
-      bar: null, plugins: {disabled: []}, apps: {allowed: []}
+      bar: null, plugins: {disabled: $off}, apps: {allowed: []}
     }' >"$(file_for "$name")"
     ;;
   *) die "unknown mode '$mode' (use --from-master or --clean)" ;;
@@ -461,6 +472,21 @@ cmd_apps() {
     if is_master "$name"; then echo "*  (master sees every application)"; else
       jq -r '(.apps.allowed // [])[]' "$file"
     fi ;;
+  allow-all | deny-all)
+    is_master "$name" && { echo "master already sees every application"; return 0; }
+    local tmp; tmp=$(mktemp)
+    if [[ $verb == deny-all ]]; then
+      jq '.apps = ((.apps // {}) | .allowed = [])' "$file" >"$tmp"
+    else
+      # Every desktop entry on the machine, the same set the launcher shows.
+      local ids
+      ids=$(find "$DATA_HOME/applications" /usr/local/share/applications /usr/share/applications \
+              -maxdepth 1 -name '*.desktop' 2>/dev/null |
+            xargs -r -I{} sh -c 'grep -qiE "^(NoDisplay|Hidden)=true" "{}" || basename "{}" .desktop' |
+            sort -u | jq -R . | jq -sc .)
+      jq --argjson all "${ids:-[]}" '.apps = ((.apps // {}) | .allowed = $all)' "$file" >"$tmp"
+    fi
+    mv "$tmp" "$file" && echo "$verb in $name" ;;
   allow | deny)
     [[ -n $app ]] || die "usage: omarchy-profile apps $name $verb <app-id>"
     is_master "$name" && { echo "master already sees every application"; return 0; }
@@ -482,6 +508,44 @@ cmd_plugin() {
   local file; file=$(file_for "$name")
   case $verb in
   list) jq -r '(.plugins.disabled // [])[]' "$file" ;;
+  # Bulk operations take an optional category so "disable all" from a filtered
+  # view means what the user is looking at, not the whole machine.
+  enable-all | disable-all)
+    local category=${3:-}
+    local ids
+    ids=$(omarchy plugin list --json 2>/dev/null |
+      jq -r --argjson pinned "$(cfg -c '.pinned_plugins // []')" --arg cat "$category" '
+        .[] | . as $p
+        | select(($pinned | index($p.id)) == null)
+        | select(.canDisable // true)
+        | select($cat == "" or (
+            if ($p.kinds | index("bar-widget")) then "Bar widgets"
+            elif ($p.kinds | index("panel")) then "Panels"
+            elif ($p.kinds | index("service")) then "Services"
+            elif ($p.kinds | index("overlay")) then "Overlays"
+            elif ($p.kinds | index("menu")) then "Menus"
+            elif ($p.kinds | index("bar")) then "Bars"
+            else "Other" end) == $cat)
+        | .id')
+    [[ -n $ids ]] || { echo "nothing to change"; return 0; }
+    local tmp; tmp=$(mktemp)
+    if [[ $verb == disable-all ]]; then
+      jq --argjson add "$(printf '%s\n' "$ids" | jq -R . | jq -sc .)" \
+        '.plugins = ((.plugins // {}) | .disabled = (((.disabled // []) + $add) | unique))' "$file" >"$tmp"
+    else
+      jq --argjson drop "$(printf '%s\n' "$ids" | jq -R . | jq -sc .)" \
+        '.plugins = ((.plugins // {}) | .disabled = ((.disabled // []) | map(select(. as $i | ($drop | index($i)) == null))))' "$file" >"$tmp"
+    fi
+    mv "$tmp" "$file" || { rm -f "$tmp"; die "could not update '$name'"; }
+    if [[ $name == "$(current_profile)" ]]; then
+      local v=enable; [[ $verb == disable-all ]] && v=disable
+      while read -r id; do
+        [[ -n $id ]] || continue
+        omarchy plugin "$v" "$id" >/dev/null 2>&1 || true
+      done <<<"$ids"
+    fi
+    write_catalog
+    echo "$verb${category:+ ($category)} in $name" ;;
   enable | disable)
     [[ -n $id ]] || die "usage: omarchy-profile plugin $name $verb <plugin-id>"
     if [[ $verb == disable ]] && cfg '.pinned_plugins // []' | jq -e --arg i "$id" 'index($i)' >/dev/null 2>&1; then
