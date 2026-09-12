@@ -182,6 +182,33 @@ Every dispatch here goes through one small set of helpers for that reason. All
 four call sites had the plain form and silently did nothing — including the
 window migration on removing a profile — because the exit code was dropped.
 
+
+### The bar's workspace indicator
+
+Omarchy's own workspace widget hardcodes the range it will consider:
+
+```qml
+if (id > 0 && id <= 10 && ids.indexOf(id) === -1) ids.push(id)
+```
+
+In a profile whose block starts at 11 that filter excludes every workspace you
+are actually using, so the indicator shows 1–10 with nothing highlighted. The
+profiles themselves work fine; it is the indicator that is looking in the wrong
+place.
+
+`extras/Workspaces.qml` in this repository is the stock widget with that fixed.
+It reads the offset from the engine's state file, so the buttons stay labelled
+1–0 in every profile and only the id they target moves:
+
+```bash
+omarchy plugin clone omarchy.workspaces --edit      # makes your own copy
+cp ~/.config/omarchy/plugins/graveklar.profiles/extras/Workspaces.qml \
+   ~/.config/omarchy/plugins/<your-clone-id>/Workspaces.qml
+```
+
+Then set `moduleName` in it to your clone's id, and `omarchy restart shell`.
+Optional: skip it and the indicator is simply wrong outside the first profile.
+
 ## Files
 
 | Path | What |
