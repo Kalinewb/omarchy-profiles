@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "id": "graveklar.profiles",
+  "name": "Profiles",
+  "version": "1.0.0",
+  "author": "graveklar",
+  "license": "MIT",
+  "description": "Switch the machine's whole look and behaviour between work, dev and personal profiles.",
+  "kinds": ["bar-widget"],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Profiles",
+    "description": "Current machine profile; click to switch.",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}
