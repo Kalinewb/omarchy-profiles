@@ -2,17 +2,19 @@
   "schemaVersion": 1,
   "id": "graveklar.profiles",
   "name": "Profiles",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "graveklar",
   "license": "MIT",
-  "description": "Switch the machine's whole look and behaviour between work, dev and personal profiles.",
-  "kinds": ["bar-widget"],
+  "description": "Several desks on one machine: each profile keeps its own workspaces, apps, theme, bar and plugins, and can be locked to a face or hold an encrypted vault.",
+  "kinds": [
+    "bar-widget"
+  ],
   "entryPoints": {
     "barWidget": "Panel.qml"
   },
   "barWidget": {
     "displayName": "Profiles",
-    "description": "Current machine profile; click to switch.",
+    "description": "Current profile; click to switch, manage or see what every profile is holding open.",
     "category": "System",
     "allowMultiple": false,
     "defaultSection": "right"

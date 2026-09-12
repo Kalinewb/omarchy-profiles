@@ -29,6 +29,10 @@ DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
 PROFILE_DIR="$CONFIG_HOME/omarchy/profiles"
 CONFIG_FILE="$PROFILE_DIR/config.json"
 SHELL_JSON="$CONFIG_HOME/omarchy/shell.json"
+# Where this copy of the plugin lives, so messages can point at the file the
+# user actually has rather than at a path we hope they installed to.
+PLUGIN_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
+
 STATE_DIR="$STATE_HOME/omarchy-profiles"
 STATE_FILE="$STATE_DIR/current.json"
 THEME_NAME_FILE="$STATE_HOME/omarchy/current/theme.name"
@@ -220,11 +224,40 @@ authenticate() {
     # authorisation decision, not a privileged action, and it should not need
     # to become one. The agent runs the polkit-1 PAM stack, so a face is tried
     # first where omarchy-face has configured one, then the password.
-    if pkcheck --action-id no.graveklar.profiles.unlock \
-               --process "$$" --allow-user-interaction >/dev/null 2>&1; then
+    local pkout
+    if pkout=$(pkcheck --action-id no.graveklar.profiles.unlock \
+               --process "$$" --allow-user-interaction 2>&1); then
       audit "unlock of $for_what succeeded via polkit (polkit-1 stack: face, fingerprint or password)"
       return 0
     fi
+
+    # "not registered" is not a wrong password, and must not be treated as one.
+    #
+    # The action is declared by a file under /usr/share/polkit-1/actions, which
+    # install.sh puts there with sudo. A marketplace install copies the plugin
+    # and never runs install.sh, so on that path the action is simply absent --
+    # and polkit says so rather than asking anything. Counting that as a failed
+    # authentication would leave every locked profile permanently unenterable,
+    # while telling the user their password was wrong.
+    if [[ $pkout == *"not registered"* ]]; then
+      audit "unlock of $for_what: polkit action not registered"
+      warn "the polkit action is not installed, so the password check cannot run"
+      warn "install it with:"
+      warn "  sudo install -m 0644 $PLUGIN_DIR/polkit/no.graveklar.profiles.policy \\"
+      warn "    /usr/share/polkit-1/actions/"
+      # sudo can stand in, but only where there is somewhere to type. From the
+      # bar there is not, and a silent hang would be worse than a clear refusal.
+      if [[ -t 0 ]] && command -v sudo >/dev/null; then
+        warn "falling back to your password for this one switch"
+        sudo -k >/dev/null 2>&1
+        if sudo -v; then
+          audit "unlock of $for_what succeeded via sudo (polkit action missing)"
+          return 0
+        fi
+      fi
+      return 1
+    fi
+
     audit "unlock of $for_what failed via polkit"
     return 1 ;;
   none)
@@ -1867,6 +1900,26 @@ cmd_init() {
   write_catalog
   write_state "$master"
   echo "initialised master profile '$master' from the current machine"
+  check_polkit_action
+}
+
+# Locking a profile depends on a polkit action declared system-wide, and
+# `omarchy plugin add` cannot put a file in /usr/share -- so on a fresh install
+# from the marketplace the action is missing. Nothing notices until somebody
+# locks a profile and then cannot get back into it, which is far too late and
+# looks like the lock is broken rather than unconfigured. Say it once, here,
+# while the fix is still cheap.
+check_polkit_action() {
+  command -v pkcheck >/dev/null || return 0
+  local out
+  out=$(pkcheck --action-id no.graveklar.profiles.unlock --process "$$" 2>&1)
+  [[ $out == *"not registered"* ]] || return 0
+  echo
+  warn "profile locks will not work yet: the polkit action is not installed."
+  warn "one command, once:"
+  warn "  sudo install -m 0644 $PLUGIN_DIR/polkit/no.graveklar.profiles.policy \\"
+  warn "    /usr/share/polkit-1/actions/"
+  warn "Everything else works without it."
 }
 
 ensure_config
@@ -1882,7 +1935,10 @@ refresh)
   cur=$(current_profile)
   write_index; write_catalog
   [[ -n $cur ]] && write_allowed_apps "$cur"
-  echo "refreshed" ;;
+  echo "refreshed"
+  # Also the upgrade path: someone who installed before this check existed, or
+  # who installed from the marketplace, finds out here rather than at a lock.
+  check_polkit_action ;;
 isolate) shift; cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 overview) shift; cmd_overview "${1:-}" ;;

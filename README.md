@@ -37,6 +37,22 @@ Then adopt the machine as it stands as your master profile:
 `init` only reads state — it never imposes any — so it is safe to run on a
 desktop you have already set up.
 
+### One more command, if you want profile locks
+
+Locking a profile asks polkit whether you are allowed in, and polkit only
+answers for actions declared under `/usr/share/polkit-1/actions`. A plugin
+install cannot write there, so that one file needs a hand:
+
+```bash
+sudo install -m 0644 \
+  ~/.config/omarchy/plugins/graveklar.profiles/polkit/no.graveklar.profiles.policy \
+  /usr/share/polkit-1/actions/
+```
+
+`init` tells you if it is missing, and so does `omarchy-profile refresh`.
+Everything except locks works without it — and a lock without it fails safe:
+the profile refuses to open and says why, rather than opening anyway.
+
 ## Use
 
 The bar widget shows the active profile; click it to switch or to open the
