@@ -50,7 +50,12 @@ ensure_config() {
   }' >"$CONFIG_FILE"
 }
 
-cfg() { jq -r "$1" "$CONFIG_FILE" 2>/dev/null; }
+# cfg <filter>            raw string value
+# cfg -c <filter>         compact JSON (for arrays handed to --argjson)
+cfg() {
+  if [[ ${1:-} == -c ]]; then jq -c "$2" "$CONFIG_FILE" 2>/dev/null
+  else jq -r "$1" "$CONFIG_FILE" 2>/dev/null; fi
+}
 
 cfg_set() {
   local tmp
@@ -160,6 +165,43 @@ write_index() {
     done < <(profile_names)
     printf ']'
   } >"$tmp" && mv "$tmp" "$STATE_DIR/profiles.json" || { rm -f "$tmp"; warn "could not write the profile index"; return 1; }
+}
+
+# The installable set, for the settings view's toggle lists.
+#
+# Plugins come from `omarchy plugin list --json` because QML has no plugin
+# registry to read; applications are NOT listed here — the panel reads
+# DesktopEntries directly, which is always current and needs no refresh.
+#
+# `pinned` is folded in here rather than left to the UI so every consumer agrees
+# on what may not be switched off.
+write_catalog() {
+  mkdir -p "$STATE_DIR"
+  command -v omarchy >/dev/null || return 0
+  local tmp pinned
+  pinned=$(cfg -c '.pinned_plugins // []')
+  tmp=$(mktemp "$STATE_DIR/plugins.json.XXXXXX") || return 1
+  omarchy plugin list --json 2>/dev/null |
+    jq -c --argjson pinned "${pinned:-[]}" '
+      [ .[] | . as $p | {
+          id, name, kinds,
+          enabled: (.enabled // false),
+          canDisable: (.canDisable // true),
+          firstParty: (.firstParty // false),
+          # $p.id, not .id: after `$pinned |` the input is the array, so `.id`
+          # would try to index it with a string.
+          pinned: (($pinned | index($p.id)) != null),
+          category: (
+            if (.kinds | index("bar-widget")) then "Bar widgets"
+            elif (.kinds | index("panel")) then "Panels"
+            elif (.kinds | index("service")) then "Services"
+            elif (.kinds | index("overlay")) then "Overlays"
+            elif (.kinds | index("menu")) then "Menus"
+            elif (.kinds | index("bar")) then "Bars"
+            else "Other" end)
+        } ]
+      | sort_by(.category, (.name | ascii_downcase))
+    ' >"$tmp" && mv "$tmp" "$STATE_DIR/plugins.json" || { rm -f "$tmp"; warn "could not write the plugin catalog"; return 1; }
 }
 
 write_state() {
@@ -285,6 +327,7 @@ cmd_set() {
 
   apply_profile "$name"
   write_index
+  write_catalog
   write_state "$name"
   echo "omarchy-profile: $name"
 }
@@ -364,7 +407,7 @@ cmd_visibility() {
   local tmp; tmp=$(mktemp)
   jq --argjson h "$hidden" '.hidden = $h' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
   write_index
-  echo "$name is now $verb-n in the picker"
+  [[ $verb == show ]] && echo "$name now shows in the picker" || echo "$name is now hidden from the picker"
 }
 
 # Applications. Master is a wildcard: it sees everything, so an install only has
@@ -458,6 +501,7 @@ cmd_init() {
   }' >"$(file_for "$master")"
   capture_into "$master"
   write_index
+  write_catalog
   write_state "$master"
   echo "initialised master profile '$master' from the current machine"
 }
@@ -465,6 +509,7 @@ cmd_init() {
 ensure_config
 
 case "${1:-}" in
+catalog) write_catalog ;;
 set) shift; cmd_set "${1:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;

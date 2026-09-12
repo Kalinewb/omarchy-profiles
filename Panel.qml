@@ -49,14 +49,16 @@ Panel {
       var out = []
       for (var i = 0; i < parsed.length; i++) {
         var p = parsed[i]
-        if (!p || p.hidden) continue
+        if (!p) continue
         out.push({
           id: String(p.name || ""),
           label: String(p.name || "").replace(/^./, function (c) { return c.toUpperCase() }),
-          icon: String(p.icon || "") || (p.master ? "󰒓" : "󰆼"),
+          icon: String(p.icon || "") || (p.master ? "\u{f0493}" : "\u{f01bc}"),
           blurb: String(p.description || ""),
-          master: !!p.master
+          master: !!p.master,
+          hidden: !!p.hidden
         })
+        if (p.master) root.masterName = String(p.name || "")
       }
       root.profiles = out
     } catch (e) {
@@ -67,12 +69,41 @@ Panel {
   property string currentProfile: ""
   property bool cursorActive: false
   property int cursor: 0
+
+  // "picker" switches profiles; "manage" creates, removes and hides them.
+  // One panel with two views rather than two plugins, because they are the same
+  // list seen two ways and a second bar icon would be clutter.
+  property string view: "picker"
+  property string masterName: ""
+
+  // The switcher's list. Hidden profiles are still in `profiles` so the manage
+  // view can unhide them; only this derived list drops them.
+  readonly property var visibleProfiles: {
+    var out = []
+    for (var i = 0; i < profiles.length; i++) if (!profiles[i].hidden) out.push(profiles[i])
+    return out
+  }
+
+  // Fire-and-forget: every mutation goes through the engine and comes back as a
+  // changed index file, so the UI never holds a second copy of the truth.
+  function runEngine(args) {
+    if (!root.bar || typeof root.bar.run !== "function") {
+      console.warn("graveklar.profiles", "No bar facade to run the engine through")
+      return
+    }
+    root.bar.run(root.engine + " " + args)
+  }
   // Set while the engine runs so a row can show it was the one picked; the
   // state file arriving is what actually clears it.
   property string applying: ""
 
   function indexOf(id) {
     for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return i
+    return -1
+  }
+
+  function visibleIndexOf(id) {
+    for (var i = 0; i < visibleProfiles.length; i++) if (visibleProfiles[i].id === id) return i
     return -1
   }
 
@@ -116,7 +147,7 @@ Panel {
       if (parsed && typeof parsed === "object" && typeof parsed.profile === "string") {
         root.currentProfile = parsed.profile
         root.applying = ""
-        var i = root.indexOf(parsed.profile)
+        var i = root.visibleIndexOf(parsed.profile)
         if (i >= 0) root.cursor = i
         return
       }
@@ -133,7 +164,7 @@ Panel {
 
   onOpenedChanged: if (opened) {
     cursorActive = false
-    if (currentProfile !== "") cursor = Math.max(0, indexOf(currentProfile))
+    if (currentProfile !== "") cursor = Math.max(0, visibleIndexOf(currentProfile))
     stateFile.reload()
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
@@ -257,9 +288,16 @@ Panel {
 
       onMoveRequested: function (dx, dy) {
         root.cursorActive = true
-        if (dy !== 0) root.cursor = Math.max(0, Math.min(root.profiles.length - 1, root.cursor + dy))
+        var len = (root.view === "manage" ? root.profiles.length : root.visibleProfiles.length)
+        if (dy !== 0) root.cursor = Math.max(0, Math.min(Math.max(0, len - 1), root.cursor + dy))
       }
-      onActivateRequested: root.apply(root.profiles[root.cursor].id)
+      onActivateRequested: {
+        // Enter only switches in the picker; in the manage view the row's own
+        // buttons are the actions, and an accidental Enter must not delete one.
+        if (root.view !== "picker") return
+        var e = root.visibleProfiles[root.cursor]
+        if (e) root.apply(e.id)
+      }
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
 
@@ -270,10 +308,11 @@ Panel {
 
         PanelHero {
           width: parent.width
-          title: "Profiles"
+          title: root.view === "manage" ? "Manage profiles" : "Profiles"
           detail: root.currentProfile !== "" ? root.label(root.currentProfile) : "Not set"
           meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
-                                     : "Same apps and files, different machine"
+                : (root.view === "manage" ? "Create, remove, or hide a profile"
+                                          : "Same files, a different desk")
           foreground: root.foreground
           fontFamily: root.fontFamily
 
@@ -286,13 +325,33 @@ Panel {
               font.pixelSize: Style.font.display
             }
           }
+
+          // The way between the two views, in the one place a hero control
+          // belongs. Switching resets the cursor: the two lists are different
+          // lengths, so a carried-over index can point past the end.
+          trailingControl: Component {
+            PanelActionButton {
+              iconText: root.view === "manage" ? "󰌍" : "󰒓"
+              tooltipText: root.view === "manage" ? "Back to switching" : "Manage profiles"
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                root.view = root.view === "manage" ? "picker" : "manage"
+                root.cursor = 0
+                root.cursorActive = false
+              }
+            }
+          }
         }
 
         PanelSeparator { foreground: root.foreground }
 
+        // ---------------------------------------------------------- picker
+
         Column {
           width: parent.width
           spacing: Style.space(4)
+          visible: root.view === "picker"
 
           PanelSectionHeader {
             width: parent.width
@@ -302,7 +361,9 @@ Panel {
           }
 
           Repeater {
-            model: root.profiles
+            // Hidden profiles stay out of the switcher but remain in the
+            // manage view, which is the whole point of hiding one.
+            model: root.visibleProfiles
 
             ProfileRow {
               required property var modelData
@@ -312,13 +373,49 @@ Panel {
               rowIndex: index
             }
           }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            visible: root.visibleProfiles.length === 0
+            wrapMode: Text.WordWrap
+            text: "No profiles yet. Run `omarchy-profile init` to adopt this machine as your master profile."
+            color: root.dim
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
+
+        // ---------------------------------------------------------- manage
+
+        ManageView {
+          width: parent.width
+          visible: root.view === "manage"
+          profiles: root.profiles
+          currentProfile: root.currentProfile
+          masterName: root.masterName
+          foreground: root.foreground
+          accent: root.accent
+          dim: root.dim
+          fontFamily: root.fontFamily
+          cursorActive: root.cursorActive
+          cursor: root.cursor
+          onRunEngine: function (args) { root.runEngine(args) }
+          onCursorMoved: function (index) { root.cursorActive = true; root.cursor = index }
+          onOpenSettings: function (profile) {
+            // The per-profile app and plugin toggles are not built yet; say so
+            // rather than opening an empty screen.
+            root.runEngine("catalog")
+            console.warn("graveklar.profiles", "settings view not implemented yet for", profile)
+          }
         }
 
         Text {
           textFormat: Text.PlainText
           width: parent.width
           topPadding: Style.space(2)
-          text: "j/k move · enter apply · middle-click the bar to cycle"
+          text: root.view === "manage" ? "esc closes · the gear returns to switching"
+                                       : "j/k move · enter apply · middle-click the bar to cycle"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
