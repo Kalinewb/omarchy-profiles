@@ -165,22 +165,50 @@ omarchy-profile unlock work    # stops asking — and asks first, to prove you c
 ```
 
 Authentication goes through **PAM**, not a passphrase of this plugin's own,
-because PAM is already where your identity is decided. `sudo -v` runs your
-configured auth stack, so whatever you have set up works with nothing added
-here — a face (`pam_exec` with a verifier, as `omarchy-face` installs), a
-fingerprint (`pam_fprintd`), or your password as the fallback. Adding a method
-later needs no change to this plugin.
+because PAM is already where your identity is decided. Whatever you have set up
+works with nothing added here — a face (`pam_exec` with a verifier, as
+`omarchy-face` installs), a fingerprint (`pam_fprintd`), or your password as the
+fallback. Adding a method later needs no change to this plugin.
 
-`sudo -k` runs first, deliberately: a cached sudo timestamp would otherwise let
-someone walk up to an unattended machine and enter a locked profile with no
-prompt at all. The cost is that your next real `sudo` asks again.
+The default `unlock.method` is `polkit`. `pkcheck` asks for an authorisation
+decision on the action `no.graveklar.profiles.unlock` without running anything
+as root, because that is what this is — a decision, not a privileged action, and
+it should not have to become one to be asked. The agent runs the `polkit-1` PAM
+stack, so a face is tried first where one is configured, then the password.
 
-The panel has no terminal to prompt in, so a locked switch relaunches the same
-command in a floating themed terminal and does the work there. Authentication
-happens **before** anything is captured or written, so a failed unlock leaves
-the machine exactly where it was.
+The policy is `auth_self` deliberately **without** `_keep`. A cached
+authorisation is precisely the hole this gate exists to close: the threat is a
+person at an unattended machine, and "you authorised something five minutes ago"
+is no evidence that you are the one standing here now.
 
-Set `unlock.method` to `none` in `config.json` on a machine without sudo.
+Because polkit draws its own dialog through the session agent, a locked switch
+started from the panel no longer relaunches itself in a floating terminal.
+Authentication still happens **before** anything is captured or written, so a
+failed unlock leaves the machine exactly where it was.
+
+`unlock.method` may also be `sudo` (the previous behaviour: `sudo -k` then
+`sudo -v`, which works but clobbers your real sudo timestamp as a side effect)
+or `none`.
+
+### A face other than yours
+
+A profile can also answer to a named face that is not the account owner's:
+
+```bash
+omarchy-profile identity work partner   # bind
+omarchy-profile identity work           # read
+omarchy-profile identity work none      # clear
+```
+
+The face is enrolled by `omarchy-face` and verified through
+`omarchy-face-identity`, which needs no authorisation prompt — the point is that
+the other person cannot authorise as you. Binding one is gated exactly like
+unlocking, because choosing who else may enter a profile is at least as
+consequential as entering it.
+
+The check is **additive**. If the named face is not recognised, the owner check
+still runs, so a camera that cannot see is never the reason somebody is locked
+out of their own machine.
 
 ### What this is, and what it is not
 
@@ -190,3 +218,9 @@ It is **not** a security boundary. Every profile runs as the same Unix user, so
 a process running as you can read any profile's files whether or not this
 prompt exists. Real isolation would need a separate Unix user and a separate
 login session, which is not a profile switch.
+
+**The same is true of a bound identity.** A profile can name whose face opens
+it — a partner's, say — but the binding lives in `~/.config`, writable by the
+same user who is being gated. It decides who the machine greets, not who can
+reach the files. A profile bound to somebody else's face is not private from
+you, and yours is not private from anyone who can edit your config.

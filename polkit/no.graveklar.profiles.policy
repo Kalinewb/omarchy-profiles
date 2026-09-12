@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>omarchy-profiles</vendor>
+
+  <!--
+    auth_self, deliberately without _keep.
+
+    A cached authorisation is exactly the hole this gate exists to close: the
+    threat is a person at an unattended machine, and "you authorised something
+    five minutes ago" is no evidence at all that you are the one standing here
+    now. The old sudo path took the same view and paid for it by running
+    `sudo -k`, which clobbered the user's real sudo timestamp as a side effect.
+    Asking polkit instead gets the same guarantee without touching sudo.
+  -->
+  <action id="no.graveklar.profiles.unlock">
+    <description>Enter a locked profile</description>
+    <message>Authentication is required to enter this profile</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+
+</policyconfig>

@@ -58,7 +58,8 @@ Panel {
           blurb: String(p.description || ""),
           master: !!p.master,
           hidden: !!p.hidden,
-          locked: !!p.locked
+          locked: !!p.locked,
+          identity: String(p.identity || "")
         })
         if (p.master) root.masterName = String(p.name || "")
       }

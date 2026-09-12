@@ -215,6 +215,7 @@ Column {
     // Visible now and the only one left: hiding it would empty the picker.
     readonly property bool hideWouldEmpty: !(row.entry && row.entry.hidden) && root.visibleCount <= 1
     readonly property bool locked: !!(row.entry && row.entry.locked)
+    readonly property string identity: row.entry ? String(row.entry.identity || "") : ""
 
     foreground: root.foreground
     accent: root.accent
@@ -266,6 +267,20 @@ Column {
         Text {
           textFormat: Text.PlainText
           width: labels.width
+          visible: row.locked && row.identity !== ""
+          // Whose lock this is, stated on the row. Enrolment is deliberately
+          // not here: the face plugin owns the camera and the model store, and
+          // two plugins competing for one IR sensor is a bug in waiting.
+          text: "Opens for " + row.identity
+          color: root.accent
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+          elide: Text.ElideRight
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          width: labels.width
           text: row.entry ? String(row.entry.blurb || "") : ""
           color: root.dim
           font.family: root.fontFamily
@@ -298,9 +313,14 @@ Column {
         // it is the one most worth gating.
         PanelActionButton {
           iconText: row.locked ? "󰌾" : "󰌿"
-          tooltipText: row.locked
-            ? "Entering " + row.name + " asks for your face or password — click to stop asking"
-            : "Ask for your face or password before entering " + row.name
+          // Naming whose face opens it is the point. A lock that opens for
+          // somebody else and does not say so is worse than no lock: you would
+          // believe it was yours.
+          tooltipText: !row.locked
+            ? "Ask for a face or password before entering " + row.name
+            : (row.identity !== ""
+               ? "Opens for " + row.identity + ", or for you — click to stop asking"
+               : "Entering " + row.name + " asks for your face or password — click to stop asking")
           foreground: row.locked ? root.accent : root.foreground
           fontFamily: root.fontFamily
           onClicked: root.runEngine((row.locked ? "unlock " : "lock ") + row.name)

@@ -48,7 +48,7 @@ ensure_config() {
     restore_last_on_login: true, last: "",
     pinned_plugins: ["graveklar.profiles"], workspace_span: 10,
     isolate: [],
-    unlock: {method: "sudo"}
+    unlock: {method: "polkit"}
   }' >"$CONFIG_FILE"
 }
 
@@ -131,10 +131,53 @@ profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; 
 # a record. `journalctl --user -t omarchy-profile` shows it.
 audit() { logger -t omarchy-profile -p user.notice -- "$*" 2>/dev/null || true; }
 
+# True only for methods that need somewhere to type. polkit draws its own
+# dialog through the session agent, so a locked switch started from the panel
+# no longer has to relaunch itself in a floating terminal just to have a place
+# to prompt.
+auth_needs_terminal() {
+  [[ $(cfg '.unlock.method // "polkit"') == sudo ]]
+}
+
 authenticate() {
-  local method for_what=${1:-a locked profile}
-  method=$(cfg '.unlock.method // "sudo"')
+  local method for_what=${1:-a locked profile} profile=${2:-}
+  method=$(cfg '.unlock.method // "polkit"')
+
+  # A profile may name a face other than the owner's -- a partner's, say. PAM
+  # cannot express that: it authenticates the Unix user, and there is only one.
+  # So this is asked first and separately, and it is only ever additive. If the
+  # face is not recognised the owner check below still runs, so a camera that
+  # cannot see is never the reason somebody is locked out of their own machine.
+  if [[ -n $profile ]] && command -v omarchy-face-identity >/dev/null 2>&1; then
+    local identity
+    identity=$(jq -r '.identity // empty' "$(file_for "$profile")" 2>/dev/null)
+    if [[ -n $identity ]]; then
+      if omarchy-face-identity verify "$identity"; then
+        audit "unlock of $for_what succeeded: face matched identity '$identity'"
+        return 0
+      fi
+      audit "unlock of $for_what: identity '$identity' not recognised, falling back to the owner check"
+    fi
+  fi
+
   case $method in
+  polkit)
+    command -v pkcheck >/dev/null || {
+      warn "pkcheck is not available; set unlock.method to sudo or none"
+      audit "unlock of $for_what refused: pkcheck missing"
+      return 1
+    }
+    # pkcheck asks the question without running anything as root: this is an
+    # authorisation decision, not a privileged action, and it should not need
+    # to become one. The agent runs the polkit-1 PAM stack, so a face is tried
+    # first where omarchy-face has configured one, then the password.
+    if pkcheck --action-id no.graveklar.profiles.unlock \
+               --process "$$" --allow-user-interaction >/dev/null 2>&1; then
+      audit "unlock of $for_what succeeded via polkit (polkit-1 stack: face, fingerprint or password)"
+      return 0
+    fi
+    audit "unlock of $for_what failed via polkit"
+    return 1 ;;
   none)
     audit "unlock of $for_what allowed without a check (unlock.method=none)"
     return 0 ;;
@@ -159,6 +202,57 @@ authenticate() {
   esac
 }
 
+# Bind a named face to a profile, so that face opens it without the owner
+# having to authorise. The face itself is enrolled by omarchy-face; this only
+# records which one this profile answers to.
+#
+# Deliberately gated the same way unlocking is: choosing who else may enter a
+# profile is at least as consequential as entering it, and an ungated version
+# would let anyone at the keyboard point a locked profile at their own face.
+cmd_identity() {
+  local name=${1:-} identity=${2:-}
+  [[ -n $name ]] || die "usage: omarchy-profile identity <profile> <identity|none>"
+  exists "$name" || die "no such profile '$name'"
+
+  if [[ -z $identity ]]; then
+    jq -r '.identity // "none"' "$(file_for "$name")"
+    return 0
+  fi
+
+  if [[ -t 0 ]] || ! auth_needs_terminal; then
+    authenticate "the face bound to $name" "$name" ||
+      die "authentication failed — '$name' is unchanged"
+  else
+    relaunch_in_terminal identity "$name" "$identity"
+    return 0
+  fi
+
+  local tmp file
+  file=$(file_for "$name")
+  tmp=$(mktemp)
+
+  if [[ $identity == none ]]; then
+    jq 'del(.identity)' "$file" >"$tmp" && mv "$tmp" "$file"
+    audit "identity cleared on $name"
+    echo "$name no longer answers to a face of its own"
+    return 0
+  fi
+
+  command -v omarchy-face-identity >/dev/null 2>&1 ||
+    die "omarchy-face is not installed, so named faces cannot be verified"
+
+  # Refuse to point a profile at a face that was never enrolled: the profile
+  # would look configured and silently never open for anyone but the owner.
+  if ! omarchy-face-identity list | grep -qx -- "$identity"; then
+    rm -f "$tmp"
+    die "no face enrolled as '$identity' — enrol it first with omarchy-face"
+  fi
+
+  jq --arg i "$identity" '.identity = $i' "$file" >"$tmp" && mv "$tmp" "$file"
+  audit "identity '$identity' bound to $name"
+  echo "$name now also opens for the face enrolled as '$identity'"
+}
+
 cmd_lock() {
   local verb=$1 name=${2:-}
   [[ -n $name ]] || die "usage: omarchy-profile $verb <name>"
@@ -168,8 +262,8 @@ cmd_lock() {
   # Removing the lock proves you could get in, so it needs the same gate as
   # entering would. Otherwise the lock is a label anyone can peel off.
   if [[ $verb == unlock ]]; then
-    if [[ -t 0 ]]; then
-      authenticate "the lock on $name" || die "authentication failed — '$name' stays locked"
+    if [[ -t 0 ]] || ! auth_needs_terminal; then
+      authenticate "the lock on $name" "$name" || die "authentication failed — '$name' stays locked"
     else
       relaunch_in_terminal unlock "$name"
       return 0
@@ -242,11 +336,68 @@ ISOLATE_DIR="$STATE_DIR/isolated"
 store_key() { printf '%s' "${1#"$HOME"/}" | tr '/' '%'; }
 store_for() { printf '%s/%s/%s\n' "$ISOLATE_DIR" "$1" "$(store_key "$2")"; }
 
+# An isolate entry is either a bare path or {path, plugin}. The tagged form
+# exists so one control can answer "is this plugin the same in every profile",
+# which is the question a person actually has — they do not think in terms of
+# ~/.local/state/omarchy-spotify. Bare strings keep working.
 isolated_paths() {
-  cfg -c '.isolate // []' | jq -r '.[]' 2>/dev/null | while read -r p; do
-    [[ -n $p ]] || continue
-    printf '%s\n' "${p/#\~/$HOME}"
-  done
+  cfg -c '.isolate // []' |
+    jq -r '.[] | if type == "object" then .path else . end' 2>/dev/null |
+    while read -r p; do
+      [[ -n $p ]] || continue
+      printf '%s\n' "${p/#\~/$HOME}"
+    done
+}
+
+# Paths this plugin owns, whether isolated right now or parked in `shared`.
+plugin_paths() {
+  local id=$1
+  cfg -c '.isolate // []' |
+    jq -r --arg id "$id" '.[] | select(type == "object" and .plugin == $id) | .path' 2>/dev/null |
+    while read -r p; do [[ -n $p ]] && printf '%s\n' "${p/#\~/$HOME}"; done
+  cfg -c '.shared_paths // []' |
+    jq -r --arg id "$id" '.[] | select(.plugin == $id) | .path' 2>/dev/null |
+    while read -r p; do [[ -n $p ]] && printf '%s\n' "${p/#\~/$HOME}"; done
+}
+
+# Drop every isolate entry naming this path, in whichever form it was written.
+#
+# Entries exist as a bare string or as {path, plugin}, and as "~/..." or as a
+# full path, because both forms have been written at different times. Comparing
+# the literals missed the older ones, which then quietly re-isolated a plugin
+# that had just been made shared. Normalise both sides against $HOME instead.
+drop_isolate_path() {
+  local target=${1/#\~/$HOME}
+  cfg_set --arg t "$target" --arg home "$HOME" '
+    def norm: if startswith("~/") then ($home + .[1:]) else . end;
+    .isolate = ((.isolate // [])
+      | map(select(((if type == "object" then .path else . end) | norm) != $t)))
+  '
+}
+
+plugin_is_shared() {
+  cfg -c '.pinned_plugins // []' | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
+}
+
+# Pinned plugins that render in the bar.
+#
+# Pinning used to mean only "a profile may not add this to disabledPlugins",
+# which is not enough: applying a profile writes .bar wholesale from what that
+# profile captured, so a pinned widget missing from that snapshot still
+# vanished. A plugin that is the same in every profile has to be put back.
+pinned_bar_widgets() {
+  local catalog="$STATE_DIR/plugins.json"
+  [[ -s $catalog ]] || return 0
+  # `. as $p` before the pipe: inside `$pinned | index(...)` the input is the
+  # array, so a bare `.id` there indexes an array with a string and jq aborts.
+  # Same mistake as write_catalog had; it fails loudly there and silently here,
+  # which is why it survived — an empty list just looks like "nothing pinned".
+  jq -r --argjson pinned "$(cfg -c '.pinned_plugins // []')" '
+    .[] | . as $p
+        | select(($pinned | index($p.id)) != null)
+        | select($p.kinds | index("bar-widget"))
+        | $p.id
+  ' "$catalog" 2>/dev/null
 }
 
 # Drop stores belonging to profiles that no longer exist. Removal cleans up
@@ -308,10 +459,24 @@ cmd_isolate() {
     echo
     echo "* = currently pointed at the active profile's copy" ;;
   add)
-    [[ -n $path ]] || die "usage: omarchy-profile isolate add <path>"
+    # isolate add [--plugin <id>] <path>
+    #
+    # The tag is what lets one "same in every profile" control move a plugin's
+    # paths together. It cannot be guessed: quickshell.spotify keeps its session
+    # in omarchy-spotify, and nothing in either name implies the other.
+    local plugin=""
+    if [[ $path == --plugin ]]; then plugin=${3:-}; path=${4:-}; fi
+    [[ -n $path ]] || die "usage: omarchy-profile isolate add [--plugin <id>] <path>"
     local rel; rel=$(printf '%s' "$path" | sed "s|^$HOME/|~/|")
-    cfg_set --arg p "$rel" '.isolate = (((.isolate // []) + [$p]) | unique)' ||
-      die "could not record '$path'"
+    if [[ -n $plugin ]]; then
+      drop_isolate_path "$path"
+      cfg_set --arg p "$rel" --arg id "$plugin" \
+        '.isolate = ((.isolate // []) + [{path: $p, plugin: $id}])' ||
+        die "could not record '$path'"
+    else
+      cfg_set --arg p "$rel" '.isolate = (((.isolate // []) + [$p]) | unique)' ||
+        die "could not record '$path'"
+    fi
     # Adopt what is live into the profile the user is in, then point at it.
     # Passing the same profile as both sides does exactly that: the real file
     # is filed under it, and the symlink comes back to the copy just made.
@@ -329,11 +494,81 @@ cmd_isolate() {
       rm -f "$expanded"
       [[ -e $store ]] && mv "$store" "$expanded"
     fi
-    cfg_set --arg p "${path/#$HOME/~}" --arg q "$expanded" \
-      '.isolate = ((.isolate // []) | map(select(. != $p and . != $q)))' ||
-      die "could not update the isolate list"
+    drop_isolate_path "$expanded" || die "could not update the isolate list"
     echo "no longer isolating ${path/#$HOME/~}" ;;
   *) die "unknown isolate verb '$verb' (list, add, remove)" ;;
+  esac
+}
+
+# "Is this plugin the same in every profile?" — one question, one control.
+#
+# Two mechanisms sit underneath it and a person should not have to know either:
+# pinning keeps the plugin out of disabledPlugins and forces its widget back
+# into every profile's bar, and un-isolating its state files gives it one
+# account rather than one per profile. Answering them separately is how you end
+# up with music playing and no player: the daemon kept going while the widget
+# came back signed in to a different profile's empty session.
+cmd_shared() {
+  local verb=${1:-list} id=${2:-}
+  case $verb in
+  list)
+    local any=0 p
+    while read -r p; do
+      [[ -n $p ]] || continue
+      any=1
+      printf '  %s\n' "$p"
+    done < <(cfg -c '.pinned_plugins // []' | jq -r '.[]')
+    ((any)) || echo "nothing shared"
+    echo
+    echo "These are in every profile's bar, cannot be switched off by a profile,"
+    echo "and use one set of files rather than one per profile." ;;
+  add)
+    [[ -n $id ]] || die "usage: omarchy-profile shared add <plugin-id>"
+    cfg_set --arg id "$id" '.pinned_plugins = (((.pinned_plugins // []) + [$id]) | unique)' ||
+      die "could not pin '$id'"
+
+    # Stop isolating its paths, and keep the record so unsharing can restore it.
+    # The active profile's copy becomes the real file, since that is the one the
+    # user has been using and the only one that is certainly current.
+    local path expanded cur store rel
+    cur=$(current_profile)
+    while read -r path; do
+      [[ -n $path ]] || continue
+      expanded=${path/#\~/$HOME}
+      rel=$(printf '%s' "$expanded" | sed "s|^$HOME/|~/|")
+      if [[ -L $expanded && -n $cur ]]; then
+        store=$(store_for "$cur" "$expanded")
+        rm -f "$expanded"
+        [[ -e $store ]] && mv "$store" "$expanded"
+      fi
+      drop_isolate_path "$expanded"
+      cfg_set --arg p "$rel" --arg id "$id" \
+        '.shared_paths = (((.shared_paths // []) + [{path: $p, plugin: $id}]) | unique)' ||
+        warn "could not stop isolating $rel"
+    done < <(plugin_paths "$id")
+    write_catalog
+    echo "$id is now the same in every profile" ;;
+  remove)
+    [[ -n $id ]] || die "usage: omarchy-profile shared remove <plugin-id>"
+    [[ $id == graveklar.profiles ]] &&
+      die "the profile picker stays shared — a profile that could hide it would leave no way back"
+    cfg_set --arg id "$id" '.pinned_plugins = ((.pinned_plugins // []) | map(select(. != $id)))' ||
+      die "could not unpin '$id'"
+    # Anything parked in shared_paths goes back to being isolated.
+    local path rel
+    while read -r path; do
+      [[ -n $path ]] || continue
+      rel=$(printf '%s' "${path/#\~/$HOME}" | sed "s|^$HOME/|~/|")
+      cfg_set --arg p "$rel" --arg id "$id" \
+        '.shared_paths = ((.shared_paths // []) | map(select(.path != $p)))
+         | .isolate = (((.isolate // []) + [{path: $p, plugin: $id}]))' ||
+        warn "could not isolate $rel again"
+    done < <(cfg -c '.shared_paths // []' | jq -r --arg id "$id" '.[] | select(.plugin == $id) | .path')
+    local cur; cur=$(current_profile)
+    [[ -n $cur ]] && swap_isolated "$cur" "$cur"
+    write_catalog
+    echo "$id is now per profile" ;;
+  *) die "unknown shared verb '$verb' (list, add, remove)" ;;
   esac
 }
 
@@ -403,6 +638,7 @@ write_index() {
         master: $is_master,
         hidden: (.hidden // false),
         locked: (.locked // false),
+        identity: (.identity // ""),
         theme: (.theme // ""),
         icon: (.icon // ""),
         offset: (.workspaces.offset // 0)
@@ -534,14 +770,32 @@ apply_profile() {
   bar=$(jq -c '.bar // empty' "$file")
   local disabled
   disabled=$(jq -c '.plugins.disabled // empty' "$file")
+
+  # Shared widgets go back into the layout if this profile's snapshot predates
+  # them being shared, and are taken out of disabledPlugins whatever the
+  # profile says. "The same in every profile" has to survive a stale capture,
+  # or the guarantee is only true until the next time you save a profile.
+  local pinned_widgets pinned_all
+  pinned_widgets=$(pinned_bar_widgets | jq -R . | jq -sc .)
+  pinned_all=$(cfg -c '.pinned_plugins // []')
+
   if [[ -n $bar || -n $disabled ]]; then
     (
       # shellcheck disable=SC1091
       source /usr/share/omarchy/bin/omarchy-shell-config
       commit "$NORMALIZE
               | (if \$bar == null then . else .bar = \$bar end)
-              | (if \$disabled == null then . else .disabledPlugins = \$disabled end)" \
-        --argjson bar "${bar:-null}" --argjson disabled "${disabled:-null}"
+              | (if \$disabled == null then . else .disabledPlugins = \$disabled end)
+              | .disabledPlugins = (.disabledPlugins - \$pinned_all)
+              | ([.bar.layout.left, .bar.layout.center, .bar.layout.right]
+                 | map(map(.id)) | add) as \$present
+              | .bar.layout.right = (
+                  (\$pinned_widgets
+                   | map(. as \$id | select((\$present | index(\$id)) == null) | {id: \$id}))
+                  + .bar.layout.right)" \
+        --argjson bar "${bar:-null}" --argjson disabled "${disabled:-null}" \
+        --argjson pinned_widgets "${pinned_widgets:-[]}" \
+        --argjson pinned_all "${pinned_all:-[]}"
     ) >/dev/null 2>&1 || warn "could not write bar/plugins to shell.json"
   fi
 
@@ -618,8 +872,9 @@ cmd_list() {
 cmd_current() { local c; c=$(current_profile); [[ -n $c ]] && echo "$c" || echo "unknown"; }
 
 cmd_set() {
-  local name=${1:-}
-  [[ -n $name ]] || die "usage: omarchy-profile set <name>"
+  local name=${1:-} as_owner=""
+  [[ ${2:-} == --as-owner ]] && as_owner=1
+  [[ -n $name ]] || die "usage: omarchy-profile set <name> [--as-owner]"
   exists "$name" || die "no such profile '$name' (try: omarchy-profile list)"
   if is_master "$name" && [[ $(cfg .master_switchable) != true ]]; then
     die "master is configured as a template only (master_switchable=false)"
@@ -633,8 +888,25 @@ cmd_set() {
   # unlock has to leave the machine exactly where it was, not half-way into a
   # profile it never opened.
   if profile_locked "$name"; then
-    if [[ -t 0 ]]; then
-      authenticate "$name" || die "authentication failed — staying in ${cur:-the current profile}"
+    if [[ -t 0 ]] || ! auth_needs_terminal; then
+      # --as-owner skips the bound-identity attempt.
+      #
+      # The identity check runs the camera engine, which waits out its own
+      # timeout before failing — around nine seconds with the IR emitter
+      # warm-up. Without this the owner of the machine pays that wait, every
+      # time, before their own prompt even appears, on any profile that has
+      # somebody else's face bound to it.
+      #
+      # Racing the two would be better than choosing between them: start the
+      # identity check in the background, raise the prompt immediately, first
+      # success wins. That needs a per-call timeout and clean cancellation from
+      # omarchy-face, so this flag is the interim.
+      # Passing no profile is what suppresses the identity attempt, since
+      # authenticate() only looks for a bound identity when it is given one.
+      local auth_profile="$name"
+      [[ -n $as_owner ]] && auth_profile=""
+      authenticate "$name" "$auth_profile" ||
+        die "authentication failed — staying in ${cur:-the current profile}"
     else
       relaunch_in_terminal set "$name"
       return 0
@@ -983,10 +1255,12 @@ ensure_config
 
 case "${1:-}" in
 catalog) write_catalog ;;
-isolate) shift; cmd_isolate "${1:-list}" "${2:-}" ;;
+isolate) shift; cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
+shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 lock) shift; cmd_lock lock "${1:-}" ;;
 unlock) shift; cmd_lock unlock "${1:-}" ;;
-set) shift; cmd_set "${1:-}" ;;
+identity) shift; cmd_identity "${1:-}" "${2:-}" ;;
+set) shift; cmd_set "${1:-}" "${2:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
 remove) shift; cmd_remove "${1:-}" ;;
