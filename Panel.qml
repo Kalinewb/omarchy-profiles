@@ -76,6 +76,24 @@ Panel {
   property string view: "picker"
   property string masterName: ""
 
+  // Which profile a remove confirmation is about. Empty means no dialog.
+  // Owned here, not by the manage view: a ConfirmDialog needs anchors, and a
+  // Column child may not have them.
+  property string pendingRemoval: ""
+
+  // Which profile the settings view is editing.
+  property string settingsProfile: ""
+  property var pluginCatalog: []
+  property var settingsDisabled: []
+
+  readonly property string catalogPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
+    + "/omarchy-profiles/plugins.json"
+
+  // A misclick on the bar should not leave this sitting open. Any interaction
+  // restarts the countdown, so it only closes when genuinely untouched.
+  readonly property int idleCloseMs: 8000
+  function keepAlive() { if (root.opened) idleClose.restart() }
+
   // The switcher's list. Hidden profiles are still in `profiles` so the manage
   // view can unhide them; only this derived list drops them.
   readonly property var visibleProfiles: {
@@ -182,6 +200,45 @@ Panel {
   }
 
   FileView {
+    id: catalogFile
+    path: root.catalogPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        if (Array.isArray(parsed)) root.pluginCatalog = parsed
+      } catch (e) {
+        console.warn("graveklar.profiles", "Ignoring bad plugin catalog", root.catalogPath, e)
+      }
+    }
+    onLoadFailed: root.pluginCatalog = []
+  }
+
+  // The edited profile's own file, so its switches show its saved state rather
+  // than the machine's current state.
+  FileView {
+    id: profileFile
+    path: root.settingsProfile === "" ? ""
+          : (Quickshell.env("XDG_CONFIG_HOME") || root.home + "/.config")
+            + "/omarchy/profiles/" + root.settingsProfile + ".json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        var d = (parsed && parsed.plugins && parsed.plugins.disabled) || []
+        root.settingsDisabled = Array.isArray(d) ? d : []
+      } catch (e) {
+        root.settingsDisabled = []
+      }
+    }
+    onLoadFailed: root.settingsDisabled = []
+  }
+
+  FileView {
     id: indexFile
     path: root.indexPath
     watchChanges: true
@@ -228,6 +285,16 @@ Panel {
     triggeredOnStart: false
     running: root.applying !== ""
     onTriggered: stateFile.reload()
+  }
+
+  Timer {
+    id: idleClose
+    interval: root.idleCloseMs
+    repeat: false
+    running: root.opened && root.pendingRemoval === ""
+    // A pending confirmation is a question waiting for an answer; timing that
+    // out would dismiss the dialog without the user deciding anything.
+    onTriggered: if (root.opened && root.pendingRemoval === "") root.close()
   }
 
   // If the engine dies without writing state, stop showing "switching…".
@@ -282,11 +349,34 @@ Panel {
     contentWidth: panel.fittedContentWidth(Style.space(300))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
 
+    // Anchored over the whole panel, and deliberately NOT a Column child: QML
+    // refuses anchors inside a Column, and without them the dialog was laid
+    // out as an ordinary row that filled the panel with a blank page.
+    ConfirmDialog {
+      id: removeDialog
+      anchors.fill: parent
+      z: 10
+      opened: root.pendingRemoval !== ""
+      message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar and plugin list are deleted. Windows still open on its workspaces are left where they are."
+      confirmText: "Remove"
+      cancelText: "Keep"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      onCanceled: root.pendingRemoval = ""
+      onConfirmed: {
+        root.runEngine("remove " + root.pendingRemoval)
+        root.pendingRemoval = ""
+        // The removed profile may be the one the settings view was editing.
+        if (root.view === "settings") { root.view = "manage"; root.settingsProfile = "" }
+      }
+    }
+
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
 
       onMoveRequested: function (dx, dy) {
+        root.keepAlive()
         root.cursorActive = true
         var len = (root.view === "manage" ? root.profiles.length : root.visibleProfiles.length)
         if (dy !== 0) root.cursor = Math.max(0, Math.min(Math.max(0, len - 1), root.cursor + dy))
@@ -308,7 +398,8 @@ Panel {
 
         PanelHero {
           width: parent.width
-          title: root.view === "manage" ? "Manage profiles" : "Profiles"
+          title: root.view === "settings" ? root.settingsProfile
+                 : (root.view === "manage" ? "Manage profiles" : "Profiles")
           detail: root.currentProfile !== "" ? root.label(root.currentProfile) : "Not set"
           meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
                 : (root.view === "manage" ? "Create, remove, or hide a profile"
@@ -331,12 +422,17 @@ Panel {
           // lengths, so a carried-over index can point past the end.
           trailingControl: Component {
             PanelActionButton {
-              iconText: root.view === "manage" ? "󰌍" : "󰒓"
-              tooltipText: root.view === "manage" ? "Back to switching" : "Manage profiles"
+              iconText: root.view === "picker" ? "󰒓" : "󰌍"
+              tooltipText: root.view === "picker" ? "Manage profiles" : "Back"
               foreground: root.foreground
               fontFamily: root.fontFamily
               onClicked: {
-                root.view = root.view === "manage" ? "picker" : "manage"
+                root.keepAlive()
+                // One step back each press, so settings returns to the list it
+                // was opened from rather than jumping to the switcher.
+                if (root.view === "settings") { root.view = "manage"; root.settingsProfile = "" }
+                else if (root.view === "manage") root.view = "picker"
+                else root.view = "manage"
                 root.cursor = 0
                 root.cursorActive = false
               }
@@ -400,22 +496,40 @@ Panel {
           fontFamily: root.fontFamily
           cursorActive: root.cursorActive
           cursor: root.cursor
-          onRunEngine: function (args) { root.runEngine(args) }
-          onCursorMoved: function (index) { root.cursorActive = true; root.cursor = index }
+          visibleCount: root.visibleProfiles.length
+          onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
+          onCursorMoved: function (index) { root.keepAlive(); root.cursorActive = true; root.cursor = index }
+          onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
           onOpenSettings: function (profile) {
-            // The per-profile app and plugin toggles are not built yet; say so
-            // rather than opening an empty screen.
+            root.keepAlive()
+            root.settingsProfile = profile
+            root.view = "settings"
             root.runEngine("catalog")
-            console.warn("graveklar.profiles", "settings view not implemented yet for", profile)
           }
+        }
+
+        SettingsView {
+          width: parent.width
+          visible: root.view === "settings"
+          profile: root.settingsProfile
+          isMaster: root.settingsProfile === root.masterName
+          plugins: root.pluginCatalog
+          disabled: root.settingsDisabled
+          foreground: root.foreground
+          accent: root.accent
+          dim: root.dim
+          fontFamily: root.fontFamily
+          onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
+          onTouched: root.keepAlive()
         }
 
         Text {
           textFormat: Text.PlainText
           width: parent.width
           topPadding: Style.space(2)
-          text: root.view === "manage" ? "esc closes · the gear returns to switching"
-                                       : "j/k move · enter apply · middle-click the bar to cycle"
+          text: root.view === "settings" ? "back returns to the list · closes itself if left alone"
+                : (root.view === "manage" ? "esc closes · the arrow returns to switching"
+                   : "j/k move · enter apply · middle-click the bar to cycle")
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -467,7 +581,8 @@ Panel {
         Text {
           textFormat: Text.PlainText
           text: row.entry ? row.entry.label : ""
-          color: root.foreground
+          // Master is distinguished by colour, not by a tag beside the name.
+          color: (row.entry && row.entry.master) ? root.accent : root.foreground
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
           font.bold: row.current

@@ -27,9 +27,13 @@ Column {
   signal runEngine(string args)
   signal openSettings(string profile)
   signal cursorMoved(int index)
+  // The panel owns the confirmation dialog; a Column cannot host one.
+  signal confirmRemove(string profile)
 
-  // Which profile the remove confirmation is about. Empty means closed.
-  property string pendingRemoval: ""
+  // How many profiles the picker currently offers. Hiding the last one is
+  // refused, so the button is disabled rather than failing after the click.
+  property int visibleCount: 0
+
   property bool creating: false
   property bool createFromMaster: true
 
@@ -162,23 +166,10 @@ Column {
     root.creating = false
   }
 
-  ConfirmDialog {
-    id: removeDialog
-    anchors.fill: parent
-    opened: root.pendingRemoval !== ""
-    // Named plainly: this deletes a saved desk, and its windows are the thing
-    // a person will actually miss.
-    message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar and app list are deleted. Any windows still open on its workspaces are left where they are."
-    confirmText: "Remove"
-    cancelText: "Keep"
-    foreground: root.foreground
-    fontFamily: root.fontFamily
-    onCanceled: root.pendingRemoval = ""
-    onConfirmed: {
-      root.runEngine("remove " + root.pendingRemoval)
-      root.pendingRemoval = ""
-    }
-  }
+  // NOTE: the remove confirmation is NOT here. A Column child may not use
+  // anchors — QML refuses it — and an unanchored ConfirmDialog was laid out as
+  // an ordinary row, so it took the whole panel and showed as a blank page.
+  // The panel hosts the dialog instead and drives it through `confirmRemove`.
 
   // One profile: name, what it is, and the actions that apply to it. Master
   // and the active profile lose the actions that would strand the user.
@@ -190,6 +181,8 @@ Column {
     readonly property string name: row.entry ? String(row.entry.id || "") : ""
     readonly property bool master: root.isMaster(row.name)
     readonly property bool active: row.name === root.currentProfile
+    // Visible now and the only one left: hiding it would empty the picker.
+    readonly property bool hideWouldEmpty: !(row.entry && row.entry.hidden) && root.visibleCount <= 1
 
     foreground: root.foreground
     accent: root.accent
@@ -229,19 +222,12 @@ Column {
           Text {
             textFormat: Text.PlainText
             text: row.entry ? String(row.entry.label || row.name) : ""
-            color: root.foreground
+            // The master is marked by colour alone. A "master" tag beside the
+            // name said the same thing twice and crowded the row.
+            color: row.master ? root.accent : root.foreground
             font.family: root.fontFamily
             font.pixelSize: Style.font.body
             font.bold: row.active
-          }
-
-          Text {
-            textFormat: Text.PlainText
-            visible: row.master
-            text: "master"
-            color: root.accent
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
           }
         }
 
@@ -291,7 +277,7 @@ Column {
           hoverColor: Color.urgent
           fontFamily: root.fontFamily
           enabled: !row.master && !row.active
-          onClicked: root.pendingRemoval = row.name
+          onClicked: root.confirmRemove(row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
       }

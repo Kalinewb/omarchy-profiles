@@ -231,14 +231,22 @@ apply_profile() {
   inhibit=$(jq -r 'if (.idle.inhibit // false) then "true" else "false" end' "$file")
   browser=$(jq -r '.browser_profile // "default"' "$file")
 
-  # Theme. Skipped when already current — retinting every terminal, the browser
-  # policy and the shell takes seconds and there is no reason to pay it to
-  # arrive where we already are. Backgrounded so the picker returns at once.
+  # Theme, FIRST and synchronously.
+  #
+  # This used to be backgrounded for a snappier picker, and the theme loaded
+  # inconsistently as a result: `omarchy theme set` rewrites shell config and
+  # asks the shell to reload, while the steps below also write shell.json and
+  # request their own reload. Two writers racing over the same file meant
+  # whichever finished last won, so the theme sometimes half-applied or not at
+  # all. Waiting costs a couple of seconds per switch and is always correct.
+  #
+  # Still skipped when already current: retinting every terminal, the browser
+  # policy and the shell is the expensive part, and there is no reason to pay
+  # it to arrive where we already are.
   local live_theme=""
   [[ -s $THEME_NAME_FILE ]] && live_theme=$(<"$THEME_NAME_FILE")
   if [[ -n $theme && $theme != "$live_theme" ]]; then
-    omarchy theme set "$theme" >/dev/null 2>&1 &
-    disown
+    omarchy theme set "$theme" >/dev/null 2>&1 || warn "could not set theme '$theme'"
   fi
 
   # Bar layout and plugin enablement, written together in one atomic commit so
@@ -395,14 +403,45 @@ cmd_remove() {
     die "'$name' still has $live window(s) on workspaces $((offset + 1))-$((offset + span)). Close them, or re-run with --force to orphan them."
   fi
   rm -f "$(file_for "$name")"
+
+  # Removing the last visible profile would leave nothing to switch to, so the
+  # master comes back into the picker rather than the user being stranded with
+  # an empty list. Master is the fallback precisely because it always exists.
+  if [[ $(visible_names | wc -l) -eq 0 ]]; then
+    local master; master=$(cfg .master)
+    if exists "$master"; then
+      local tmp; tmp=$(mktemp)
+      jq '.hidden = false' "$(file_for "$master")" >"$tmp" && mv "$tmp" "$(file_for "$master")"
+      echo "removed $name — $master is visible again, since nothing else was"
+    fi
+  else
+    echo "removed $name"
+  fi
   write_index
-  echo "removed $name"
+}
+
+# Profiles the picker will offer.
+visible_names() {
+  while read -r n; do
+    [[ -n $n ]] || continue
+    jq -e '.hidden // false' "$(file_for "$n")" >/dev/null 2>&1 || echo "$n"
+  done < <(profile_names)
 }
 
 cmd_visibility() {
   local verb=$1 name=${2:-}
   [[ -n $name ]] || die "usage: omarchy-profile $verb <name>"
   exists "$name" || die "no such profile '$name'"
+
+  # Hiding the last visible profile would leave the picker empty and no way to
+  # switch at all. Master is allowed to be hidden like any other — it just
+  # cannot be the one that empties the list.
+  if [[ $verb == hide ]]; then
+    local remaining
+    remaining=$(visible_names | grep -vx "$name" | wc -l)
+    ((remaining >= 1)) || die "'$name' is the only profile left in the picker — make another one visible first"
+  fi
+
   local hidden=true; [[ $verb == show ]] && hidden=false
   local tmp; tmp=$(mktemp)
   jq --argjson h "$hidden" '.hidden = $h' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
@@ -454,7 +493,18 @@ cmd_plugin() {
     else
       jq --arg i "$id" '.plugins = ((.plugins // {}) | .disabled = ((.disabled // []) | map(select(. != $i))))' "$file" >"$tmp"
     fi
-    mv "$tmp" "$file" && echo "$verb $id in $name" ;;
+    mv "$tmp" "$file" || { rm -f "$tmp"; die "could not update '$name'"; }
+
+    # Editing the profile you are currently in has to change the machine too,
+    # not just the file. Otherwise the next switch captures live state over the
+    # edit and it silently disappears — the record and the reality have to move
+    # together for the active profile.
+    if [[ $name == "$(current_profile)" ]]; then
+      omarchy plugin "$verb" "$id" >/dev/null 2>&1 ||
+        warn "recorded, but could not $verb '$id' on the running shell"
+    fi
+    write_catalog
+    echo "$verb $id in $name" ;;
   *) die "unknown plugin verb '$verb'" ;;
   esac
 }
