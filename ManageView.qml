@@ -342,6 +342,14 @@ Column {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(2)
 
+        // Bigger than the 22x22 default. Four of these sit side by side with a
+        // 2px gap, and at the default size the gaps are a meaningful share of
+        // the strip: aiming for the gear and landing on nothing is easy, and
+        // reads as the button ignoring the mouse rather than as a miss.
+        // The row is taller than this already in every real case, so nothing
+        // moves; only the area that answers grows.
+        readonly property real actionSize: Style.space(28)
+
         // Master carries neither of these: it cannot be removed, and it sees
         // every app and plugin by definition, so there is nothing behind the
         // gear. Hidden rather than disabled — a greyed button invites a click
@@ -351,6 +359,7 @@ Column {
           iconText: "󰒓"
           tooltipText: "Apps and plugins for " + row.name
           foreground: root.foreground
+          size: actions.actionSize
           fontFamily: root.fontFamily
           onClicked: root.openSettings(row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
@@ -369,6 +378,7 @@ Column {
                ? "Opens for " + row.identity + ", or for you — click to stop asking"
                : "Entering " + row.name + " asks for your face or password — click to stop asking")
           foreground: row.locked ? root.accent : root.foreground
+          size: actions.actionSize
           fontFamily: root.fontFamily
           onClicked: root.runEngine((row.locked ? "unlock " : "lock ") + row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
@@ -385,6 +395,7 @@ Column {
                ? "The only profile in the picker — make another visible first"
                : "Hide from the picker")
           foreground: root.foreground
+          size: actions.actionSize
           fontFamily: root.fontFamily
           enabled: (row.entry && row.entry.hidden) ? true : !row.hideWouldEmpty
           onClicked: root.runEngine(((row.entry && row.entry.hidden) ? "show " : "hide ") + row.name)
@@ -397,6 +408,7 @@ Column {
           tooltipText: row.active ? "Switch away before removing this profile" : "Remove " + row.name
           foreground: root.foreground
           hoverColor: Color.urgent
+          size: actions.actionSize
           fontFamily: root.fontFamily
           enabled: !row.active
           onClicked: root.confirmRemove(row.name)

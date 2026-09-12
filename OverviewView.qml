@@ -162,11 +162,16 @@ Column {
         anchors.verticalCenter: parent.verticalCenter
         spacing: Style.space(2)
 
+        // Same reason as the manage rows: a 22x22 default next to a 2px gap is
+        // easy to miss, and a miss reads as the button ignoring the mouse.
+        readonly property real actionSize: Style.space(28)
+
         PanelActionButton {
           visible: orow.real && !orow.active
           iconText: "󰁔"
           tooltipText: "Switch to " + orow.name
           foreground: root.foreground
+          size: oactions.actionSize
           fontFamily: root.fontFamily
           onClicked: { root.touched(); root.runEngine("set " + orow.name) }
         }
@@ -177,6 +182,7 @@ Column {
           tooltipText: "Ask the " + orow.windows + " window(s) in " + orow.name + " to close"
           foreground: root.foreground
           hoverColor: Color.urgent
+          size: oactions.actionSize
           fontFamily: root.fontFamily
           onClicked: { root.touched(); root.confirmClose(orow.name) }
         }

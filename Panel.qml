@@ -221,11 +221,27 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.parseState(text())
+    property string lastText: ""
+    onLoaded: {
+      var t = text()
+      if (t === stateFile.lastText) return
+      stateFile.lastText = t
+      root.parseState(t)
+    }
     // No state file yet means no profile has been applied. Leave the label
     // generic instead of claiming one.
     onLoadFailed: root.currentProfile = ""
   }
+
+  // Why every watcher compares the text before assigning:
+  //
+  // A Repeater whose model is a JS array rebuilds EVERY delegate when the array
+  // is reassigned, even if the new array is identical. The rebuilt row under the
+  // pointer is a different item, and Qt Quick only delivers an enter event on
+  // the next mouse MOVE -- so a button the cursor is already sitting on goes
+  // cold and stays cold until the mouse is jiggled. The engine rewrites these
+  // files often, frequently with byte-identical content, so the cheap guard
+  // below is what keeps a still pointer on a live button.
 
   FileView {
     id: overviewFile
@@ -233,9 +249,13 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
+    property string lastText: ""
     onLoaded: {
       try {
-        var parsed = JSON.parse(text())
+        var t = text()
+        if (t === overviewFile.lastText) return
+        overviewFile.lastText = t
+        var parsed = JSON.parse(t)
         if (Array.isArray(parsed)) root.overviewRows = parsed
       } catch (e) {
         console.warn("graveklar.profiles", "Ignoring bad overview", root.overviewPath, e)
@@ -250,9 +270,13 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
+    property string lastText: ""
     onLoaded: {
       try {
-        var parsed = JSON.parse(text())
+        var t = text()
+        if (t === catalogFile.lastText) return
+        catalogFile.lastText = t
+        var parsed = JSON.parse(t)
         if (Array.isArray(parsed)) root.pluginCatalog = parsed
       } catch (e) {
         console.warn("graveklar.profiles", "Ignoring bad plugin catalog", root.catalogPath, e)
@@ -271,9 +295,13 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
+    property string lastText: ""
     onLoaded: {
       try {
-        var parsed = JSON.parse(text())
+        var t = text()
+        if (t === profileFile.lastText) return
+        profileFile.lastText = t
+        var parsed = JSON.parse(t)
         var d = (parsed && parsed.plugins && parsed.plugins.disabled) || []
         root.settingsDisabled = Array.isArray(d) ? d : []
         var a = (parsed && parsed.apps && parsed.apps.allowed) || []
@@ -292,7 +320,13 @@ Panel {
     watchChanges: true
     printErrors: false
     onFileChanged: reload()
-    onLoaded: root.parseIndex(text())
+    property string lastText: ""
+    onLoaded: {
+      var t = text()
+      if (t === indexFile.lastText) return
+      indexFile.lastText = t
+      root.parseIndex(t)
+    }
     onLoadFailed: root.profiles = []
   }
 
