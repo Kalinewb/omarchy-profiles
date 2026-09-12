@@ -53,6 +53,64 @@ sudo install -m 0644 \
 Everything except locks works without it — and a lock without it fails safe:
 the profile refuses to open and says why, rather than opening anyway.
 
+## Dependencies
+
+Everything below `jq` ships with Omarchy already. Nothing here is installed for
+you, and nothing except `jq` is needed to run the plugin.
+
+| | | |
+|---|---|---|
+| `jq` | required | every profile is a JSON file |
+| `hyprctl` | required | focusing and moving windows between workspaces |
+| `pkcheck` (polkit) | for locks | asks whether you may enter a locked profile |
+| `gocryptfs`, `fusermount3` | for vaults | `omarchy pkg add gocryptfs` |
+| `fuser` (psmisc) | for vaults | names what is still holding an open vault |
+| `omarchy-face-identity` | for bound faces | from [omarchy-face]; entirely optional |
+
+[omarchy-face]: https://github.com/Kalinewb/omarchy-face
+
+The dependency on `omarchy-face` is one-way and optional: without it a profile
+can still be locked, and a profile bound to a face says so rather than becoming
+unopenable. Licensed MIT, see `LICENSE`.
+
+## Removing it
+
+**Un-isolate first.** `isolate` replaces a real config file with a symlink into
+the plugin's state directory, so deleting that directory first would leave a
+dangling symlink where a plugin's config used to be:
+
+```bash
+omarchy-profile isolate list                     # * means it is a live symlink
+omarchy-profile isolate remove <each path>       # puts the real file back
+```
+
+Then close anything encrypted, and keep the ciphertext if you still want it —
+removing the plugin does not decrypt it, and the passphrase is the only way in:
+
+```bash
+omarchy-profile vault close <profile>
+cp -r ~/.local/state/omarchy-profiles/vaults ~/vaults-backup   # if you have any
+```
+
+Then the plugin itself, and what it wrote:
+
+```bash
+omarchy plugin remove graveklar.profiles
+rm -rf ~/.config/omarchy/profiles          # the profiles themselves
+rm -rf ~/.local/state/omarchy-profiles     # state, and the vault ciphertext
+sudo rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.policy
+rmdir ~/Vaults/* ~/Vaults 2>/dev/null   # the empty mount points
+```
+
+Nothing in `~/.config/omarchy/shell.json` needs undoing: profiles write your
+real bar and plugin configuration, so whatever the last active profile left
+there is a working desktop on its own.
+
+Two things to do by hand, if you set them up: remove the `omarchy-profile ws`
+bindings from `~/.config/hypr/bindings.lua` — with the plugin gone they point at
+nothing, and leaving them there makes workspaces unreachable — and re-enable any
+plugin a profile had disabled, with `omarchy plugin enable <id>`.
+
 ## Use
 
 The bar widget shows the active profile; click it to switch or to open the
