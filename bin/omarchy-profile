@@ -179,8 +179,18 @@ authenticate() {
     elif omarchy-face-identity verify "$identity"; then
       audit "unlock of $for_what succeeded: face matched identity '$identity'"
       return 0
+    elif [[ $owner_override == false ]] && omarchy-face-identity verify "$identity"; then
+      # One retry, and only on the path that has nowhere else to go. With
+      # owner_override off there is no password to fall back to, so a camera
+      # that simply did not see anyone would lock the owner out of their own
+      # profile -- and the check is silent, which means the first attempt is
+      # often spent before anyone thinks to look up. A second attempt costs a
+      # couple of seconds and proves nothing different about who is there:
+      # howdy keeps its own attempt limits underneath this.
+      audit "unlock of $for_what succeeded: face matched identity '$identity' on retry"
+      return 0
     elif [[ $owner_override == false ]]; then
-      warn "this profile opens only for '$identity'"
+      warn "this profile opens only for '$identity' — the camera did not recognise you"
       audit "unlock of $for_what REFUSED: identity '$identity' not recognised and owner_override is off"
       return 1
     else
@@ -252,7 +262,10 @@ cmd_identity() {
     authenticate "the face bound to $name" "$name" ||
       die "authentication failed — '$name' is unchanged"
   else
-    relaunch_in_terminal identity "$name" "$identity"
+    # --only must survive the hop. Dropping it would set the binding and leave
+    # owner_override ON, which looks like success and is the opposite of what
+    # was asked for -- the one failure mode this flag cannot have.
+    relaunch_in_terminal identity "$name" "$identity" ${only:+--only}
     return 0
   fi
 
@@ -279,8 +292,24 @@ cmd_identity() {
     die "no face enrolled as '$identity' — enrol it first with omarchy-face"
   fi
 
+  # An identity is only ever consulted by the lock: `set` authenticates a
+  # profile that asks to be authenticated, and walks straight into one that does
+  # not. Binding a face to an unlocked profile therefore protects nothing, while
+  # printing a message that says it does -- so the binding brings the lock with
+  # it, and says so rather than leaving a profile that only looks guarded.
+  local was_locked=0
+  profile_locked "$name" && was_locked=1
+
   jq --arg i "$identity" --argjson override "$([[ -n $only ]] && echo false || echo true)" \
-    '.identity = $i | .owner_override = $override' "$file" >"$tmp" && mv "$tmp" "$file"
+    '.identity = $i | .owner_override = $override | .locked = true' "$file" >"$tmp" && mv "$tmp" "$file"
+  write_index
+
+  if ((!was_locked)); then
+    audit "locked $name (an identity is only consulted at the lock)"
+    echo "Locked '$name' too — a bound face is only consulted when the profile asks"
+    echo "for authentication, so on an unlocked profile the binding would do nothing."
+    echo
+  fi
 
   if [[ -n $only ]]; then
     audit "identity '$identity' bound to $name, owner override OFF"

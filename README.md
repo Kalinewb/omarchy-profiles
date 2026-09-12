@@ -283,8 +283,16 @@ types their passphrase for the vault, and their face is what saves them typing
 it to *enter the profile*. Two different things, on purpose.
 
 ```bash
-omarchy-profile vault init partner     # their passphrase, not yours
+omarchy-profile identity partner alice --only   # locks the profile too
+omarchy-profile vault init partner              # their passphrase, not yours
 ```
+
+Binding a face turns the lock on as part of the same change. An identity is only
+ever consulted when a profile asks for authentication, so a bound face on an
+unlocked profile would be inert while the message said otherwise.
+
+With `--only` there is no password to fall back to, so a camera that simply did
+not see anyone gets one retry before the profile refuses.
 
 Without that passphrase the contents are ciphertext to every account on the
 machine, root included. That is the only part of this plugin that a password
