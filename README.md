@@ -274,8 +274,8 @@ Use a vault. The distinction is not a detail:
 |  | a lock, or a bound face | a vault |
 |---|---|---|
 | What decides | a rule in a file | a key derived from a passphrase |
-| Owner with root | can edit the rule | cannot read the contents |
-| Forgotten secret | recoverable | contents are gone |
+| Owner with root | can edit the rule | cannot read it while closed |
+| Forgotten secret | recoverable | only via the master key |
 
 A face cannot open a vault, and that is not an omission — a biometric check
 returns yes or no, it does not produce a key. So the person whose profile it is
@@ -399,4 +399,27 @@ While **closed**: everything. From another profile, from a file manager, from
 
 While **open**: nothing beyond the filesystem. Every profile runs as the same
 Unix user, so any process running as you can read the mount while it is mounted.
-It is a closed safe, not a sandbox. There is no passphrase recovery.
+It is a closed safe, not a sandbox.
+
+Two edges worth knowing before you trust one:
+
+**The master key is the recovery path.** `vault init` prints one, once. The
+passphrase unlocks the vault day to day; the master key is what gets you back in
+if you forget the passphrase. Write it down somewhere that is not the laptop.
+
+**A program already inside the vault keeps reading it.** Closing detaches the
+mount, so nothing new can get in and the folder is gone from the filesystem —
+but a process that had a file open before the close keeps reading *that file*
+through the descriptor it already holds, until it exits. This is how unmounting
+works, not a bug, and the tool says so rather than reporting a clean seal:
+
+```
+$ omarchy-profile vault close work
+closed — nothing new can reach it.
+omarchy-profile: tail still had a file open, and keeps reading that file until it exits
+```
+
+The same warning appears when leaving a profile seals its vault. If you want a
+guaranteed seal, close what is using the vault first — the journal
+(`journalctl -t omarchy-profile`) records which closes were clean and which were
+not.

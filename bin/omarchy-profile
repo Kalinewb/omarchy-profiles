@@ -992,6 +992,37 @@ vault_cipher() { printf '%s/%s\n' "$VAULT_DIR" "$1"; }
 vault_mount() { printf '%s/Vaults/%s\n' "$HOME" "$1"; }
 
 vault_is_open() { mountpoint -q "$(vault_mount "$1")" 2>/dev/null; }
+
+# Unmount a vault: 0 clean, 2 only a lazy unmount worked, 1 neither did.
+#
+# The distinction is not pedantry. A lazy unmount detaches the mount point, so
+# the vault disappears from the filesystem and nothing NEW can open it -- but a
+# process that already had a file open keeps reading plaintext through that
+# descriptor until it exits. Printing "closed" for that case would claim a seal
+# that has not happened yet, which is the one thing this feature must not do.
+vault_unmount() {
+  local mnt=$1
+  fusermount3 -u "$mnt" 2>/dev/null && return 0
+  fusermount3 -uz "$mnt" 2>/dev/null && return 2
+  return 1
+}
+
+# Names of the programs sitting in the mount, so the warning says something
+# actionable. Must be called BEFORE unmounting -- afterwards there is no mount
+# left to ask about. Silent when fuser is unavailable; a missing list is not
+# worth failing a close over.
+vault_holders() {
+  command -v fuser >/dev/null || return 0
+  local pids p out=()
+  pids=$(fuser -m "$1" 2>/dev/null) || return 0
+  for p in $pids; do
+    [[ $p =~ ^[0-9]+$ ]] || continue
+    out+=("$(ps -o comm= -p "$p" 2>/dev/null)")
+  done
+  ((${#out[@]})) || return 0
+  printf '%s\n' "${out[@]}" | sed '/^$/d' | sort -u | paste -sd', ' -
+}
+
 vault_exists() { [[ -f "$(vault_cipher "$1")/gocryptfs.conf" ]]; }
 
 need_gocryptfs() {
@@ -1021,7 +1052,8 @@ cmd_vault() {
     if [[ ! -t 0 ]]; then relaunch_in_terminal vault init "$name"; return 0; fi
     mkdir -p "$(vault_cipher "$name")" "$(vault_mount "$name")"
     echo "Creating an encrypted folder for '$name'."
-    echo "Choose a passphrase. There is no recovery: lose it and the contents are gone."
+    echo "Choose a passphrase. gocryptfs then prints a master key once — that key is"
+    echo "the only way back in if the passphrase is forgotten, so write it down now."
     echo
     gocryptfs -init -- "$(vault_cipher "$name")" || die "could not create the vault"
     audit "vault created for $name"
@@ -1046,17 +1078,22 @@ cmd_vault() {
     [[ -n $name ]] || name=$(current_profile)
     [[ -n $name ]] || die "usage: omarchy-profile vault close <profile>"
     vault_is_open "$name" || { echo "not open"; return 0; }
-    # A lazy unmount as the fallback: something still holding a file open should
-    # not mean the vault stays readable, and the mount goes as soon as it lets
-    # go. Reporting success on a failed unmount would be the worse lie.
-    if fusermount3 -u "$(vault_mount "$name")" 2>/dev/null ||
-       fusermount3 -uz "$(vault_mount "$name")" 2>/dev/null; then
-      audit "vault closed for $name"
-      echo "closed"
-    else
-      warn "could not close the vault for '$name' — something is still using it"
-      return 1
-    fi ;;
+    # A lazy unmount is the fallback, and the report says which one happened:
+    # something still holding a file open must not mean the vault stays browsable,
+    # but it also must not be called sealed while that program can still read.
+    local mnt holders rc
+    mnt=$(vault_mount "$name")
+    holders=$(vault_holders "$mnt")
+    vault_unmount "$mnt"; rc=$?
+    case $rc in
+    0) audit "vault closed for $name"; echo "closed" ;;
+    2) audit "vault closed for $name (lazily; ${holders:-a program} still had it open)"
+       echo "closed — nothing new can reach it."
+       warn "${holders:-a program} still had a file open, and keeps reading that file until it exits" ;;
+    *) audit "vault close FAILED for $name (${holders:-unknown})"
+       warn "could not close the vault for '$name' — ${holders:-something} is still using it"
+       return 1 ;;
+    esac ;;
   *) die "unknown vault verb '$verb' (status, init, open, close)" ;;
   esac
 }
@@ -1070,10 +1107,17 @@ close_foreign_vaults() {
     [[ -n $n ]] || continue
     [[ $n == "$keep" ]] && continue
     vault_is_open "$n" || continue
-    fusermount3 -u "$(vault_mount "$n")" 2>/dev/null ||
-      fusermount3 -uz "$(vault_mount "$n")" 2>/dev/null ||
-      warn "could not close '$n' vault — something is still using it"
-    audit "vault closed for $n (left the profile)"
+    local mnt holders rc
+    mnt=$(vault_mount "$n")
+    holders=$(vault_holders "$mnt")
+    vault_unmount "$mnt"; rc=$?
+    case $rc in
+    0) audit "vault closed for $n (left the profile)" ;;
+    2) audit "vault closed for $n (left the profile; lazily, ${holders:-a program} had it open)"
+       warn "'$n' vault is detached, but ${holders:-a program} keeps the files it already opened" ;;
+    *) audit "vault close FAILED for $n (left the profile; ${holders:-unknown})"
+       warn "could not close '$n' vault — ${holders:-something} is still using it" ;;
+    esac
   done < <(profile_names)
 }
 
