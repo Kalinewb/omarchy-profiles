@@ -104,3 +104,39 @@ too if losing them mid-session would look like a broken desktop.
 ## License
 
 MIT
+
+## Per-profile plugin data
+
+A plugin's settings are already per-profile when it keeps them inline in
+`shell.json`, because a profile captures that whole object. Plugins with their
+own files outside it are global — the Spotify plugin's session lives in
+`~/.local/state/omarchy-spotify`, so every profile is signed in as the same
+person, and the dock keeps one `arc-dock.json`, so every profile gets the same
+dock.
+
+Isolate those paths and each profile gets its own copy:
+
+```bash
+omarchy-profile isolate add ~/.local/state/omarchy-spotify
+omarchy-profile isolate add ~/.config/omarchy/arc-dock.json
+omarchy-profile isolate list          # * marks the one in use now
+omarchy-profile isolate remove <path> # puts the active copy back as a real file
+```
+
+It works the way browsers do for their own profiles: one copy per profile, with
+the path the plugin knows pointed at the active profile's copy. The plugin is
+unchanged and unaware.
+
+Swapping is lossless and self-healing. Leaving profile F for T, for each
+isolated path: a symlink is removed, a real file is moved into F's store since
+the live data is F's, and T is linked to its own store — or, if T has none, the
+path is left absent so the plugin makes a fresh one, which the next switch away
+adopts into T's store. Nothing is deleted and no symlink is left dangling.
+
+New profiles follow the same choice as everything else: **copy of master**
+inherits the stores (already signed in, same dock), **clean** inherits none
+(signed out, default dock). Removing a profile deletes its store with it.
+
+One caveat: a plugin already running may not notice the swap until it reloads.
+A profile switch that also changes the theme restarts enough of the shell to
+cover it; otherwise `omarchy restart shell`.

@@ -161,8 +161,8 @@ Column {
       textFormat: Text.PlainText
       wrapMode: Text.WordWrap
       text: root.createFromMaster
-        ? "Starts with everything the master can see, as a snapshot — later installs into master will not appear here on their own."
-        : "Starts with nothing. You choose every app and plugin it may use."
+        ? "A snapshot of the master: the same apps, plugins and plugin data — already signed in to Spotify, same dock. Later installs into master will not appear here on their own."
+        : "Starts with nothing: no apps, only Omarchy's own plugins, and every plugin makes fresh state — signed out, default dock."
       color: root.dim
       font.family: root.fontFamily
       font.pixelSize: Style.font.caption

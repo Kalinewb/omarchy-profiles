@@ -362,7 +362,7 @@ Panel {
       anchors.fill: parent
       z: 10
       opened: root.pendingRemoval !== ""
-      message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar and plugin list are deleted. Any windows still open on its workspaces move to " + (root.masterName === "" ? "the master" : root.masterName) + " — nothing is left stranded."
+      message: "Remove the profile \"" + root.pendingRemoval + "\"?\n\nIts saved theme, bar, plugin list and any per-profile plugin data (a signed-in Spotify session, its own dock) are deleted. Any windows still open on its workspaces move to " + (root.masterName === "" ? "the master" : root.masterName) + " — nothing is left stranded."
       confirmText: "Remove"
       cancelText: "Keep"
       foreground: root.foreground

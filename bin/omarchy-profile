@@ -46,7 +46,8 @@ ensure_config() {
   jq -n '{
     version: 1, master: "master", master_switchable: true,
     restore_last_on_login: true, last: "",
-    pinned_plugins: ["graveklar.profiles"], workspace_span: 10
+    pinned_plugins: ["graveklar.profiles"], workspace_span: 10,
+    isolate: []
   }' >"$CONFIG_FILE"
 }
 
@@ -91,6 +92,117 @@ next_offset() {
   done < <(profile_names)
   ((max < 0)) && { echo 0; return; }
   echo $((max + span))
+}
+
+# --------------------------------------------------------------- isolation
+#
+# Per-profile plugin state.
+#
+# A plugin's settings are per-profile already when it keeps them inline in
+# shell.json, because a profile captures that whole object. Plugins with their
+# own files outside it are global: the Spotify plugin's session lives at
+# ~/.local/state/omarchy-spotify/session.json, so every profile is signed in as
+# the same person, and the dock's settings live in one arc-dock.json, so every
+# profile gets the same dock.
+#
+# The fix is the trick browsers use for their own profiles: keep one copy per
+# profile and point the path the plugin knows at the active profile's copy. The
+# plugin is unchanged and unaware.
+#
+# Swapping is lossless and self-healing:
+#   leaving F, entering T, for each isolated path P
+#     P is a symlink   -> remove it (the target is already F's store)
+#     P is real        -> move it into F's store, since the live data is F's
+#     T has a store    -> symlink P at it
+#     T has none       -> leave P absent, and the plugin makes a fresh one;
+#                         the next switch away adopts that into T's store
+# Nothing is ever deleted and no symlink is ever left dangling.
+
+ISOLATE_DIR="$STATE_DIR/isolated"
+
+# ~/.local/state/omarchy-spotify -> local%state%omarchy-spotify
+store_key() { printf '%s' "${1#"$HOME"/}" | tr '/' '%'; }
+store_for() { printf '%s/%s/%s\n' "$ISOLATE_DIR" "$1" "$(store_key "$2")"; }
+
+isolated_paths() {
+  cfg -c '.isolate // []' | jq -r '.[]' 2>/dev/null | while read -r p; do
+    [[ -n $p ]] || continue
+    printf '%s\n' "${p/#\~/$HOME}"
+  done
+}
+
+swap_isolated() {
+  local from=${1:-} to=${2:-} path from_store to_store
+  while read -r path; do
+    [[ -n $path ]] || continue
+    [[ $path == "$HOME"/* ]] || { warn "refusing to isolate '$path' (outside your home)"; continue; }
+
+    if [[ -L $path ]]; then
+      rm -f "$path"
+    elif [[ -e $path ]]; then
+      if [[ -n $from ]]; then
+        from_store=$(store_for "$from" "$path")
+        mkdir -p "$(dirname "$from_store")"
+        rm -rf "$from_store"
+        mv "$path" "$from_store" || warn "could not save '$path' into $from"
+      fi
+      # With no outgoing profile the live data has no owner to be filed under,
+      # so it is left alone rather than moved somewhere arbitrary.
+    fi
+
+    if [[ -n $to ]]; then
+      to_store=$(store_for "$to" "$path")
+      if [[ -e $to_store ]]; then
+        mkdir -p "$(dirname "$path")"
+        ln -sfn "$to_store" "$path"
+      fi
+    fi
+  done < <(isolated_paths)
+}
+
+cmd_isolate() {
+  local verb=${1:-list} path=${2:-}
+  case $verb in
+  list)
+    local any=0
+    while read -r p; do
+      [[ -n $p ]] || continue
+      any=1
+      local mark="  "
+      [[ -L $p ]] && mark="* "
+      printf '%s%s\n' "$mark" "${p/#$HOME/~}"
+    done < <(isolated_paths)
+    ((any)) || echo "nothing isolated — try: omarchy-profile isolate add ~/.local/state/omarchy-spotify"
+    echo
+    echo "* = currently pointed at the active profile's copy" ;;
+  add)
+    [[ -n $path ]] || die "usage: omarchy-profile isolate add <path>"
+    local rel; rel=$(printf '%s' "$path" | sed "s|^$HOME/|~/|")
+    cfg_set --arg p "$rel" '.isolate = (((.isolate // []) + [$p]) | unique)' ||
+      die "could not record '$path'"
+    # Adopt what is live into the profile the user is in, then point at it.
+    # Passing the same profile as both sides does exactly that: the real file
+    # is filed under it, and the symlink comes back to the copy just made.
+    local cur; cur=$(current_profile)
+    [[ -n $cur ]] && swap_isolated "$cur" "$cur"
+    echo "isolating $rel" ;;
+  remove)
+    [[ -n $path ]] || die "usage: omarchy-profile isolate remove <path>"
+    local expanded=${path/#\~/$HOME} cur store
+    cur=$(current_profile)
+    # Put the active profile's copy back as a real file, so dropping isolation
+    # leaves a working setup rather than a dangling link.
+    if [[ -L $expanded && -n $cur ]]; then
+      store=$(store_for "$cur" "$expanded")
+      rm -f "$expanded"
+      [[ -e $store ]] && mv "$store" "$expanded"
+    fi
+    cfg_set --arg p "${path/#$HOME/~}" --arg q "$expanded" \
+      '.isolate = ((.isolate // []) | map(select(. != $p and . != $q)))' ||
+      die "could not update the isolate list"
+    echo "no longer isolating ${path/#$HOME/~}" ;;
+  *) die "unknown isolate verb '$verb' (list, add, remove)" ;;
+  esac
 }
 
 # ------------------------------------------------------------------ capture
@@ -352,6 +464,9 @@ cmd_set() {
   [[ $cur == "$name" ]] && { echo "already in $name"; return 0; }
   # The outgoing profile keeps whatever was changed while inside it.
   [[ -n $cur ]] && exists "$cur" && capture_into "$cur"
+  # Plugin state that lives outside shell.json follows the profile too, so a
+  # Spotify session or a dock layout belongs to one profile rather than all.
+  swap_isolated "$cur" "$name"
 
   apply_profile "$name"
   write_index
@@ -411,6 +526,23 @@ cmd_create() {
   *) die "unknown mode '$mode' (use --from-master or --clean)" ;;
   esac
   write_index
+  # Isolated plugin state follows the same choice as the rest of the profile.
+  # From master: copy its stores, so the new profile starts already signed in
+  # to Spotify and with the same dock. Clean: copy nothing, so each plugin
+  # makes itself a fresh one on first use — signed out, default dock.
+  if [[ $mode == --from-master ]]; then
+    local src dst path
+    while read -r path; do
+      [[ -n $path ]] || continue
+      src=$(store_for "$master" "$path")
+      dst=$(store_for "$name" "$path")
+      [[ -e $src ]] || continue
+      mkdir -p "$(dirname "$dst")"
+      cp -a "$src" "$dst" || warn "could not copy $path into $name"
+    done < <(isolated_paths)
+  fi
+
+  write_index
   echo "created $name (workspaces $((offset + 1))-$((offset + 10)))"
 }
 
@@ -459,6 +591,9 @@ cmd_remove() {
     fi
   fi
   rm -f "$(file_for "$name")"
+  # Its isolated plugin state goes too. Leaving it behind would accumulate
+  # silently, and one of those files is a signed-in Spotify session.
+  rm -rf "${ISOLATE_DIR:?}/${name:?}"
 
   # Removing the last visible profile would leave nothing to switch to, so the
   # master comes back into the picker rather than the user being stranded with
@@ -669,6 +804,7 @@ ensure_config
 
 case "${1:-}" in
 catalog) write_catalog ;;
+isolate) shift; cmd_isolate "${1:-list}" "${2:-}" ;;
 set) shift; cmd_set "${1:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
@@ -697,6 +833,9 @@ omarchy-profile — profiles for the Omarchy desktop
   create <name> [--from-master|--clean]
   remove <name>                    moves its windows to the master first
   show <name> | hide <name>        whether it appears in the picker
+
+  isolate [list|add|remove] [path]  give each profile its own copy of a
+                                    plugin's own config or state file
 
   apps <profile> [list|allow|deny] [app-id]
   plugin <profile> [list|enable|disable] [plugin-id]
