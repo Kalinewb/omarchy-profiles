@@ -186,11 +186,35 @@ authenticate() {
       # simply making it unreachable -- must not be a way to downgrade that.
       if [[ $owner_override == false ]]; then
         warn "'$profile' opens only for '$identity', and the face tooling is missing"
+        warn "as it stands nothing opens it. To undo the binding, remove the"
+        warn "\"identity\" and \"owner_override\" keys from:"
+        warn "  $(file_for "$profile" | sed "s|^$HOME|~|")"
         audit "unlock of $for_what REFUSED: identity '$identity' unverifiable and owner_override is off"
         return 1
       fi
       warn "'$profile' is bound to the face '$identity', but omarchy-face-identity is not installed"
       audit "unlock of $for_what: identity '$identity' unverifiable, face tooling missing"
+    elif ! /usr/local/bin/omarchy-face-identity list 2>/dev/null | grep -qx -- "$identity"; then
+      # Not "unrecognised" -- gone. The model was cleared, or the engine behind
+      # it was uninstalled, which is what omarchy-remove-security-face does:
+      # the helper stays in /usr/local/bin while howdy and every model leave.
+      # `verify` cannot tell that from a stranger at the camera, so without
+      # this the profile would answer "the camera did not recognise you"
+      # forever and the reason would never appear anywhere.
+      #
+      # Refused rather than waved through when owner_override is off, for the
+      # same reason a missing helper is: clearing a model must not be a way to
+      # downgrade --only. But it says what happened and how to undo it.
+      if [[ $owner_override == false ]]; then
+        warn "'$profile' opens only for '$identity', which is no longer enrolled"
+        warn "as it stands nothing opens it. To undo the binding, remove the"
+        warn "\"identity\" and \"owner_override\" keys from:"
+        warn "  $(file_for "$profile" | sed "s|^$HOME|~|")"
+        audit "unlock of $for_what REFUSED: identity '$identity' no longer enrolled and owner_override is off"
+        return 1
+      fi
+      warn "'$profile' is bound to the face '$identity', which is no longer enrolled"
+      audit "unlock of $for_what: identity '$identity' no longer enrolled, falling back to the owner check"
     elif /usr/local/bin/omarchy-face-identity verify "$identity"; then
       audit "unlock of $for_what succeeded: face matched identity '$identity'"
       return 0
