@@ -1,4 +1,5 @@
 import QtQuick
+import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
 import qs.Commons
@@ -391,26 +392,47 @@ Panel {
       onCloseRequested: root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
 
+      // The plugin list runs to ~60 rows, far past any sensible panel height.
+      // Without this the Column simply drew past the panel's own bounds and
+      // over the desktop. clip + StopAtBounds keeps it inside; `interactive`
+      // engages only when there is genuinely more than fits, so short views
+      // still behave like a static panel rather than a scroll area.
+      Flickable {
+        id: flick
+        anchors.fill: parent
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
       Column {
         id: column
-        width: parent.width
+        width: flick.width
         spacing: Style.space(12)
 
         PanelHero {
           width: parent.width
           title: root.view === "settings" ? root.settingsProfile
                  : (root.view === "manage" ? "Manage profiles" : "Profiles")
-          detail: root.currentProfile !== "" ? root.label(root.currentProfile) : "Not set"
+          // Empty outside the picker: the pill names the profile you are IN,
+          // which only matters while choosing one. Showing "Master" beside the
+          // title "test" read as a label on test.
+          detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile) : ""
           meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
-                : (root.view === "manage" ? "Create, remove, or hide a profile"
-                                          : "Same files, a different desk")
+                : root.view === "settings" ? "What this profile may use"
+                : root.view === "manage" ? "Create, remove, or hide a profile"
+                : "Same files, a different desk"
           foreground: root.foreground
           fontFamily: root.fontFamily
 
           iconComponent: Component {
             Text {
               textFormat: Text.PlainText
-              text: root.icon(root.currentProfile)
+              text: root.icon(root.view === "settings" && root.settingsProfile !== ""
+                              ? root.settingsProfile : root.currentProfile)
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
@@ -536,6 +558,7 @@ Panel {
           horizontalAlignment: Text.AlignHCenter
           elide: Text.ElideRight
         }
+      }
       }
     }
   }
