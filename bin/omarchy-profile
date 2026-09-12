@@ -122,17 +122,40 @@ next_offset() {
 
 profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; }
 
+# Every attempt is logged, pass or fail.
+#
+# Not for its own sake: with a face in the PAM stack a successful unlock is
+# silent and instant, which is indistinguishable from no check having run at
+# all. "It did not ask me for anything" is the expected experience and also
+# exactly what a broken gate looks like, so the only way to tell them apart is
+# a record. `journalctl --user -t omarchy-profile` shows it.
+audit() { logger -t omarchy-profile -p user.notice -- "$*" 2>/dev/null || true; }
+
 authenticate() {
-  local method
+  local method for_what=${1:-a locked profile}
   method=$(cfg '.unlock.method // "sudo"')
   case $method in
-  none) return 0 ;;
+  none)
+    audit "unlock of $for_what allowed without a check (unlock.method=none)"
+    return 0 ;;
   sudo)
-    command -v sudo >/dev/null || { warn "sudo is not available; set unlock.method to none"; return 1; }
+    command -v sudo >/dev/null || {
+      warn "sudo is not available; set unlock.method to none"
+      audit "unlock of $for_what refused: sudo missing"
+      return 1
+    }
     # -k so a cached timestamp cannot stand in for a real prompt.
     sudo -k >/dev/null 2>&1
-    sudo -v ;;
-  *) warn "unknown unlock.method '$method'"; return 1 ;;
+    if sudo -v; then
+      audit "unlock of $for_what succeeded via PAM (sudo stack: face, fingerprint or password)"
+      return 0
+    fi
+    audit "unlock of $for_what FAILED via PAM"
+    return 1 ;;
+  *)
+    warn "unknown unlock.method '$method'"
+    audit "unlock of $for_what refused: unknown unlock.method '$method'"
+    return 1 ;;
   esac
 }
 
@@ -146,9 +169,9 @@ cmd_lock() {
   # entering would. Otherwise the lock is a label anyone can peel off.
   if [[ $verb == unlock ]]; then
     if [[ -t 0 ]]; then
-      authenticate || die "authentication failed — '$name' stays locked"
+      authenticate "the lock on $name" || die "authentication failed — '$name' stays locked"
     else
-      relaunch_in_terminal "unlock $name"
+      relaunch_in_terminal unlock "$name"
       return 0
     fi
   fi
@@ -611,9 +634,9 @@ cmd_set() {
   # profile it never opened.
   if profile_locked "$name"; then
     if [[ -t 0 ]]; then
-      authenticate || die "authentication failed — staying in ${cur:-the current profile}"
+      authenticate "$name" || die "authentication failed — staying in ${cur:-the current profile}"
     else
-      relaunch_in_terminal "set $name"
+      relaunch_in_terminal set "$name"
       return 0
     fi
   fi
