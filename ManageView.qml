@@ -64,30 +64,59 @@ Column {
 
   // ---------------------------------------------------------------- create
 
-  Item {
+  // A row, not an icon with a caption beside it: the whole strip is the target,
+  // and it hovers like the profile rows above so it reads as one more row in
+  // the same list rather than a stray button.
+  CursorSurface {
+    id: newRow
     width: parent.width
-    implicitHeight: newButton.implicitHeight
     visible: !root.creating
 
-    PanelActionButton {
-      id: newButton
+    foreground: root.foreground
+    accent: root.accent
+    hasCursor: newRow.hovered
+
+    property bool hovered: false
+
+    implicitHeight: newRowBody.implicitHeight + Style.space(14)
+
+    Row {
+      id: newRowBody
       anchors.left: parent.left
-      iconText: "󰐕"
-      tooltipText: "New profile"
-      foreground: root.foreground
-      fontFamily: root.fontFamily
-      onClicked: { root.creating = true; Qt.callLater(function () { nameField.forceActiveFocus() }) }
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        text: "󰐕"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: "New profile"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        anchors.verticalCenter: parent.verticalCenter
+      }
     }
 
-    Text {
-      anchors.left: newButton.right
-      anchors.leftMargin: Style.space(8)
-      anchors.verticalCenter: newButton.verticalCenter
-      textFormat: Text.PlainText
-      text: "New profile"
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.body
+    HoverHandler {
+      onHoveredChanged: newRow.hovered = hovered
+    }
+
+    TapHandler {
+      onTapped: {
+        root.creating = true
+        Qt.callLater(function () { nameField.forceActiveFocus() })
+      }
     }
   }
 
