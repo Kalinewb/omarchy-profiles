@@ -705,6 +705,28 @@ write_catalog() {
   ' >"$tmp" && mv "$tmp" "$STATE_DIR/plugins.json" || { rm -f "$tmp"; warn "could not write the plugin catalog"; return 1; }
 }
 
+# The active profile's app allow-list, for the launcher to filter on.
+#
+# Written as its own small file rather than having the launcher read profile
+# JSON: the launcher only needs the answer for right now, and a file it can
+# FileView means no process spawn on every keystroke in the search box.
+#
+# `all: true` for the master, which sees everything by definition — the
+# launcher then skips filtering entirely rather than matching against a list of
+# every desktop entry on the machine.
+write_allowed_apps() {
+  local name=$1 all=false
+  is_master "$name" && all=true
+  mkdir -p "$STATE_DIR"
+  local tmp
+  tmp=$(mktemp "$STATE_DIR/allowed-apps.json.XXXXXX") || return 1
+  jq -n --arg profile "$name" --argjson all "$all" \
+     --argjson allowed "$(jq -c '.apps.allowed // []' "$(file_for "$name")" 2>/dev/null || echo '[]')" \
+     '{profile: $profile, all: $all, allowed: $allowed}' >"$tmp" &&
+    mv "$tmp" "$STATE_DIR/allowed-apps.json" ||
+    { rm -f "$tmp"; warn "could not write the app allow-list"; return 1; }
+}
+
 write_state() {
   local name=$1 offset
   offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$name")")
@@ -882,6 +904,186 @@ hl_move_window() {
 
 hl_close_window() {
   hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })" >/dev/null
+}
+
+# ------------------------------------------------------------------ vaults
+#
+# An encrypted folder per profile.
+#
+# gocryptfs rather than LUKS or fscrypt: it needs no root, it works on btrfs
+# (fscrypt does not — it wants ext4 or f2fs), and a cipherdir is an ordinary
+# directory that a normal backup picks up.
+#
+#   ~/.local/state/omarchy-profiles/vaults/<profile>   ciphertext, always there
+#   ~/Vaults/<profile>                                 plaintext, only while open
+#
+# What this protects: the contents while the vault is CLOSED. From another
+# profile, from a file manager, from `grep -r ~`, from a lost laptop — all of it
+# is ciphertext. The vault closes automatically when you leave the profile.
+#
+# What it does not protect: the contents while the vault is OPEN. Every profile
+# runs as the same Unix user, so any process running as you can read the mount
+# while it is mounted. It is a closed-safe, not a sandbox.
+#
+# Opening is deliberately manual. Auto-opening on every switch would mean a
+# passphrase prompt on every switch, and a vault that is open whenever you are
+# in the profile is only protecting you against someone browsing a profile you
+# are not using — which is most of the value, but not enough to pay a prompt
+# for on every switch.
+
+VAULT_DIR="$STATE_DIR/vaults"
+vault_cipher() { printf '%s/%s\n' "$VAULT_DIR" "$1"; }
+vault_mount() { printf '%s/Vaults/%s\n' "$HOME" "$1"; }
+
+vault_is_open() { mountpoint -q "$(vault_mount "$1")" 2>/dev/null; }
+vault_exists() { [[ -f "$(vault_cipher "$1")/gocryptfs.conf" ]]; }
+
+need_gocryptfs() {
+  command -v gocryptfs >/dev/null && return 0
+  warn "gocryptfs is not installed — run: omarchy pkg add gocryptfs"
+  return 1
+}
+
+cmd_vault() {
+  local verb=${1:-status} name=${2:-}
+  case $verb in
+  status)
+    local any=0 n
+    while read -r n; do
+      [[ -n $n ]] || continue
+      vault_exists "$n" || continue
+      any=1
+      printf '  %-12s %s\n' "$n" "$(vault_is_open "$n" && echo "open at $(vault_mount "$n" | sed "s|^$HOME|~|")" || echo closed)"
+    done < <(profile_names)
+    ((any)) || echo "no vaults — make one with: omarchy-profile vault init <profile>"
+    command -v gocryptfs >/dev/null || echo; command -v gocryptfs >/dev/null || warn "gocryptfs is not installed" ;;
+  init)
+    [[ -n $name ]] || die "usage: omarchy-profile vault init <profile>"
+    exists "$name" || die "no such profile '$name'"
+    need_gocryptfs || return 1
+    vault_exists "$name" && die "'$name' already has a vault"
+    if [[ ! -t 0 ]]; then relaunch_in_terminal vault init "$name"; return 0; fi
+    mkdir -p "$(vault_cipher "$name")" "$(vault_mount "$name")"
+    echo "Creating an encrypted folder for '$name'."
+    echo "Choose a passphrase. There is no recovery: lose it and the contents are gone."
+    echo
+    gocryptfs -init -- "$(vault_cipher "$name")" || die "could not create the vault"
+    audit "vault created for $name"
+    echo
+    echo "Open it with: omarchy-profile vault open $name" ;;
+  open)
+    [[ -n $name ]] || name=$(current_profile)
+    [[ -n $name ]] || die "usage: omarchy-profile vault open <profile>"
+    vault_exists "$name" || die "'$name' has no vault (make one: omarchy-profile vault init $name)"
+    vault_is_open "$name" && { echo "already open"; return 0; }
+    if [[ ! -t 0 ]]; then relaunch_in_terminal vault open "$name"; return 0; fi
+    need_gocryptfs || return 1
+    mkdir -p "$(vault_mount "$name")"
+    if gocryptfs -- "$(vault_cipher "$name")" "$(vault_mount "$name")"; then
+      audit "vault opened for $name"
+      echo "open at $(vault_mount "$name" | sed "s|^$HOME|~|")"
+    else
+      audit "vault open FAILED for $name"
+      die "could not open the vault"
+    fi ;;
+  close)
+    [[ -n $name ]] || name=$(current_profile)
+    [[ -n $name ]] || die "usage: omarchy-profile vault close <profile>"
+    vault_is_open "$name" || { echo "not open"; return 0; }
+    # A lazy unmount as the fallback: something still holding a file open should
+    # not mean the vault stays readable, and the mount goes as soon as it lets
+    # go. Reporting success on a failed unmount would be the worse lie.
+    if fusermount3 -u "$(vault_mount "$name")" 2>/dev/null ||
+       fusermount3 -uz "$(vault_mount "$name")" 2>/dev/null; then
+      audit "vault closed for $name"
+      echo "closed"
+    else
+      warn "could not close the vault for '$name' — something is still using it"
+      return 1
+    fi ;;
+  *) die "unknown vault verb '$verb' (status, init, open, close)" ;;
+  esac
+}
+
+# Close every open vault that does not belong to the profile being entered.
+# This is the half of the feature that does the protecting: leaving a profile
+# seals it without anyone having to remember to.
+close_foreign_vaults() {
+  local keep=${1:-} n
+  while read -r n; do
+    [[ -n $n ]] || continue
+    [[ $n == "$keep" ]] && continue
+    vault_is_open "$n" || continue
+    fusermount3 -u "$(vault_mount "$n")" 2>/dev/null ||
+      fusermount3 -uz "$(vault_mount "$n")" 2>/dev/null ||
+      warn "could not close '$n' vault — something is still using it"
+    audit "vault closed for $n (left the profile)"
+  done < <(profile_names)
+}
+
+# ------------------------------------------------------------------ global
+#
+# A workspace that belongs to the machine rather than to a profile.
+#
+# Some windows are not part of any desk: music, a download, a long build. Under
+# per-profile workspace blocks those would be stranded in whichever profile
+# happened to be active when they opened, reachable only by switching back.
+#
+# Hyprland already has the right layer for this — a special workspace is an
+# overlay, toggled on top of whatever is below, and its id is negative so it
+# falls outside every profile's block automatically. No new mechanism, and the
+# overview lists it under (unassigned) for free.
+#
+# Off by default. It costs a keybinding and a concept, and someone who keeps
+# their music in the master profile does not need either.
+
+global_ws_name() { cfg '.global_workspace // ""'; }
+
+cmd_global() {
+  local verb=${1:-status} arg=${2:-}
+  case $verb in
+  status)
+    local name; name=$(global_ws_name)
+    if [[ -z $name ]]; then
+      echo "no global workspace (turn one on with: omarchy-profile global enable music)"
+    else
+      echo "global workspace: special:$name"
+      command -v hyprctl >/dev/null &&
+        hyprctl -j clients 2>/dev/null |
+          jq -r --arg w "special:$name" '.[] | select(.workspace.name == $w) | "  \(.class)  \(.title[0:50])"'
+    fi ;;
+  enable)
+    [[ -n $arg ]] || arg=music
+    [[ $arg =~ ^[a-z0-9-]+$ ]] || die "a workspace name may use lowercase letters, digits and - only"
+    cfg_set --arg w "$arg" '.global_workspace = $w' || die "could not enable it"
+    cat <<EOF
+global workspace enabled: special:$arg
+
+Add a keybinding for it in ~/.config/hypr/bindings.lua:
+
+  o.bind("SUPER + M", "Music", hl.dsp.workspace.toggle_special("$arg"))
+  o.bind("SUPER + SHIFT + M", "Send to music",
+    hl.dsp.window.move({ workspace = "special:$arg", follow = false }))
+
+Windows there stay put through every profile switch, and the overview lists
+them under (unassigned) because a special workspace has a negative id and so
+falls outside every profile's block.
+EOF
+    ;;
+  disable)
+    cfg_set '.global_workspace = ""' || die "could not disable it"
+    echo "global workspace off — remove its keybinding by hand if you added one" ;;
+  send)
+    local name; name=$(global_ws_name)
+    [[ -n $name ]] || die "no global workspace; try: omarchy-profile global enable music"
+    hl_move_window "special:$name" "" false
+    echo "sent the focused window to special:$name" ;;
+  toggle)
+    local name; name=$(global_ws_name)
+    [[ -n $name ]] || die "no global workspace; try: omarchy-profile global enable music"
+    hyprctl dispatch "hl.dsp.workspace.toggle_special(\"$name\")" >/dev/null ;;
+  *) die "unknown global verb '$verb' (status, enable, disable, send, toggle)" ;;
+  esac
 }
 
 # ---------------------------------------------------------------- overview
@@ -1123,11 +1325,13 @@ cmd_set() {
   # Plugin state that lives outside shell.json follows the profile too, so a
   # Spotify session or a dock layout belongs to one profile rather than all.
   prune_isolated
+  close_foreign_vaults "$name"
   swap_isolated "$cur" "$name"
 
   apply_profile "$name"
   write_index
   write_catalog
+  write_allowed_apps "$name"
   write_state "$name"
   echo "omarchy-profile: $name"
 }
@@ -1322,7 +1526,9 @@ cmd_apps() {
             sort -u | jq -R . | jq -sc .)
       jq --argjson all "${ids:-[]}" '.apps = ((.apps // {}) | .allowed = $all)' "$file" >"$tmp"
     fi
-    mv "$tmp" "$file" && echo "$verb in $name" ;;
+    mv "$tmp" "$file" || die "could not update '$name'"
+    [[ $name == "$(current_profile)" ]] && write_allowed_apps "$name"
+    echo "$verb in $name" ;;
   allow | deny)
     [[ -n $app ]] || die "usage: omarchy-profile apps $name $verb <app-id>"
     is_master "$name" && { echo "master already sees every application"; return 0; }
@@ -1332,7 +1538,9 @@ cmd_apps() {
     else
       jq --arg a "$app" '.apps = ((.apps // {}) | .allowed = ((.allowed // []) | map(select(. != $a))))' "$file" >"$tmp"
     fi
-    mv "$tmp" "$file" && echo "$verb $app in $name" ;;
+    mv "$tmp" "$file" || die "could not update '$name'"
+    [[ $name == "$(current_profile)" ]] && write_allowed_apps "$name"
+    echo "$verb $app in $name" ;;
   *) die "unknown apps verb '$verb'" ;;
   esac
 }
@@ -1503,6 +1711,16 @@ ensure_config
 
 case "${1:-}" in
 catalog) write_catalog ;;
+global) shift; cmd_global "${1:-status}" "${2:-}" ;;
+vault) shift; cmd_vault "${1:-status}" "${2:-}" ;;
+refresh)
+  # Rewrite every file the panel and launcher read, without switching. Useful
+  # after editing a profile by hand, and after installing over an older version
+  # that wrote none of them.
+  cur=$(current_profile)
+  write_index; write_catalog
+  [[ -n $cur ]] && write_allowed_apps "$cur"
+  echo "refreshed" ;;
 isolate) shift; cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 overview) shift; cmd_overview "${1:-}" ;;
@@ -1544,6 +1762,13 @@ omarchy-profile — profiles for the Omarchy desktop
                                     plugin's own config or state file
 
   overview [--json]                what every profile is holding open
+  refresh                          rewrite the files the panel and launcher read
+
+  global [status|enable|disable|send|toggle] [name]
+                                   a workspace that survives every switch
+
+  vault [status|init|open|close] [profile]
+                                   an encrypted folder, sealed when you leave
   close <name>                     ask every window in a profile to close
 
   apps <profile> [list|allow|deny] [app-id]

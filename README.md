@@ -297,3 +297,73 @@ and any workspace past the last profile's range — so nothing is invisible.
 with unsaved work still gets to stop you. Anything that ignores the request
 survives, which is the right failure: a profile holding 6 GB is housekeeping,
 not an emergency worth losing work over.
+
+## Per-profile app visibility
+
+`graveklar.menu` is the Omarchy menu with one change: it shows only the
+applications the active profile may use. `mergeAppRows` is the single place app
+rows are built, so filtering there covers the root list and the search alike and
+nothing else in the menu needs to know profiles exist.
+
+```bash
+omarchy-profile apps work allow hey
+omarchy-profile apps work deny discord
+omarchy-profile apps work allow-all | deny-all
+```
+
+The launcher reads one small file the engine rewrites on every switch, so there
+is no process spawn while you are typing. The master sees everything, and then
+filtering is skipped entirely rather than matching every desktop entry against a
+list of every desktop entry.
+
+**Failure is open, not closed.** A missing file, bad JSON, or a profile system
+that was never set up all mean "show everything". A launcher that hides your
+applications because a JSON file went missing is a worse failure than one that
+shows an app a profile meant to hide.
+
+## The global workspace
+
+Some windows are not part of any desk: music, a download, a long build. A
+Hyprland *special* workspace has a negative id, so it falls outside every
+profile's block and survives every switch.
+
+```bash
+omarchy-profile global enable music   # prints the keybindings to add
+omarchy-profile global status         # what is parked there
+```
+
+Off by default: it costs a keybinding and a concept, and someone who keeps their
+music in the master profile needs neither.
+
+## Vaults
+
+An encrypted folder per profile, sealed when you leave it.
+
+```bash
+omarchy pkg add gocryptfs             # optional dependency
+omarchy-profile vault init work
+omarchy-profile vault open work
+omarchy-profile vault status
+```
+
+```
+~/.local/state/omarchy-profiles/vaults/<profile>   ciphertext, always there
+~/Vaults/<profile>                                 plaintext, only while open
+```
+
+gocryptfs rather than LUKS or fscrypt: no root needed, it works on btrfs
+(fscrypt wants ext4 or f2fs), and a cipherdir is an ordinary directory that a
+normal backup picks up.
+
+Opening is manual. Auto-opening on every switch would mean a passphrase prompt
+on every switch, and the protection that matters — a profile you are *not* in
+being unreadable — is bought by the automatic close, not by the open.
+
+### What a vault protects
+
+While **closed**: everything. From another profile, from a file manager, from
+`grep -r ~`, from a lost laptop.
+
+While **open**: nothing beyond the filesystem. Every profile runs as the same
+Unix user, so any process running as you can read the mount while it is mounted.
+It is a closed safe, not a sandbox. There is no passphrase recovery.
