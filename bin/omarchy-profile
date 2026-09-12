@@ -1639,26 +1639,48 @@ cmd_ws() {
   local n=${1:-} offset span cur
   offset=$(ws_offset); span=$(ws_span)
 
-  # next/prev wrap inside the profile's own block.
+  # next/prev step to the next workspace in this block that EXISTS.
   #
-  # Hyprland's own e+1 walks to the next workspace that exists, which after the
-  # tenth is the next profile's first — so the stock binding quietly carries you
-  # into another desk's windows. Cycling has to know where the block ends.
+  # Hyprland's own e+1 skips empty workspaces — that is what the "e" is for, and
+  # it is the whole reason the binding is useful: two occupied workspaces are
+  # one keypress apart however far their numbers are. Its only flaw is not
+  # knowing where a profile's block ends, so after the tenth it carries you into
+  # the next desk's windows.
+  #
+  # So: the same skipping, bounded. Walking all ten positions blindly was worse
+  # than the stock behaviour, because reaching an occupied workspace three
+  # numbers away meant three keypresses through empty ones.
   if [[ $n == next || $n == prev ]]; then
     cur=$(hyprctl -j activeworkspace 2>/dev/null | jq -r '.id // 1')
     [[ $cur =~ ^-?[0-9]+$ ]] || cur=$((offset + 1))
-    local pos=$((cur - offset))
-    # Somewhere outside the block (a scratchpad, say): come back to its first.
-    if ((pos < 1 || pos > span)); then
+
+    # Existing workspaces inside the block, in order, with the current one
+    # folded in: a workspace with only one window is real to the compositor but
+    # `hyprctl workspaces` can lag a fresh switch.
+    local ids
+    ids=$(hyprctl -j workspaces 2>/dev/null |
+      jq -r --argjson o "$offset" --argjson s "$span" --argjson cur "$cur" \
+        '[.[] | .id | select(. > $o and . <= ($o + $s))] + [$cur | select(. > $o and . <= ($o + $s))]
+         | unique | .[]')
+
+    # Outside the block (a special workspace, say), or nothing here yet: land on
+    # the block's first workspace rather than doing nothing.
+    if [[ -z $ids ]]; then
       hl_focus_workspace "$((offset + 1))"
       return 0
     fi
-    if [[ $n == next ]]; then
-      ((pos = pos % span + 1))
-    else
-      ((pos = (pos - 2 + span) % span + 1))
-    fi
-    hl_focus_workspace "$((offset + pos))"
+
+    local target
+    target=$(awk -v cur="$cur" -v dir="$n" '
+      { a[NR] = $1; if ($1 == cur) at = NR }
+      END {
+        if (NR == 0) exit
+        if (at == 0) { print a[1]; exit }          # current not in the list
+        if (NR == 1) { print a[1]; exit }          # nowhere else to go
+        if (dir == "next") print a[at % NR + 1]
+        else               print a[(at - 2 + NR) % NR + 1]
+      }' <<<"$ids")
+    [[ -n $target ]] && hl_focus_workspace "$target"
     return 0
   fi
 

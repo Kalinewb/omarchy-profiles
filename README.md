@@ -74,8 +74,10 @@ for w = 1, 10 do
     gk_profile .. " move " .. n .. " --silent")
 end
 
--- Hyprland's e+1 goes to the next workspace that EXISTS, which after the tenth
--- is the next profile's first. Cycling has to know where the block ends.
+-- Hyprland's e+1 skips EMPTY workspaces, which is what makes it useful: two
+-- occupied workspaces are one keypress apart however far their numbers are. Its
+-- only flaw is not knowing where a block ends, so after the tenth it carries you
+-- into the next profile. `ws next` keeps the skipping and adds the boundary.
 hl.unbind("SUPER + TAB")
 o.bind("SUPER + TAB", "Next workspace in this profile", gk_profile .. " ws next")
 hl.unbind("SUPER + SHIFT + TAB")
