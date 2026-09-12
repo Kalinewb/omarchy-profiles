@@ -143,19 +143,47 @@ authenticate() {
   local method for_what=${1:-a locked profile} profile=${2:-}
   method=$(cfg '.unlock.method // "polkit"')
 
-  # A profile may name a face other than the owner's -- a partner's, say. PAM
+  # A profile may name a face other than the owner's — a partner's, say. PAM
   # cannot express that: it authenticates the Unix user, and there is only one.
-  # So this is asked first and separately, and it is only ever additive. If the
-  # face is not recognised the owner check below still runs, so a camera that
-  # cannot see is never the reason somebody is locked out of their own machine.
-  if [[ -n $profile ]] && command -v omarchy-face-identity >/dev/null 2>&1; then
-    local identity
+  # So the identity is asked first and separately.
+  #
+  # owner_override decides what happens when that face is not recognised:
+  #
+  #   true (default)  the owner check below still runs, so a camera that cannot
+  #                   see is never the reason somebody is locked out of their
+  #                   own machine.
+  #   false           refuse. Only the bound face opens this profile, and the
+  #                   machine owner's password does not.
+  #
+  # Read the honesty note under "What a lock is not" before trusting the second
+  # one: this file is writable by the owner, so owner_override=false is a
+  # courtesy between people sharing a laptop, not a boundary. The encrypted
+  # vault is the part that a password cannot talk its way past.
+  local identity="" owner_override=true
+  if [[ -n $profile ]]; then
     identity=$(jq -r '.identity // empty' "$(file_for "$profile")" 2>/dev/null)
-    if [[ -n $identity ]]; then
-      if omarchy-face-identity verify "$identity"; then
-        audit "unlock of $for_what succeeded: face matched identity '$identity'"
-        return 0
-      fi
+    # `== false`, not `// true`: jq's alternative operator treats false as
+    # absent, so `.owner_override // true` returned TRUE for a profile that had
+    # explicitly set it to false — the setting was silently a no-op, and the
+    # owner's password kept opening a profile meant to refuse it.
+    owner_override=$(jq -r 'if (.owner_override == false) then "false" else "true" end' \
+      "$(file_for "$profile")" 2>/dev/null)
+  fi
+
+  if [[ -n $identity ]]; then
+    if ! command -v omarchy-face-identity >/dev/null 2>&1; then
+      # A bound identity with no way to check it: refusing would strand the
+      # profile on a machine where the face plugin was removed.
+      warn "'$profile' is bound to the face '$identity', but omarchy-face-identity is not installed"
+      audit "unlock of $for_what: identity '$identity' unverifiable, face tooling missing"
+    elif omarchy-face-identity verify "$identity"; then
+      audit "unlock of $for_what succeeded: face matched identity '$identity'"
+      return 0
+    elif [[ $owner_override == false ]]; then
+      warn "this profile opens only for '$identity'"
+      audit "unlock of $for_what REFUSED: identity '$identity' not recognised and owner_override is off"
+      return 1
+    else
       audit "unlock of $for_what: identity '$identity' not recognised, falling back to the owner check"
     fi
   fi
@@ -210,8 +238,9 @@ authenticate() {
 # profile is at least as consequential as entering it, and an ungated version
 # would let anyone at the keyboard point a locked profile at their own face.
 cmd_identity() {
-  local name=${1:-} identity=${2:-}
-  [[ -n $name ]] || die "usage: omarchy-profile identity <profile> <identity|none>"
+  local name=${1:-} identity=${2:-} only=""
+  [[ ${3:-} == --only ]] && only=1
+  [[ -n $name ]] || die "usage: omarchy-profile identity <profile> <identity|none> [--only]"
   exists "$name" || die "no such profile '$name'"
 
   if [[ -z $identity ]]; then
@@ -232,7 +261,9 @@ cmd_identity() {
   tmp=$(mktemp)
 
   if [[ $identity == none ]]; then
-    jq 'del(.identity)' "$file" >"$tmp" && mv "$tmp" "$file"
+    # owner_override goes back to its default too: leaving it off with no
+    # identity bound would leave a profile nothing could open.
+    jq 'del(.identity) | del(.owner_override)' "$file" >"$tmp" && mv "$tmp" "$file"
     audit "identity cleared on $name"
     echo "$name no longer answers to a face of its own"
     return 0
@@ -248,9 +279,34 @@ cmd_identity() {
     die "no face enrolled as '$identity' — enrol it first with omarchy-face"
   fi
 
-  jq --arg i "$identity" '.identity = $i' "$file" >"$tmp" && mv "$tmp" "$file"
-  audit "identity '$identity' bound to $name"
-  echo "$name now also opens for the face enrolled as '$identity'"
+  jq --arg i "$identity" --argjson override "$([[ -n $only ]] && echo false || echo true)" \
+    '.identity = $i | .owner_override = $override' "$file" >"$tmp" && mv "$tmp" "$file"
+
+  if [[ -n $only ]]; then
+    audit "identity '$identity' bound to $name, owner override OFF"
+    cat <<EOF
+$name now opens only for the face enrolled as '$identity'.
+Your own password will not open it.
+
+Read this before relying on it. $(file_for "$name" | sed "s|^$HOME|~|") is writable
+by whoever owns this machine, so anyone who can edit it can turn this back on,
+or clear the binding, or read the profile's files directly without entering it
+at all. As a courtesy between people sharing a laptop it holds. As a boundary
+it does not, and nothing kept in ~/.config could.
+
+For a part of the profile that a password genuinely cannot reach:
+
+  omarchy-profile vault init $name
+
+The vault's key comes from its passphrase, so it is not a rule anybody can edit
+— without the passphrase the contents are ciphertext to every account on the
+machine, root included.
+EOF
+  else
+    audit "identity '$identity' bound to $name"
+    echo "$name now also opens for the face enrolled as '$identity'"
+    echo "(your own password still opens it too — use --only to change that)"
+  fi
 }
 
 cmd_lock() {
@@ -1749,7 +1805,7 @@ overview) shift; cmd_overview "${1:-}" ;;
 close) shift; cmd_close_profile "${1:-}" ;;
 lock) shift; cmd_lock lock "${1:-}" ;;
 unlock) shift; cmd_lock unlock "${1:-}" ;;
-identity) shift; cmd_identity "${1:-}" "${2:-}" ;;
+identity) shift; cmd_identity "${1:-}" "${2:-}" "${3:-}" ;;
 set) shift; cmd_set "${1:-}" "${2:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;

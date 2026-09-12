@@ -254,10 +254,41 @@ prompt exists. Real isolation would need a separate Unix user and a separate
 login session, which is not a profile switch.
 
 **The same is true of a bound identity.** A profile can name whose face opens
-it — a partner's, say — but the binding lives in `~/.config`, writable by the
-same user who is being gated. It decides who the machine greets, not who can
-reach the files. A profile bound to somebody else's face is not private from
-you, and yours is not private from anyone who can edit your config.
+it — a partner's, say — and `--only` stops your own password opening it:
+
+```bash
+omarchy-profile identity partner anna --only
+```
+
+That does what it says: the face is the only thing the prompt accepts. But the
+binding lives in `~/.config`, writable by whoever owns the machine, so anyone
+who can edit that file can switch the rule back off, clear the binding, or read
+the profile's files directly without entering it at all. As a courtesy between
+people sharing a laptop it holds. As a boundary it does not, and nothing kept
+in `~/.config` could.
+
+### If it has to actually hold
+
+Use a vault. The distinction is not a detail:
+
+|  | a lock, or a bound face | a vault |
+|---|---|---|
+| What decides | a rule in a file | a key derived from a passphrase |
+| Owner with root | can edit the rule | cannot read the contents |
+| Forgotten secret | recoverable | contents are gone |
+
+A face cannot open a vault, and that is not an omission — a biometric check
+returns yes or no, it does not produce a key. So the person whose profile it is
+types their passphrase for the vault, and their face is what saves them typing
+it to *enter the profile*. Two different things, on purpose.
+
+```bash
+omarchy-profile vault init partner     # their passphrase, not yours
+```
+
+Without that passphrase the contents are ciphertext to every account on the
+machine, root included. That is the only part of this plugin that a password
+cannot talk its way past.
 
 ## What is open
 
