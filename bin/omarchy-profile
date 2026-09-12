@@ -859,6 +859,31 @@ apply_profile() {
   fi
 }
 
+# Hyprland on Omarchy is configured in Lua, and hyprctl dispatch takes a Lua
+# expression rather than a dispatcher name: `hyprctl dispatch workspace 3`
+# fails with "')' expected near '3'". Every dispatch goes through these, so the
+# dialect is written down once instead of four times.
+#
+# This was wrong in all four call sites until it was tested against a running
+# compositor — including the window migration on remove, which therefore never
+# moved anything. Nothing reported an error because the exit code was dropped.
+hl_focus_workspace() {
+  hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null
+}
+
+hl_move_window() {
+  local ws=$1 addr=${2:-} follow=${3:-true} expr
+  expr="hl.dsp.window.move({ workspace = \"$ws\""
+  [[ -n $addr ]] && expr+=", window = \"address:$addr\""
+  [[ $follow == false ]] && expr+=", follow = false"
+  expr+=" })"
+  hyprctl dispatch "$expr" >/dev/null
+}
+
+hl_close_window() {
+  hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })" >/dev/null
+}
+
 # ---------------------------------------------------------------- overview
 #
 # What every profile is holding open right now.
@@ -1024,7 +1049,7 @@ cmd_close_profile() {
   span=$(jq -r '.workspaces.span // 10' "$(file_for "$name")")
   while read -r addr; do
     [[ -n $addr ]] || continue
-    hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1 && ((n++))
+    hl_close_window "$addr" 2>/dev/null && ((n++))
   done < <(hyprctl -j clients 2>/dev/null |
     jq -r --argjson o "$offset" --argjson s "$span" \
       '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s)) | .address')
@@ -1212,8 +1237,7 @@ cmd_remove() {
       # workspace being emptied.
       while read -r addr ws; do
         [[ -n $addr ]] || continue
-        hyprctl dispatch movetoworkspacesilent \
-          "$((master_offset + ws - offset)),address:$addr" >/dev/null 2>&1 ||
+        hl_move_window "$((master_offset + ws - offset))" "$addr" false ||
           warn "could not move window $addr off workspace $ws"
       done < <(hyprctl -j clients 2>/dev/null |
         jq -r --argjson o "$offset" --argjson s "$span" \
@@ -1387,18 +1411,61 @@ cmd_plugin() {
 
 # Workspace indirection. Hyprland has no app grouping, so workspaces are the
 # only layer available; these two keep SUPER+N meaning "this profile's Nth".
+# The active profile's block. Defaults to 0/10 so a missing or unreadable state
+# file leaves the keys addressing workspaces 1-10 — the stock behaviour — rather
+# than doing nothing. These run on every workspace keypress, so they stay to one
+# jq call.
+ws_offset() {
+  local o
+  o=$(jq -r '.ws_offset // 0' "$STATE_FILE" 2>/dev/null)
+  [[ $o =~ ^[0-9]+$ ]] && printf '%s\n' "$o" || printf '0\n'
+}
+
+ws_span() {
+  local s
+  s=$(jq -r '.ws_span // 10' "$STATE_FILE" 2>/dev/null)
+  [[ $s =~ ^[0-9]+$ ]] && printf '%s\n' "$s" || printf '10\n'
+}
+
 cmd_ws() {
-  local n=${1:-} offset
-  [[ $n =~ ^([1-9]|10)$ ]] || die "usage: omarchy-profile ws <1-10>"
-  offset=$(jq -r '.ws_offset // 0' "$STATE_FILE" 2>/dev/null); [[ $offset =~ ^[0-9]+$ ]] || offset=0
-  hyprctl dispatch workspace "$((offset + n))" >/dev/null
+  local n=${1:-} offset span cur
+  offset=$(ws_offset); span=$(ws_span)
+
+  # next/prev wrap inside the profile's own block.
+  #
+  # Hyprland's own e+1 walks to the next workspace that exists, which after the
+  # tenth is the next profile's first — so the stock binding quietly carries you
+  # into another desk's windows. Cycling has to know where the block ends.
+  if [[ $n == next || $n == prev ]]; then
+    cur=$(hyprctl -j activeworkspace 2>/dev/null | jq -r '.id // 1')
+    [[ $cur =~ ^-?[0-9]+$ ]] || cur=$((offset + 1))
+    local pos=$((cur - offset))
+    # Somewhere outside the block (a scratchpad, say): come back to its first.
+    if ((pos < 1 || pos > span)); then
+      hl_focus_workspace "$((offset + 1))"
+      return 0
+    fi
+    if [[ $n == next ]]; then
+      ((pos = pos % span + 1))
+    else
+      ((pos = (pos - 2 + span) % span + 1))
+    fi
+    hl_focus_workspace "$((offset + pos))"
+    return 0
+  fi
+
+  [[ $n =~ ^([1-9]|10)$ ]] || die "usage: omarchy-profile ws <1-10|next|prev>"
+  hl_focus_workspace "$((offset + n))"
 }
 
 cmd_move() {
-  local n=${1:-} offset
-  [[ $n =~ ^([1-9]|10)$ ]] || die "usage: omarchy-profile move <1-10>"
-  offset=$(jq -r '.ws_offset // 0' "$STATE_FILE" 2>/dev/null); [[ $offset =~ ^[0-9]+$ ]] || offset=0
-  hyprctl dispatch movetoworkspace "$((offset + n))" >/dev/null
+  local n=${1:-} offset follow=true
+  # "silent" is follow = false in the Lua API: the window moves and the view
+  # stays put, rather than a separate dispatcher name.
+  [[ ${2:-} == --silent ]] && follow=false
+  [[ $n =~ ^([1-9]|10)$ ]] || die "usage: omarchy-profile move <1-10> [--silent]"
+  offset=$(ws_offset)
+  hl_move_window "$((offset + n))" "" "$follow"
 }
 
 cmd_next() {
@@ -1452,7 +1519,7 @@ hide) shift; cmd_visibility hide "${1:-}" ;;
 apps) shift; cmd_apps "${1:-}" "${2:-list}" "${3:-}" ;;
 plugin) shift; cmd_plugin "${1:-}" "${2:-list}" "${3:-}" ;;
 ws) shift; cmd_ws "${1:-}" ;;
-move) shift; cmd_move "${1:-}" ;;
+move) shift; cmd_move "${1:-}" "${2:-}" ;;
 next) cmd_next ;;
 current) cmd_current ;;
 init) cmd_init ;;
@@ -1482,8 +1549,8 @@ omarchy-profile — profiles for the Omarchy desktop
   apps <profile> [list|allow|deny] [app-id]
   plugin <profile> [list|enable|disable] [plugin-id]
 
-  ws <1-10>                        focus this profile's Nth workspace
-  move <1-10>                      move the window to this profile's Nth workspace
+  ws <1-10|next|prev>            focus a workspace inside this profile
+  move <1-10> [--silent]           move the window inside this profile
 
 A profile is a saved desk, not a template: switching away captures whatever you
 changed, so nothing resets when you come back.

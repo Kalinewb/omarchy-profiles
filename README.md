@@ -60,19 +60,51 @@ To make `SUPER+1..0` follow the active profile, point them at the engine in
 `~/.config/hypr/bindings.lua`:
 
 ```lua
-local profile = os.getenv("HOME") .. "/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
+local gk_profile = os.getenv("HOME") .. "/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
 
 for w = 1, 10 do
   local key = "code:" .. tostring(w + 9)
+  local n = tostring(w)
   hl.unbind("SUPER + " .. key)
-  o.bind("SUPER + " .. key, "Workspace " .. w, profile .. " ws " .. w)
+  o.bind("SUPER + " .. key, "Workspace " .. n, gk_profile .. " ws " .. n)
   hl.unbind("SUPER + SHIFT + " .. key)
-  o.bind("SUPER + SHIFT + " .. key, "Move to workspace " .. w, profile .. " move " .. w)
+  o.bind("SUPER + SHIFT + " .. key, "Move window to workspace " .. n, gk_profile .. " move " .. n)
+  hl.unbind("SUPER + SHIFT + ALT + " .. key)
+  o.bind("SUPER + SHIFT + ALT + " .. key, "Move window silently to workspace " .. n,
+    gk_profile .. " move " .. n .. " --silent")
 end
+
+-- Hyprland's e+1 goes to the next workspace that EXISTS, which after the tenth
+-- is the next profile's first. Cycling has to know where the block ends.
+hl.unbind("SUPER + TAB")
+o.bind("SUPER + TAB", "Next workspace in this profile", gk_profile .. " ws next")
+hl.unbind("SUPER + SHIFT + TAB")
+o.bind("SUPER + SHIFT + TAB", "Previous workspace in this profile", gk_profile .. " ws prev")
 ```
 
-Without this the keys still work; they just always address workspaces 1–10
-rather than the active profile's block.
+Leave the mouse-scroll bindings on Hyprland's own `e+1` / `e-1`. They walk into
+other profiles' blocks, which is the leak these keys exist to close — and that
+makes them the escape hatch: a way to reach another desk on purpose, and a way
+to navigate at all if the plugin is removed with these bindings left behind.
+
+Without any of this the keys still work; they just always address workspaces
+1–10, so every profile shares one block.
+
+### One trap if you write your own dispatches
+
+Hyprland on Omarchy is configured in Lua, and `hyprctl dispatch` takes a Lua
+expression, not a dispatcher name:
+
+```bash
+hyprctl dispatch workspace 3
+# error: [string "return hl.dispatch(workspace 3)"]:1: ')' expected near '3'
+
+hyprctl dispatch 'hl.dsp.focus({ workspace = "3" })'   # ok
+```
+
+Every dispatch here goes through one small set of helpers for that reason. All
+four call sites had the plain form and silently did nothing — including the
+window migration on removing a profile — because the exit code was dropped.
 
 ## Files
 
