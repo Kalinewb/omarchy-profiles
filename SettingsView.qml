@@ -332,13 +332,31 @@ Column {
         elide: Text.ElideRight
       }
 
+      // What the thing actually does. A list of bare names tells you nothing
+      // about what switching one off will cost you, which is the whole reason
+      // to read this screen.
+      Text {
+        width: nameCol.width
+        visible: text !== ""
+        textFormat: Text.PlainText
+        text: prow.plugin ? String(prow.plugin.description || "") : ""
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        wrapMode: Text.WordWrap
+        // Two lines: enough for the sentence most authors write, without one
+        // verbose README paragraph pushing the rest of the list off screen.
+        maximumLineCount: 2
+        elide: Text.ElideRight
+      }
+
       Text {
         width: nameCol.width
         visible: prow.pinned || !!(prow.plugin && prow.plugin.firstParty)
         textFormat: Text.PlainText
         text: prow.pinned ? "Pinned — switching this off would leave no way back"
-                          : "An Omarchy default — on unless you turn it off"
-        color: root.dim
+                          : "An Omarchy default"
+        color: prow.pinned ? root.accent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         elide: Text.ElideRight

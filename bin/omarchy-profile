@@ -178,30 +178,50 @@ write_index() {
 write_catalog() {
   mkdir -p "$STATE_DIR"
   command -v omarchy >/dev/null || return 0
-  local tmp pinned
+  local tmp pinned state meta
   pinned=$(cfg -c '.pinned_plugins // []')
+
+  # Two sources, because neither alone is enough:
+  #   plugin list --json  what is enabled, what may be disabled
+  #   plugin-catalog      the description and the author's own category
+  # A list of bare ids tells the user nothing about what they are switching
+  # off, so the description is the point of joining them.
+  state=$(omarchy plugin list --json 2>/dev/null) || state='[]'
+  meta=$(omarchy-plugin-catalog 2>/dev/null) || meta='[]'
+
   tmp=$(mktemp "$STATE_DIR/plugins.json.XXXXXX") || return 1
-  omarchy plugin list --json 2>/dev/null |
-    jq -c --argjson pinned "${pinned:-[]}" '
-      [ .[] | . as $p | {
-          id, name, kinds,
-          enabled: (.enabled // false),
-          canDisable: (.canDisable // true),
-          firstParty: (.firstParty // false),
-          # $p.id, not .id: after `$pinned |` the input is the array, so `.id`
-          # would try to index it with a string.
-          pinned: (($pinned | index($p.id)) != null),
-          category: (
-            if (.kinds | index("bar-widget")) then "Bar widgets"
-            elif (.kinds | index("panel")) then "Panels"
-            elif (.kinds | index("service")) then "Services"
-            elif (.kinds | index("overlay")) then "Overlays"
-            elif (.kinds | index("menu")) then "Menus"
-            elif (.kinds | index("bar")) then "Bars"
-            else "Other" end)
-        } ]
-      | sort_by(.category, (.name | ascii_downcase))
-    ' >"$tmp" && mv "$tmp" "$STATE_DIR/plugins.json" || { rm -f "$tmp"; warn "could not write the plugin catalog"; return 1; }
+  jq -nc --argjson state "${state:-[]}" --argjson meta "${meta:-[]}" \
+         --argjson pinned "${pinned:-[]}" '
+    ($meta | map({key: .id, value: .}) | from_entries) as $by_id
+    | [ $state[] | . as $p | ($by_id[$p.id] // {}) as $m | {
+        id: $p.id,
+        name: ($p.name // $p.id),
+        kinds: ($p.kinds // []),
+        enabled: ($p.enabled // false),
+        canDisable: ($p.canDisable // true),
+        firstParty: ($p.firstParty // false),
+        # $p.id, not .id: after `$pinned |` the input is the array, so `.id`
+        # would try to index it with a string.
+        pinned: (($pinned | index($p.id)) != null),
+        # The widget blurb first: it is written about the thing in the bar and
+        # is shorter than the plugin-level description, which often reads like
+        # a README paragraph.
+        description: (($m.barWidget.description // $m.description // "") | gsub("\\s+"; " ")),
+        # The author'"'"'s own category where they set one — Audio, Compositor,
+        # Wellbeing — since it says more than the kind does. Falls back to the
+        # kind for the plugins that declare none.
+        category: (
+          $m.barWidget.category //
+          (if ($p.kinds | index("bar-widget")) then "Bar widgets"
+           elif ($p.kinds | index("panel")) then "Panels"
+           elif ($p.kinds | index("service")) then "Services"
+           elif ($p.kinds | index("overlay")) then "Overlays"
+           elif ($p.kinds | index("menu")) then "Menus"
+           elif ($p.kinds | index("bar")) then "Bars"
+           else "Other" end))
+      } ]
+    | sort_by(.category, (.name | ascii_downcase))
+  ' >"$tmp" && mv "$tmp" "$STATE_DIR/plugins.json" || { rm -f "$tmp"; warn "could not write the plugin catalog"; return 1; }
 }
 
 write_state() {
