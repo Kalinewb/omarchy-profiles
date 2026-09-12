@@ -87,6 +87,11 @@ Panel {
   // Which profile the settings view is editing.
   property string settingsProfile: ""
   property var pluginCatalog: []
+  property var overviewRows: []
+  property string pendingClose: ""
+
+  readonly property string overviewPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
+    + "/omarchy-profiles/overview.json"
   property var settingsDisabled: []
   property var settingsAllowedApps: []
 
@@ -188,6 +193,9 @@ Panel {
     cursorActive = false
     if (currentProfile !== "") cursor = Math.max(0, visibleIndexOf(currentProfile))
     stateFile.reload()
+    // Recomputed on open rather than polled: it reads /proc for every window,
+    // which is not something to do on a timer for a panel nobody is looking at.
+    root.runEngine("overview")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
@@ -201,6 +209,23 @@ Panel {
     // No state file yet means no profile has been applied. Leave the label
     // generic instead of claiming one.
     onLoadFailed: root.currentProfile = ""
+  }
+
+  FileView {
+    id: overviewFile
+    path: root.overviewPath
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(text())
+        if (Array.isArray(parsed)) root.overviewRows = parsed
+      } catch (e) {
+        console.warn("graveklar.profiles", "Ignoring bad overview", root.overviewPath, e)
+      }
+    }
+    onLoadFailed: root.overviewRows = []
   }
 
   FileView {
@@ -378,6 +403,24 @@ Panel {
       }
     }
 
+    ConfirmDialog {
+      id: closeDialog
+      anchors.fill: parent
+      z: 10
+      opened: root.pendingClose !== ""
+      message: "Close everything open in \"" + root.pendingClose + "\"?\n\nEach window is asked to close, so anything with unsaved work can still stop you. The profile itself is kept."
+      confirmText: "Close them"
+      cancelText: "Leave them"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      onCanceled: root.pendingClose = ""
+      onConfirmed: {
+        root.runEngine("close " + root.pendingClose)
+        root.pendingClose = ""
+        root.runEngine("overview")
+      }
+    }
+
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
@@ -422,6 +465,7 @@ Panel {
         PanelHero {
           width: parent.width
           title: root.view === "settings" ? root.settingsProfile
+                 : root.view === "overview" ? "What is open"
                  : (root.view === "manage" ? "Manage profiles" : "Profiles")
           // Empty outside the picker: the pill names the profile you are IN,
           // which only matters while choosing one. Showing "Master" beside the
@@ -429,6 +473,7 @@ Panel {
           detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile) : ""
           meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
                 : root.view === "settings" ? "What this profile may use"
+                : root.view === "overview" ? "Nothing closes when you switch"
                 : root.view === "manage" ? "Create, remove, or hide a profile"
                 : "Same files, a different desk"
           foreground: root.foreground
@@ -459,6 +504,7 @@ Panel {
                 // One step back each press, so settings returns to the list it
                 // was opened from rather than jumping to the switcher.
                 if (root.view === "settings") { root.view = "manage"; root.settingsProfile = "" }
+                else if (root.view === "overview") root.view = "manage"
                 else if (root.view === "manage") root.view = "picker"
                 else root.view = "manage"
                 root.cursor = 0
@@ -528,12 +574,27 @@ Panel {
           onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
           onCursorMoved: function (index) { root.keepAlive(); root.cursorActive = true; root.cursor = index }
           onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
+          onOpenOverview: { root.keepAlive(); root.runEngine("overview"); root.view = "overview" }
           onOpenSettings: function (profile) {
             root.keepAlive()
             root.settingsProfile = profile
             root.view = "settings"
             root.runEngine("catalog")
           }
+        }
+
+        OverviewView {
+          width: parent.width
+          visible: root.view === "overview"
+          rows: root.overviewRows
+          currentProfile: root.currentProfile
+          foreground: root.foreground
+          accent: root.accent
+          dim: root.dim
+          fontFamily: root.fontFamily
+          onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
+          onConfirmClose: function (profile) { root.keepAlive(); root.pendingClose = profile }
+          onTouched: root.keepAlive()
         }
 
         SettingsView {
@@ -556,7 +617,8 @@ Panel {
           textFormat: Text.PlainText
           width: parent.width
           topPadding: Style.space(2)
-          text: root.view === "settings" ? "back returns to the list · closes itself if left alone"
+          text: root.view === "overview" ? "measured from each window's cgroup, not estimated"
+                : root.view === "settings" ? "back returns to the list · closes itself if left alone"
                 : (root.view === "manage" ? "esc closes · the arrow returns to switching"
                    : "j/k move · enter apply · middle-click the bar to cycle")
           color: root.dim

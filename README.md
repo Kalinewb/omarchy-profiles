@@ -224,3 +224,44 @@ it — a partner's, say — but the binding lives in `~/.config`, writable by th
 same user who is being gated. It decides who the machine greets, not who can
 reach the files. A profile bound to somebody else's face is not private from
 you, and yours is not private from anyone who can edit your config.
+
+## What is open
+
+Profiles persist. Switching away kills nothing, which is what makes "I am
+working, now I want to game" safe to do without thinking. The cost is that
+several profiles can quietly hold several browsers, so there is a view of it:
+
+```bash
+omarchy-profile overview
+omarchy-profile overview --json    # what the panel reads
+omarchy-profile close work         # ask every window in a profile to close
+```
+
+```
+PROFILE         WINS   WS   MEMORY  LAST USED  APPS
+* master           2    2     1.6G        now  foot, org.omarchy.agent
+  gaming           3    2     4.1G     2d ago  steam, gamescope
+  (unassigned)     1    1      91M      never  Bitwarden
+```
+
+Two things make the numbers worth trusting:
+
+**Attribution is by workspace.** A window belongs to a profile if its workspace
+falls in that profile's block, so a terminal you opened by hand counts exactly
+like one a profile switch opened. Launching apps into per-profile systemd
+slices was the obvious alternative and is worse: it only sees what went through
+its own launcher, so the total looks authoritative while silently missing
+things.
+
+**Memory comes from each window's cgroup**, which uwsm already gives every app,
+summed over *unique* cgroups. Chromium keeps every window in one scope, so
+summing per window would count a browser once per window and overstate a
+profile several times over.
+
+`(unassigned)` collects anything outside every profile's block — the scratchpad,
+and any workspace past the last profile's range — so nothing is invisible.
+
+`close` asks each window to close rather than killing its cgroup, so an editor
+with unsaved work still gets to stop you. Anything that ignores the request
+survives, which is the right failure: a profile holding 6 GB is housekeeping,
+not an emergency worth losing work over.

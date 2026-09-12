@@ -716,6 +716,15 @@ write_state() {
      '{profile: $profile, ws_offset: $ws_offset, ws_span: $span, updated: $updated}' \
      >"$tmp" && mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
   cfg_set --arg last "$name" '.last = $last' || warn "could not record last profile"
+
+  # Stamped on the profile itself, so the overview can say "not opened in three
+  # weeks" — which is the signal that it is holding windows you have forgotten.
+  local ptmp
+  ptmp=$(mktemp) || return 0
+  # UTC with a Z: jq's fromdateiso8601 rejects a +02:00 offset outright, and
+  # the reader should not have to carry a timezone parser.
+  jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_used = $t' "$(file_for "$name")" >"$ptmp" &&
+    mv "$ptmp" "$(file_for "$name")" || rm -f "$ptmp"
 }
 
 # ------------------------------------------------------------------ apply
@@ -848,6 +857,178 @@ apply_profile() {
   if [[ -n $wallpaper && -f $wallpaper ]]; then
     omarchy theme bg set "$wallpaper" >/dev/null 2>&1 || warn "could not set wallpaper"
   fi
+}
+
+# ---------------------------------------------------------------- overview
+#
+# What every profile is holding open right now.
+#
+# Profiles persist by design: switching away kills nothing, which is what makes
+# "I am working, now I want to game" safe. The cost is that seven profiles can
+# quietly be holding seven browsers, and the only defence is being able to see
+# it. This is that view.
+#
+# Two decisions make the numbers trustworthy rather than roughly right:
+#
+# Attribution is by WORKSPACE, not by anything we launched. A window belongs to
+# a profile if its workspace falls in that profile's block, so a terminal
+# started by hand counts exactly like one opened by a profile switch. Launching
+# apps into per-profile systemd slices was the obvious alternative and is worse:
+# it would only see what went through our own launcher, so the total would look
+# authoritative while silently missing things.
+#
+# Memory comes from each window's cgroup, which uwsm already gives every app,
+# so it is real accounting rather than a guess — and it is summed over UNIQUE
+# cgroups, not windows. Chromium keeps every window in one scope; summing per
+# window would report its memory once per tab-window and overstate a browser
+# profile several times over.
+
+# Deduped cgroup memory for a set of pids read from stdin.
+#
+# Deduped because Chromium keeps every window in one scope: summing per window
+# would count a browser's memory once per window and overstate a profile
+# several times over. An unreadable cgroup contributes nothing rather than
+# failing the whole row.
+cgroup_memory_for_pids() {
+  local pid cg seen=() total=0 mem
+  declare -A counted
+  while read -r pid; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    cg=$(sed -n 's|^0::||p' "/proc/$pid/cgroup" 2>/dev/null)
+    [[ -n $cg ]] || continue
+    [[ -n ${counted[$cg]:-} ]] && continue
+    counted[$cg]=1
+    mem=$(cat "/sys/fs/cgroup${cg}/memory.current" 2>/dev/null) || continue
+    [[ $mem =~ ^[0-9]+$ ]] && total=$((total + mem))
+  done
+  printf '%s\n' "$total"
+}
+
+overview_json() {
+  command -v hyprctl >/dev/null || { echo '[]'; return 0; }
+
+  local clients active ranges='[]' rows='[]' name offset span
+  clients=$(hyprctl -j clients 2>/dev/null) || clients='[]'
+  active=$(current_profile)
+
+  while read -r name; do
+    [[ -n $name ]] || continue
+    offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$name")")
+    span=$(jq -r '.workspaces.span // 10' "$(file_for "$name")")
+    ranges=$(jq -c --argjson o "$offset" --argjson s "$span" '. + [{o: $o, s: $s}]' <<<"$ranges")
+
+    local mem
+    mem=$(jq -r --argjson o "$offset" --argjson s "$span" \
+      '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s)) | .pid' <<<"$clients" |
+      cgroup_memory_for_pids)
+
+    rows=$(jq -c \
+      --arg name "$name" --arg active "$active" \
+      --argjson o "$offset" --argjson s "$span" \
+      --argjson clients "$clients" --argjson mem "${mem:-0}" \
+      --slurpfile prof "$(file_for "$name")" '
+        ($clients | [.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))]) as $mine
+        | . + [{
+            profile: $name,
+            active: ($name == $active),
+            offset: $o, span: $s,
+            windows: ($mine | length),
+            workspaces: ($mine | map(.workspace.id) | unique | length),
+            memory: $mem,
+            apps: ($mine | group_by(.class) | map({class: (.[0].class // "?"), count: length})
+                         | sort_by(-.count)),
+            hidden: ($prof[0].hidden // false),
+            locked: ($prof[0].locked // false),
+            last_used: ($prof[0].last_used // "")
+          }]' <<<"$rows")
+  done < <(profile_names)
+
+  # Anything outside every block, so nothing is invisible: the scratchpad, and
+  # any workspace beyond the last profile's range.
+  local loose_mem
+  loose_mem=$(jq -r --argjson ranges "$ranges" \
+    '.[] | . as $c
+     | select([$ranges[] | select($c.workspace.id > .o and $c.workspace.id <= (.o + .s))] | length == 0)
+     | .pid' <<<"$clients" | cgroup_memory_for_pids)
+
+  jq -c --argjson clients "$clients" --argjson ranges "$ranges" --argjson mem "${loose_mem:-0}" '
+    ($clients | [.[] | . as $c
+       | select([$ranges[] | select($c.workspace.id > .o and $c.workspace.id <= (.o + .s))] | length == 0)]) as $loose
+    | if ($loose | length) > 0 then
+        . + [{
+          profile: "(unassigned)",
+          active: false, offset: null, span: null,
+          windows: ($loose | length),
+          workspaces: ($loose | map(.workspace.id) | unique | length),
+          memory: $mem,
+          apps: ($loose | group_by(.class) | map({class: (.[0].class // "?"), count: length}) | sort_by(-.count)),
+          hidden: false, locked: false, last_used: ""
+        }]
+      else . end
+  ' <<<"$rows"
+}
+
+cmd_overview() {
+  local json
+  json=$(overview_json)
+  mkdir -p "$STATE_DIR"
+  printf '%s' "$json" >"$STATE_DIR/overview.json"
+
+  [[ ${1:-} == --json ]] && { printf '%s\n' "$json"; return 0; }
+
+  printf '%-14s %5s %4s %8s %10s  %s\n' PROFILE WINS WS MEMORY 'LAST USED' APPS
+  # Megabytes below a gigabyte: 51 MB rendered as "0G" at one decimal place,
+  # which reads as "nothing here" for a window that is plainly open.
+  jq -r --argjson now "$(date +%s)" '
+    # A timestamp written before these were normalised to UTC carries a +02:00
+    # offset, which fromdateiso8601 rejects outright. Catching that shows "?"
+    # for one row instead of failing the whole table.
+    def ago($now):
+      if (. // "") == "" then "never"
+      else (try ($now - fromdateiso8601) catch null) as $d
+        | if   $d == null  then "?"
+          elif $d < 3600   then (($d / 60      | floor | tostring) + "m ago")
+          elif $d < 86400  then (($d / 3600    | floor | tostring) + "h ago")
+          else                  (($d / 86400   | floor | tostring) + "d ago")
+          end
+      end;
+    .[] | [
+      (if .active then "* " else "  " end) + .profile,
+      (.windows|tostring),
+      (.workspaces|tostring),
+      (if .memory >= 1073741824 then ((.memory/1073741824*10|round)/10|tostring) + "G"
+       elif .memory >= 1048576 then ((.memory/1048576)|round|tostring) + "M"
+       else "-" end),
+      (if .active then "now" else (.last_used | ago($now)) end),
+      (.apps | map(.class + (if .count > 1 then " x" + (.count|tostring) else "" end)) | join(", "))
+    ] | @tsv' <<<"$json" |
+    while IFS=$'\t' read -r p w ws m used apps; do
+      printf '%-14s %5s %4s %8s %10s  %s\n' "$p" "$w" "$ws" "$m" "$used" "${apps:0:52}"
+    done
+}
+
+# Close everything a profile is holding, politely.
+#
+# closewindow rather than killing the cgroup: an editor with unsaved work gets
+# its usual chance to ask. Anything that ignores the request survives, which is
+# the right failure — a profile with 12 windows and 6 GB is a housekeeping
+# problem, not an emergency worth losing work over.
+cmd_close_profile() {
+  local name=${1:-}
+  [[ -n $name ]] || die "usage: omarchy-profile close <name>"
+  exists "$name" || die "no such profile '$name'"
+  command -v hyprctl >/dev/null || die "hyprctl is not available"
+
+  local offset span n=0 addr
+  offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$name")")
+  span=$(jq -r '.workspaces.span // 10' "$(file_for "$name")")
+  while read -r addr; do
+    [[ -n $addr ]] || continue
+    hyprctl dispatch closewindow "address:$addr" >/dev/null 2>&1 && ((n++))
+  done < <(hyprctl -j clients 2>/dev/null |
+    jq -r --argjson o "$offset" --argjson s "$span" \
+      '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s)) | .address')
+  echo "asked $n window(s) in $name to close"
 }
 
 # ------------------------------------------------------------------ commands
@@ -1257,6 +1438,8 @@ case "${1:-}" in
 catalog) write_catalog ;;
 isolate) shift; cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
+overview) shift; cmd_overview "${1:-}" ;;
+close) shift; cmd_close_profile "${1:-}" ;;
 lock) shift; cmd_lock lock "${1:-}" ;;
 unlock) shift; cmd_lock unlock "${1:-}" ;;
 identity) shift; cmd_identity "${1:-}" "${2:-}" ;;
@@ -1292,6 +1475,9 @@ omarchy-profile — profiles for the Omarchy desktop
 
   isolate [list|add|remove] [path]  give each profile its own copy of a
                                     plugin's own config or state file
+
+  overview [--json]                what every profile is holding open
+  close <name>                     ask every window in a profile to close
 
   apps <profile> [list|allow|deny] [app-id]
   plugin <profile> [list|enable|disable] [plugin-id]

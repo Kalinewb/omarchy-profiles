@@ -29,6 +29,7 @@ Column {
   signal cursorMoved(int index)
   // The panel owns the confirmation dialog; a Column cannot host one.
   signal confirmRemove(string profile)
+  signal openOverview()
 
   // How many profiles the picker currently offers. Hiding the last one is
   // refused, so the button is disabled rather than failing after the click.
@@ -58,6 +59,52 @@ Column {
       entry: modelData
       rowIndex: index
     }
+  }
+
+  PanelSeparator { foreground: root.foreground }
+
+  // The way to the overview. Here rather than in the picker, because "what is
+  // everything holding open" is a housekeeping question, and this is the
+  // housekeeping screen.
+  CursorSurface {
+    id: overviewRow
+    width: parent.width
+    property bool hovered: false
+    foreground: root.foreground
+    accent: root.accent
+    hasCursor: overviewRow.hovered
+    implicitHeight: overviewBody.implicitHeight + Style.space(14)
+
+    Row {
+      id: overviewBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        text: "󰓠"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Text {
+        textFormat: Text.PlainText
+        text: "What is open"
+        color: root.foreground
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        anchors.verticalCenter: parent.verticalCenter
+      }
+    }
+
+    HoverHandler { onHoveredChanged: overviewRow.hovered = hovered }
+    TapHandler { onTapped: root.openOverview() }
   }
 
   PanelSeparator { foreground: root.foreground }
