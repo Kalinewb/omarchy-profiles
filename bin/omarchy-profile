@@ -47,7 +47,8 @@ ensure_config() {
     version: 1, master: "master", master_switchable: true,
     restore_last_on_login: true, last: "",
     pinned_plugins: ["graveklar.profiles"], workspace_span: 10,
-    isolate: []
+    isolate: [],
+    unlock: {method: "sudo"}
   }' >"$CONFIG_FILE"
 }
 
@@ -92,6 +93,83 @@ next_offset() {
   done < <(profile_names)
   ((max < 0)) && { echo 0; return; }
   echo $((max + span))
+}
+
+# ------------------------------------------------------------------- locks
+#
+# Password-protected profiles.
+#
+# Authentication goes through PAM rather than a passphrase of our own, because
+# PAM is already where this user's identity is decided. On this machine the sudo
+# stack is:
+#
+#   auth [success=1 default=ignore] pam_exec.so ... omarchy-face-gate
+#   auth sufficient                 pam_exec.so ... omarchy-face-verify
+#   auth include                    system-auth
+#
+# so `sudo -v` accepts a face, and falls through to the password — and to a
+# fingerprint for anyone who has added pam_fprintd. None of that is implemented
+# here, and adding a new method later needs no change to this plugin.
+#
+# `sudo -k` first, deliberately: without it a cached sudo timestamp would let
+# someone walk up to an unattended machine and enter a locked profile with no
+# prompt at all. The cost is that the next real sudo asks again.
+#
+# What this is and is not: it gates ENTERING a profile. Every profile runs as the
+# same Unix user, so it is not a security boundary — a process running as you can
+# read another profile's files whether or not this prompt exists. It stops a
+# person at the keyboard, not a program.
+
+profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; }
+
+authenticate() {
+  local method
+  method=$(cfg '.unlock.method // "sudo"')
+  case $method in
+  none) return 0 ;;
+  sudo)
+    command -v sudo >/dev/null || { warn "sudo is not available; set unlock.method to none"; return 1; }
+    # -k so a cached timestamp cannot stand in for a real prompt.
+    sudo -k >/dev/null 2>&1
+    sudo -v ;;
+  *) warn "unknown unlock.method '$method'"; return 1 ;;
+  esac
+}
+
+cmd_lock() {
+  local verb=$1 name=${2:-}
+  [[ -n $name ]] || die "usage: omarchy-profile $verb <name>"
+  exists "$name" || die "no such profile '$name'"
+  local want=true; [[ $verb == unlock ]] && want=false
+
+  # Removing the lock proves you could get in, so it needs the same gate as
+  # entering would. Otherwise the lock is a label anyone can peel off.
+  if [[ $verb == unlock ]]; then
+    if [[ -t 0 ]]; then
+      authenticate || die "authentication failed — '$name' stays locked"
+    else
+      relaunch_in_terminal "unlock $name"
+      return 0
+    fi
+  fi
+
+  local tmp; tmp=$(mktemp)
+  jq --argjson l "$want" '.locked = $l' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
+  write_index
+  [[ $want == true ]] && echo "$name now asks for authentication" || echo "$name no longer asks"
+}
+
+# The panel runs this script through the bar with no terminal attached, so a
+# password prompt has nowhere to appear. Hand the same command to a floating
+# themed terminal, which has a tty, and let that copy do the work.
+relaunch_in_terminal() {
+  local self="${BASH_SOURCE[0]}"
+  if command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
+    omarchy-launch-floating-terminal-with-presentation "$self $*" >/dev/null 2>&1
+  else
+    warn "no terminal available to ask for authentication"
+    return 1
+  fi
 }
 
 # --------------------------------------------------------------- isolation
@@ -284,6 +362,7 @@ write_index() {
         description: (._description // ""),
         master: $is_master,
         hidden: (.hidden // false),
+        locked: (.locked // false),
         theme: (.theme // ""),
         icon: (.icon // ""),
         offset: (.workspaces.offset // 0)
@@ -509,6 +588,18 @@ cmd_set() {
   local cur
   cur=$(current_profile)
   [[ $cur == "$name" ]] && { echo "already in $name"; return 0; }
+
+  # Authenticate BEFORE anything is captured, swapped or written. A failed
+  # unlock has to leave the machine exactly where it was, not half-way into a
+  # profile it never opened.
+  if profile_locked "$name"; then
+    if [[ -t 0 ]]; then
+      authenticate || die "authentication failed — staying in ${cur:-the current profile}"
+    else
+      relaunch_in_terminal "set $name"
+      return 0
+    fi
+  fi
   # The outgoing profile keeps whatever was changed while inside it.
   [[ -n $cur ]] && exists "$cur" && capture_into "$cur"
   # Plugin state that lives outside shell.json follows the profile too, so a
@@ -853,6 +944,8 @@ ensure_config
 case "${1:-}" in
 catalog) write_catalog ;;
 isolate) shift; cmd_isolate "${1:-list}" "${2:-}" ;;
+lock) shift; cmd_lock lock "${1:-}" ;;
+unlock) shift; cmd_lock unlock "${1:-}" ;;
 set) shift; cmd_set "${1:-}" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
@@ -881,6 +974,7 @@ omarchy-profile — profiles for the Omarchy desktop
   create <name> [--from-master|--clean]
   remove <name>                    moves its windows to the master first
   show <name> | hide <name>        whether it appears in the picker
+  lock <name> | unlock <name>      whether entering it needs authentication
 
   isolate [list|add|remove] [path]  give each profile its own copy of a
                                     plugin's own config or state file

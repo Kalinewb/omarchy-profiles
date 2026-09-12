@@ -57,7 +57,8 @@ Panel {
           icon: String(p.icon || "") || (p.master ? "\u{f0493}" : "\u{f01bc}"),
           blurb: String(p.description || ""),
           master: !!p.master,
-          hidden: !!p.hidden
+          hidden: !!p.hidden,
+          locked: !!p.locked
         })
         if (p.master) root.masterName = String(p.name || "")
       }
@@ -606,16 +607,31 @@ Panel {
         width: rowContent.width - rowContent.spacing * 2 - 2 * Style.space(10)
         spacing: 0
 
-        Text {
-          textFormat: Text.PlainText
-          text: row.entry ? row.entry.label : ""
-          // Master is distinguished by colour, not by a tag beside the name.
-          color: (row.entry && row.entry.master) ? root.accent : root.foreground
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          font.bold: row.current
-          elide: Text.ElideRight
+        Row {
           width: parent.width
+          spacing: Style.space(5)
+
+          Text {
+            textFormat: Text.PlainText
+            text: row.entry ? row.entry.label : ""
+            // Master is distinguished by colour, not by a tag beside the name.
+            color: (row.entry && row.entry.master) ? root.accent : root.foreground
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            font.bold: row.current
+            elide: Text.ElideRight
+          }
+
+          // A padlock here so a prompt on switching is never a surprise.
+          Text {
+            textFormat: Text.PlainText
+            visible: !!(row.entry && row.entry.locked)
+            text: "󰌾"
+            color: root.accent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            anchors.verticalCenter: parent.verticalCenter
+          }
         }
 
         Text {

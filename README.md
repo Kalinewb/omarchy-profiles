@@ -156,3 +156,37 @@ inherits the stores (already signed in, same dock), **clean** inherits none
 
 No caveat about reloading: a switch restarts the shell, so every plugin reads
 its new copy. See *Why a switch restarts the shell*.
+
+## Password-protected profiles
+
+```bash
+omarchy-profile lock work      # entering it now asks
+omarchy-profile unlock work    # stops asking — and asks first, to prove you could
+```
+
+Authentication goes through **PAM**, not a passphrase of this plugin's own,
+because PAM is already where your identity is decided. `sudo -v` runs your
+configured auth stack, so whatever you have set up works with nothing added
+here — a face (`pam_exec` with a verifier, as `omarchy-face` installs), a
+fingerprint (`pam_fprintd`), or your password as the fallback. Adding a method
+later needs no change to this plugin.
+
+`sudo -k` runs first, deliberately: a cached sudo timestamp would otherwise let
+someone walk up to an unattended machine and enter a locked profile with no
+prompt at all. The cost is that your next real `sudo` asks again.
+
+The panel has no terminal to prompt in, so a locked switch relaunches the same
+command in a floating themed terminal and does the work there. Authentication
+happens **before** anything is captured or written, so a failed unlock leaves
+the machine exactly where it was.
+
+Set `unlock.method` to `none` in `config.json` on a machine without sudo.
+
+### What this is, and what it is not
+
+It gates **entering** a profile. It stops a person at the keyboard.
+
+It is **not** a security boundary. Every profile runs as the same Unix user, so
+a process running as you can read any profile's files whether or not this
+prompt exists. Real isolation would need a separate Unix user and a separate
+login session, which is not a profile switch.

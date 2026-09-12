@@ -214,6 +214,7 @@ Column {
     readonly property bool active: row.name === root.currentProfile
     // Visible now and the only one left: hiding it would empty the picker.
     readonly property bool hideWouldEmpty: !(row.entry && row.entry.hidden) && root.visibleCount <= 1
+    readonly property bool locked: !!(row.entry && row.entry.locked)
 
     foreground: root.foreground
     accent: root.accent
@@ -290,6 +291,19 @@ Column {
           foreground: root.foreground
           fontFamily: root.fontFamily
           onClicked: root.openSettings(row.name)
+          onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
+        }
+
+        // Master can be locked too: it is the profile that sees everything, so
+        // it is the one most worth gating.
+        PanelActionButton {
+          iconText: row.locked ? "󰌾" : "󰌿"
+          tooltipText: row.locked
+            ? "Entering " + row.name + " asks for your face or password — click to stop asking"
+            : "Ask for your face or password before entering " + row.name
+          foreground: row.locked ? root.accent : root.foreground
+          fontFamily: root.fontFamily
+          onClicked: root.runEngine((row.locked ? "unlock " : "lock ") + row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
 
