@@ -46,7 +46,7 @@ manager. Everything it does is also a command:
 omarchy-profile list                  # * is active, (master) is the master
 omarchy-profile set work              # captures the outgoing profile first
 omarchy-profile create work --clean   # or --from-master
-omarchy-profile remove work           # refuses while it still has windows
+omarchy-profile remove work           # its windows move to the master first
 omarchy-profile capture               # save live state into the active profile now
 
 omarchy-profile apps work allow hey            # which applications it can see
@@ -101,6 +101,23 @@ too if losing them mid-session would look like a broken desktop.
   is set through `omarchy toggle idle allow-idle|stay-awake` instead. Note the
   sense: stay-awake *inhibits* idling.
 
+## Why a switch restarts the shell
+
+Because a reload is not enough, and "it usually works, restart if it looks
+wrong" is not a thing to ship. Plugins hold their own config and state files
+open, so a swapped Spotify session or dock file goes unnoticed; enabling a
+plugin that was off needs it instantiated; and Qt keeps compiled QML cached.
+Each of those produced a switch that looked half-applied.
+
+The order is what makes it safe: **files first, restart second, IPC third.**
+Restarting before the writes would have the new shell read the old files, and
+setting do-not-disturb over IPC before a restart wastes the call on a process
+about to exit. Do-not-disturb and the idle flag are persisted under
+`XDG_STATE_HOME`, so they survive the restart either way.
+
+The cost is a visible blip and about five seconds, most of it the theme retint.
+A profile switch is already a visual event, so the blip reads as part of it.
+
 ## License
 
 MIT
@@ -137,6 +154,5 @@ New profiles follow the same choice as everything else: **copy of master**
 inherits the stores (already signed in, same dock), **clean** inherits none
 (signed out, default dock). Removing a profile deletes its store with it.
 
-One caveat: a plugin already running may not notice the swap until it reloads.
-A profile switch that also changes the theme restarts enough of the shell to
-cover it; otherwise `omarchy restart shell`.
+No caveat about reloading: a switch restarts the shell, so every plugin reads
+its new copy. See *Why a switch restarts the shell*.

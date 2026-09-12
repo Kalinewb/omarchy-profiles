@@ -131,6 +131,20 @@ isolated_paths() {
   done
 }
 
+# Drop stores belonging to profiles that no longer exist. Removal cleans up
+# after itself, but a profile deleted by hand — or by a version of this script
+# from before that existed — leaves one behind, and those files can include a
+# live Spotify session.
+prune_isolated() {
+  [[ -d $ISOLATE_DIR ]] || return 0
+  local dir name
+  for dir in "$ISOLATE_DIR"/*; do
+    [[ -d $dir ]] || continue
+    name=$(basename "$dir")
+    exists "$name" || { rm -rf "${dir:?}"; warn "dropped leftover plugin data for the removed profile '$name'"; }
+  done
+}
+
 swap_isolated() {
   local from=${1:-} to=${2:-} path from_store to_store
   while read -r path; do
@@ -351,6 +365,21 @@ write_state() {
 
 # ------------------------------------------------------------------ apply
 
+# Block until the shell answers, so the IPC calls after a restart are not fired
+# into a process still starting up. Polls rather than sleeping a fixed amount:
+# a cold start on a loaded machine is slower than on an idle one, and a fixed
+# wait is either too short to be safe or too long to be pleasant.
+wait_for_shell() {
+  local i
+  for i in $(seq 1 40); do
+    omarchy-shell shell reloadConfig >/dev/null 2>&1 && return 0
+    sleep 0.25
+  done
+  warn "the shell did not come back within 10s — do-not-disturb and idle may not have applied"
+  return 1
+}
+
+
 apply_profile() {
   local name=$1 file
   file=$(file_for "$name")
@@ -397,8 +426,35 @@ apply_profile() {
     ) >/dev/null 2>&1 || warn "could not write bar/plugins to shell.json"
   fi
 
+  if [[ -n $screensaver && -n $lock ]]; then
+    (
+      # shellcheck disable=SC1091
+      source /usr/share/omarchy/bin/omarchy-shell-config
+      commit "$NORMALIZE | .idle.screensaver = \$sec | .idle.lock = \$lock" \
+        --argjson sec "$screensaver" --argjson lock "$lock"
+    ) >/dev/null 2>&1 || warn "could not write idle timers"
+  fi
+
+  # Restart the shell, now that every file it reads has been written.
+  #
+  # A reload is not enough. Plugins hold their own config and state open, so a
+  # swapped Spotify session or dock file is not noticed; enabling a plugin that
+  # was off needs it instantiated; and Qt keeps compiled QML cached. Each of
+  # those produced a switch that looked half-applied, and "it usually works,
+  # restart if it looks wrong" is not a thing to ship.
+  #
+  # The order is what makes this safe: files first, restart second, IPC third.
+  # Restarting before the writes would have the new shell read the old files,
+  # and setting DND over IPC before a restart wastes the call on a process
+  # about to exit.
+  if command -v omarchy >/dev/null; then
+    omarchy restart shell >/dev/null 2>&1 || warn "could not restart the shell"
+    wait_for_shell
+  fi
+
   # Absolute setters only. A toggle would land on the wrong state whenever the
-  # machine already happened to be in the target state.
+  # machine already happened to be in the target state. These go last, against
+  # the shell that will still be running when the switch is done.
   omarchy-shell notifications setDnd "$dnd" >/dev/null 2>&1 ||
     warn "could not set do-not-disturb (shell busy?) — re-run to retry"
 
@@ -410,15 +466,6 @@ apply_profile() {
     omarchy toggle idle stay-awake >/dev/null 2>&1 || warn "could not set stay-awake"
   else
     omarchy toggle idle allow-idle >/dev/null 2>&1 || warn "could not allow idling"
-  fi
-
-  if [[ -n $screensaver && -n $lock ]]; then
-    (
-      # shellcheck disable=SC1091
-      source /usr/share/omarchy/bin/omarchy-shell-config
-      commit "$NORMALIZE | .idle.screensaver = \$sec | .idle.lock = \$lock" \
-        --argjson sec "$screensaver" --argjson lock "$lock"
-    ) >/dev/null 2>&1 || warn "could not write idle timers"
   fi
 
   [[ $browser != default ]] && mkdir -p "$DATA_HOME/omarchy-profiles/browser/$browser"
@@ -466,6 +513,7 @@ cmd_set() {
   [[ -n $cur ]] && exists "$cur" && capture_into "$cur"
   # Plugin state that lives outside shell.json follows the profile too, so a
   # Spotify session or a dock layout belongs to one profile rather than all.
+  prune_isolated
   swap_isolated "$cur" "$name"
 
   apply_profile "$name"
