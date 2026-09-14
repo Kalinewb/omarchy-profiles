@@ -28,6 +28,8 @@ Column {
   property var disabled: []
   // Desktop-entry ids this profile may launch. Master ignores it.
   property var allowedApps: []
+  // Desktop-entry ids this profile could be allowed, from the engine.
+  property var candidateApps: []
 
   property color foreground: Color.foreground
   property color accent: Color.accent
@@ -126,16 +128,36 @@ Column {
     return out
   }
 
-  // Every launchable application on the machine. Read straight from
-  // DesktopEntries rather than through the engine: it is always current and
-  // needs no refresh step.
+  // Every application this profile could be allowed.
+  //
+  // The ids come from the engine, which reads through its own hidden entries,
+  // and the names from DesktopEntries, which has them already. Taking the ids
+  // from DesktopEntries too would be simpler and wrong: an application this
+  // profile hides IS a NoDisplay entry while the profile is active, so it would
+  // drop off the very list that switches it back on.
+  //
+  // Until the engine answers — and if it never does — the machine's own visible
+  // entries stand in. Incomplete, but never an empty page.
   readonly property var allApps: {
     var out = []
+    var names = ({})
     var values = DesktopEntries.applications.values || []
     for (var i = 0; i < values.length; i++) {
       var e = values[i]
-      if (!e || e.noDisplay) continue
-      out.push({ id: String(e.id || ""), name: String(e.name || e.id || "") })
+      if (!e) continue
+      names[String(e.id || "")] = String(e.name || e.id || "")
+    }
+    if (root.candidateApps.length > 0) {
+      for (var j = 0; j < root.candidateApps.length; j++) {
+        var id = String(root.candidateApps[j])
+        out.push({ id: id, name: names[id] || id })
+      }
+    } else {
+      for (var k = 0; k < values.length; k++) {
+        var v = values[k]
+        if (!v || v.noDisplay) continue
+        out.push({ id: String(v.id || ""), name: String(v.name || v.id || "") })
+      }
     }
     out.sort(function (a, b) { return a.name.toLowerCase() < b.name.toLowerCase() ? -1 : 1 })
     return out
@@ -294,18 +316,6 @@ Column {
     width: parent.width
     spacing: Style.space(8)
     visible: root.page === "apps" && !root.isMaster
-
-    // Honest about the gap: the list is real and the choices are saved, but
-    // nothing filters the launcher on them yet.
-    Text {
-      width: parent.width
-      textFormat: Text.PlainText
-      wrapMode: Text.WordWrap
-      text: "Choices here are saved to the profile, but not enforced yet — the launcher still shows every app until it filters on the active profile."
-      color: root.dim
-      font.family: root.fontFamily
-      font.pixelSize: Style.font.caption
-    }
 
     Row {
       width: parent.width

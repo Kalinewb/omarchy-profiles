@@ -442,26 +442,37 @@ not an emergency worth losing work over.
 
 ## Per-profile app visibility
 
-`graveklar.menu` is the Omarchy menu with one change: it shows only the
-applications the active profile may use. `mergeAppRows` is the single place app
-rows are built, so filtering there covers the root list and the search alike and
-nothing else in the menu needs to know profiles exist.
+A profile hides an application by writing an XDG hidden entry for it into
+`~/.local/share/applications`. Omarchy's menu, launcher and search all filter
+through one script, `hidden-entries.sh`, so an entry marked `NoDisplay=true`
+there is gone from all three at once, live, with no shell restart and no fork of
+the menu to maintain.
 
 ```bash
 omarchy-profile apps work allow hey
 omarchy-profile apps work deny discord
 omarchy-profile apps work allow-all | deny-all
+omarchy-profile apps preview --json work   # what switching in would hide
+omarchy-profile apps-sweep                 # put everything back
 ```
 
-The launcher reads one small file the engine rewrites on every switch, so there
-is no process spawn while you are typing. The master sees everything, and then
-filtering is skipped entirely rather than matching every desktop entry against a
-list of every desktop entry.
+The master sees everything, so switching into it unhides whatever the profile
+you left had hidden.
 
-**Failure is open, not closed.** A missing file, bad JSON, or a profile system
-that was never set up all mean "show everything". A launcher that hides your
-applications because a JSON file went missing is a worse failure than one that
-shows an app a profile meant to hide.
+**This writes into your real application directory, so every file it touches
+says so.** An entry it created from a system one carries
+`X-OmarchyProfiles-Hidden=1` and is deleted again on unhide. One of your own
+files that it edited in place carries `X-OmarchyProfiles-Modified=1`, and the
+original is kept in `~/.local/state/omarchy-profiles/desktop-backups` with a
+hash of the file as it was left. On unhide, a file that still matches that hash
+is replaced by its backup; one that does not — because you, or the application's
+own updater, changed it while it was hidden — keeps your version, with only the
+two lines this plugin added taken back out. Nothing untagged is ever deleted,
+and nothing untagged is edited before a backup of it has been compared byte for
+byte against the original.
+
+`apps-sweep` undoes all of it, whichever profile did it. It is the way out if a
+switch is interrupted, and uninstalling runs it first.
 
 ## The global workspace
 

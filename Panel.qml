@@ -107,6 +107,11 @@ Panel {
     + "/omarchy-profiles/overview.json"
   property var settingsDisabled: []
   property var settingsAllowedApps: []
+  // Every application the edited profile could be allowed, from the engine's
+  // enumerator. Not read from DesktopEntries any more: an application a profile
+  // hides is a NoDisplay entry while that profile is active, and the list that
+  // switches it back on is exactly the list it would drop out of.
+  property var settingsAllApps: []
 
   // Which profile a password is being asked for, and which Setup row is waiting
   // on an answer. Nothing writes them yet — the prompt and the Setup view are
@@ -315,6 +320,17 @@ Panel {
     root.settingsProfile = profile
     root.pushView("settings")
     root.runEngine("catalog")
+    root.loadSettingsApps(profile)
+  }
+
+  function loadSettingsApps(profile) {
+    root.settingsAllApps = []
+    if (profile === "") return
+    root.ask(["apps", "list", "--json", profile], "", function (ok, parsed) {
+      // A failure leaves it empty, and the view falls back to what the machine
+      // is showing right now — wrong about hidden apps, but never blank.
+      if (ok && parsed && Array.isArray(parsed.all)) root.settingsAllApps = parsed.all
+    })
   }
 
   function parseState(content) {
@@ -798,6 +814,7 @@ Panel {
           plugins: root.pluginCatalog
           disabled: root.settingsDisabled
           allowedApps: root.settingsAllowedApps
+          candidateApps: root.settingsAllApps
           foreground: root.foreground
           accent: root.accent
           dim: root.dim

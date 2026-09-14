@@ -37,6 +37,17 @@ STATE_DIR="$STATE_HOME/omarchy-profiles"
 STATE_FILE="$STATE_DIR/current.json"
 THEME_NAME_FILE="$STATE_HOME/omarchy/current/theme.name"
 
+# Application visibility writes XDG hidden entries here. Deliberately the
+# literal path and not "$DATA_HOME/applications": Omarchy's hidden-entries.sh
+# scans ~/.local/share/applications whatever XDG_DATA_HOME says, so writing
+# anywhere else would hide nothing.
+APPS_DIR="$HOME/.local/share/applications"
+APP_BACKUP_DIR="$STATE_DIR/desktop-backups"
+# Written into the [Desktop Entry] group of every file we touch. Which tag a
+# file carries is what decides how it is put back (see the section below).
+APP_TAG_HIDDEN="X-OmarchyProfiles-Hidden"
+APP_TAG_MODIFIED="X-OmarchyProfiles-Modified"
+
 die() { echo "omarchy-profile: $*" >&2; exit 1; }
 warn() { echo "omarchy-profile: $*" >&2; }
 
@@ -857,26 +868,334 @@ write_catalog() {
   ' >"$tmp" && mv "$tmp" "$STATE_DIR/plugins.json" || { rm -f "$tmp"; warn "could not write the plugin catalog"; return 1; }
 }
 
-# The active profile's app allow-list, for the launcher to filter on.
+# ------------------------------------------------- application visibility
 #
-# Written as its own small file rather than having the launcher read profile
-# JSON: the launcher only needs the answer for right now, and a file it can
-# FileView means no process spawn on every keystroke in the search box.
+# A profile shows a subset of the machine's applications by writing XDG hidden
+# entries into ~/.local/share/applications. Omarchy's menu, launcher and search
+# all filter through one script — hidden-entries.sh — so an entry marked
+# NoDisplay=true there disappears from all three at once, live, with no shell
+# restart. There is nothing to teach the launcher and no fork of it to maintain.
 #
-# `all: true` for the master, which sees everything by definition — the
-# launcher then skips filtering entirely rather than matching against a list of
-# every desktop entry on the machine.
-write_allowed_apps() {
-  local name=$1 all=false
-  is_master "$name" && all=true
-  mkdir -p "$STATE_DIR"
-  local tmp
-  tmp=$(mktemp "$STATE_DIR/allowed-apps.json.XXXXXX") || return 1
-  jq -n --arg profile "$name" --argjson all "$all" \
-     --argjson allowed "$(jq -c '.apps.allowed // []' "$(file_for "$name")" 2>/dev/null || echo '[]')" \
-     '{profile: $profile, all: $all, allowed: $allowed}' >"$tmp" &&
-    mv "$tmp" "$STATE_DIR/allowed-apps.json" ||
-    { rm -f "$tmp"; warn "could not write the app allow-list"; return 1; }
+# This writes into the user's real application directory, which is the largest
+# blast radius in the plugin, so every file we touch says what we did to it:
+#
+#   X-OmarchyProfiles-Hidden=1    we created this file from a system entry
+#                                 -> unhiding it is `rm`
+#   X-OmarchyProfiles-Modified=1  the user already had this file and we edited
+#                                 it in place -> unhiding restores the backup,
+#                                 unless it was edited while hidden
+#
+# Nothing untagged is ever deleted, and nothing untagged is edited before a
+# backup of it has been made and compared byte for byte.
+
+# Every desktop entry on the machine, as TSV, one line per desktop id:
+#
+#   id  level  source_path  hidden_at_source  wmclass  exec  name  tag  tag_path
+#
+# The first six columns are the design's; `name` saves every consumer a second
+# read of the same files, and `tag`/`tag_path` say which file in APPS_DIR is
+# ours and where it is. That is what keeps this the ONLY place in the engine
+# that enumerates desktop files — everything else reads these lines.
+#
+# It mirrors hidden-entries.sh exactly — same scan order, same id rule, same
+# hiding rules — with one deliberate difference: it looks THROUGH our own tags.
+# A file we created is skipped without claiming its id, so the system entry
+# behind it answers; a file we edited is judged by its backup. Our own edits
+# therefore cannot change its answer, which is what gives reconcile a fixed
+# point: without it, hiding an app removes it from the candidate set, and the
+# next reconcile decides it is no longer an app anyone asked to hide.
+#
+# The rules are re-implemented in awk rather than shelling out to
+# hidden-entries.sh because that script scans fixed directories: pointing it at
+# a backup would mean copying every desktop file on the machine on every switch.
+# The copy is kept honest by a test: with no tagged file anywhere, the ids this
+# reports as hidden_at_source must equal hidden-entries.sh's output exactly.
+app_sources() {
+  [[ -n ${APP_SOURCES_CACHE+set} ]] || APP_SOURCES_CACHE=$(app_sources_scan)
+  [[ -n $APP_SOURCES_CACHE ]] && printf '%s\n' "$APP_SOURCES_CACHE"
+  return 0
+}
+
+# The desktop names AppLibrary.qml passes hidden-entries.sh: the three desktop
+# environment variables, empty ones dropped, joined with a colon.
+app_desktop_names() {
+  local parts=() p
+  for p in "${XDG_CURRENT_DESKTOP:-}" "${XDG_SESSION_DESKTOP:-}" "${DESKTOP_SESSION:-}"; do
+    [[ -n $p ]] && parts+=("$p")
+  done
+  (IFS=:; printf '%s' "${parts[*]}")
+}
+
+app_sources_scan() {
+  local dirs=("$APPS_DIR") data_dirs=() d
+  IFS=':' read -ra data_dirs <<<"${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
+  for d in "${data_dirs[@]}"; do [[ -n $d ]] && dirs+=("$d/applications"); done
+  dirs+=("$HOME/.nix-profile/share/applications")
+
+  # NUL throughout, and every id and path handed to awk rather than to the
+  # shell: "Disk Usage.desktop" and friends are already here, and a file name
+  # is the one thing on this path we do not control.
+  {
+    for d in "${dirs[@]}"; do
+      [[ -d $d ]] || continue
+      printf 'D%s\0' "$d"
+      find "$d" -type f -name '*.desktop' -print0 2>/dev/null | sort -z |
+        awk 'BEGIN { RS = "\0"; ORS = "\0" } { print "F" $0 }'
+    done
+  } | awk -v RS='\0' \
+          -v names="$(app_desktop_names)" \
+          -v appsdir="$APPS_DIR" -v backups="$APP_BACKUP_DIR" \
+          -v tag_hidden="$APP_TAG_HIDDEN" -v tag_modified="$APP_TAG_MODIFIED" '
+    # hidden-entries.sh desktop_matches(): any name against any list entry.
+    function matches(list, n, m, i, j, nn, ll) {
+      n = split(names, nn, ":"); m = split(list, ll, ";")
+      for (i = 1; i <= n; i++) {
+        if (nn[i] == "") continue
+        for (j = 1; j <= m; j++) if (ll[j] != "" && ll[j] == nn[i]) return 1
+      }
+      return 0
+    }
+    function openable(path, line, r) { r = (getline line < path); close(path); return r >= 0 }
+    # hidden-entries.sh is_hidden_desktop_file(), plus the fields the callers
+    # want, in one pass. `bare` drops Hidden/NoDisplay from the verdict, for the
+    # one case where the file in front of us is ours and its backup is gone.
+    function scan(path, bare, line, in_de, hid, only, notin, key, val, p, outer) {
+      E_hidden = 0; E_class = ""; E_exec = ""; E_name = ""; E_tag = ""
+      in_de = 0; hid = 0; only = ""; notin = ""
+      # RS is NUL for the file list we are being fed; a desktop file is lines.
+      outer = RS; RS = "\n"
+      while ((getline line < path) > 0) {
+        sub(/\r$/, "", line)
+        if (line ~ /^\[.*\]$/) { in_de = (line == "[Desktop Entry]") ? 1 : 0; continue }
+        if (!in_de) continue
+        p = index(line, "="); if (p == 0) continue
+        key = substr(line, 1, p - 1); val = substr(line, p + 1)
+        if (key == "Hidden" || key == "NoDisplay") { if (val == "true" && !bare) hid = 1 }
+        else if (key == "OnlyShowIn") only = val
+        else if (key == "NotShowIn") notin = val
+        else if (key == "StartupWMClass") { if (E_class == "") E_class = val }
+        else if (key == "Exec") { if (E_exec == "") E_exec = val }
+        else if (key == "Name") { if (E_name == "") E_name = val }
+        else if (key == tag_hidden) { if (val == "1") E_tag = "hidden" }
+        else if (key == tag_modified) { if (val == "1") E_tag = "modified" }
+      }
+      close(path); RS = outer
+      if (hid) { E_hidden = 1; return }
+      if (only != "" && !matches(only)) { E_hidden = 1; return }
+      if (notin != "" && matches(notin)) { E_hidden = 1; return }
+    }
+    function clean(s) { gsub(/[\t\n]/, " ", s); return s }
+    function emit(id, level, src, hid, cls, ex, nm, tg, tp) {
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", clean(id), level, clean(src),
+             (hid ? "true" : "false"), clean(cls), clean(ex), clean(nm), tg, clean(tp)
+    }
+    {
+      kind = substr($0, 1, 1); value = substr($0, 2)
+      if (kind == "D") { dir = value; next }
+      file = value
+      id = substr(file, length(dir) + 2)            # desktop_id_for_file
+      sub(/\.desktop$/, "", id)
+      gsub(/\//, "-", id)
+      if (id in seen) next                          # first-seen id wins
+      level = (dir == appsdir) ? "user" : "system"
+      src = file
+      scan(file, 0)
+      if (level == "user" && E_tag != "") {
+        owned[id] = E_tag; ownpath[id] = file
+        # Ours. Let the entry we made it from answer for the id instead.
+        if (E_tag == "hidden") next
+        backup = backups "/" id ".desktop"
+        if (openable(backup)) { src = backup; scan(backup, 0) }
+        else scan(file, 1)                          # backup lost: judge it by everything but our own flags
+      }
+      seen[id] = 1
+      emit(id, level, src, E_hidden, E_class, E_exec, E_name, owned[id], ownpath[id])
+    }
+    # A file of ours whose source has since been uninstalled. Nothing else would
+    # ever mention it again, and it would stay in the menu directory forever.
+    END {
+      for (id in owned)
+        if (!(id in seen)) emit(id, "user", ownpath[id], 1, "", "", "", owned[id], ownpath[id])
+    }'
+}
+
+# What apply_app_visibility would do for <profile>, as TSV:
+#
+#   H  id  level  source_path     hide this id (it is not ours yet)
+#   S  id  tag    path            show it again (it is ours and no longer hidden)
+#
+# The hide side is the work outstanding, not the whole set a profile hides: once
+# converged there is nothing to do and a preview is empty, which is the property
+# the fixed-point test asserts.
+app_visibility_plan() {
+  local name=$1 master=false allowed=""
+  is_master "$name" && master=true
+  [[ $master == true ]] || allowed=$(jq -r '(.apps.allowed // [])[]' "$(file_for "$name")" 2>/dev/null)
+
+  app_sources | awk -F'\t' -v master="$master" -v allowed="$allowed" '
+    BEGIN { n = split(allowed, a, "\n"); for (i = 1; i <= n; i++) if (a[i] != "") ok[a[i]] = 1 }
+    {
+      id = $1; level = $2; src = $3; hidden = $4; tag = $8; tagpath = $9
+      if (tag != "") { owned[id] = tag; opath[id] = tagpath }
+      if (master == "true") next          # the master sees everything
+      if (hidden == "true") next          # not a candidate: Omarchy hides it anyway
+      if (id in ok) next
+      hide[id] = 1; hlevel[id] = level; hsrc[id] = src
+    }
+    END {
+      for (id in hide)  if (!(id in owned)) printf "H\t%s\t%s\t%s\n", id, hlevel[id], hsrc[id]
+      for (id in owned) if (!(id in hide))  printf "S\t%s\t%s\t%s\n", id, owned[id], opath[id]
+    }' | sort
+}
+
+# Make what is on disk match <profile>, whatever it was before. An absolute
+# setter rather than a diff applier: it is re-run by refresh and after a crash,
+# and has to be able to clean up work it did not itself start.
+apply_app_visibility() {
+  local name=${1:-}
+  [[ -n $name ]] && exists "$name" || return 1
+  mkdir -p "$APPS_DIR" "$APP_BACKUP_DIR" || return 1
+
+  local changed=0 kind id arg path
+  while IFS=$'\t' read -r kind id arg path; do
+    case $kind in
+    H) app_hide "$id" "$arg" "$path" && changed=1 ;;
+    S) app_show "$id" "$arg" "$path" && changed=1 ;;
+    esac
+  done < <(app_visibility_plan "$name")
+
+  ((changed)) || return 0
+  unset APP_SOURCES_CACHE
+  # Otherwise mimeinfo.cache still answers with the entries we removed.
+  command -v update-desktop-database >/dev/null &&
+    update-desktop-database -q "$APPS_DIR" 2>/dev/null
+  return 0
+}
+
+# The copy of <src> that is hidden: NoDisplay and our tag go in immediately
+# after the [Desktop Entry] header, and any NoDisplay/Hidden already in that
+# group comes out.
+#
+# Stripping is not tidiness. hidden-entries.sh treats a `true` as sticky, but
+# other XDG parsers take the LAST value in the group, so a pre-existing
+# NoDisplay=false further down would leave the app hidden here and visible
+# everywhere else. Later groups — [Desktop Action …], which chromium, code and
+# nautilus all have — are left exactly as they are.
+app_hidden_copy() {
+  awk -v tag="$2" '
+    /^\[/ { if (g == 1) g = 2
+            if ($0 == "[Desktop Entry]" && g == 0) { print; print "NoDisplay=true"; print tag "=1"; g = 1; next } }
+    g == 1 && /^(NoDisplay|Hidden)=/ { next }
+    { print }' "$1"
+}
+
+# A temp file beside the entries, so the move onto them is atomic. The name
+# deliberately does not end in .desktop: a scan racing us must not see it.
+app_tempfile() { mktemp "$APPS_DIR/.omarchy-profiles.XXXXXX"; }
+
+app_hide() {
+  local id=$1 level=$2 src=$3 tmp
+  if [[ $level == user ]]; then
+    # The user's own file. It is read-only to us until there is a backup we
+    # have compared against it — a half-written backup here is the difference
+    # between hiding an app and losing it.
+    local backup="$APP_BACKUP_DIR/$id.desktop"
+    cp -p -- "$src" "$backup" 2>/dev/null || { warn "could not back up $id — leaving it visible"; return 1; }
+    cmp -s -- "$src" "$backup" || {
+      rm -f -- "$backup"
+      warn "the backup of $id did not match the original — leaving it visible"; return 1
+    }
+    tmp=$(app_tempfile) || return 1
+    app_hidden_copy "$src" "$APP_TAG_MODIFIED" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod --reference="$src" -- "$tmp" 2>/dev/null || chmod 0644 -- "$tmp"
+    mv -f -- "$tmp" "$src" || { rm -f -- "$tmp"; return 1; }
+    # The hash of the file AS WE LEFT IT. Unhiding compares against it to find
+    # out whether anyone has touched the file since.
+    sha256sum <"$src" | awk '{ print $1 }' >"$APP_BACKUP_DIR/$id.sha256"
+  else
+    # A system entry. Our copy shadows it by id, and unhiding is deleting it,
+    # so there is nothing to back up.
+    tmp=$(app_tempfile) || return 1
+    app_hidden_copy "$src" "$APP_TAG_HIDDEN" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+    chmod 0644 -- "$tmp"
+    mv -f -- "$tmp" "$APPS_DIR/$id.desktop" || { rm -f -- "$tmp"; return 1; }
+  fi
+  return 0
+}
+
+app_show() {
+  local id=$1 tag=$2 path=$3
+  [[ -f $path ]] || return 1
+
+  if [[ $tag == hidden ]]; then
+    rm -f -- "$path"
+    return 0
+  fi
+
+  local backup="$APP_BACKUP_DIR/$id.desktop" hashfile="$APP_BACKUP_DIR/$id.sha256"
+  local want="" live
+  [[ -f $hashfile ]] && want=$(<"$hashfile")
+  live=$(sha256sum <"$path" | awk '{ print $1 }')
+  if [[ -f $backup && -n $want && $live == "$want" ]]; then
+    mv -f -- "$backup" "$path" || return 1
+    rm -f -- "$hashfile"
+    return 0
+  fi
+
+  # Edited since we hid it — by the user, or by the app's own updater. The edit
+  # wins: take out only the two lines we put in, and put back whatever
+  # NoDisplay/Hidden the original had, which we stripped when we hid it.
+  local restore=""
+  [[ -f $backup ]] && restore=$(awk '
+    /^\[/ { if (g == 1) g = 2; if ($0 == "[Desktop Entry]" && g == 0) { g = 1; next } }
+    g == 1 && /^(NoDisplay|Hidden)=/ { print }' "$backup")
+
+  local tmp; tmp=$(app_tempfile) || return 1
+  awk -v tag="$APP_TAG_MODIFIED" -v restore="$restore" '
+    BEGIN { nr = split(restore, rl, "\n") }
+    {
+      if (substr($0, 1, 1) == "[") {
+        if (g == 1) g = 2
+        if ($0 == "[Desktop Entry]" && g == 0) {
+          print; g = 1; expect = 1
+          for (i = 1; i <= nr; i++) if (rl[i] != "") print rl[i]
+          next
+        }
+      }
+      if (g == 1 && expect == 1 && $0 == "NoDisplay=true") { expect = 0; next }
+      expect = 0
+      if (g == 1 && $0 == tag "=1") next
+      print
+    }' "$path" >"$tmp" || { rm -f -- "$tmp"; return 1; }
+  chmod --reference="$path" -- "$tmp" 2>/dev/null || chmod 0644 -- "$tmp"
+  mv -f -- "$tmp" "$path" || { rm -f -- "$tmp"; return 1; }
+  local had_backup=""; [[ -f $backup ]] && had_backup=1
+  rm -f -- "$backup" "$hashfile"
+  if [[ -n $had_backup ]]; then
+    warn "kept your edits to $id"
+  else
+    # Nothing to put back. Removing our own two lines is all we can do, and all
+    # we are entitled to do — the rest of the file is not ours.
+    warn "no backup for $id — removed the lines this plugin added and left the rest"
+  fi
+  return 0
+}
+
+# Undo every hidden entry we own, whatever profile asked for it. The safety net
+# for a crash mid-switch and the first step of uninstalling.
+apps_sweep() {
+  mkdir -p "$APP_BACKUP_DIR"
+  local n=0 id tag path
+  while IFS=$'\t' read -r id tag path; do
+    [[ -n $id ]] || continue
+    app_show "$id" "$tag" "$path" && n=$((n + 1))
+  done < <(app_sources | awk -F'\t' '$8 != "" { print $1 "\t" $8 "\t" $9 }' | sort -u)
+  if ((n)); then
+    unset APP_SOURCES_CACHE
+    command -v update-desktop-database >/dev/null &&
+      update-desktop-database -q "$APPS_DIR" 2>/dev/null
+  fi
+  echo "restored $n hidden $([[ $n == 1 ]] && echo entry || echo entries)"
 }
 
 write_state() {
@@ -1367,7 +1686,7 @@ cmd_set() {
   apply_profile "$name"
   write_index
   write_catalog
-  write_allowed_apps "$name"
+  apply_app_visibility "$name"
   write_state "$name"
   echo "omarchy-profile: $name"
 }
@@ -1536,34 +1855,79 @@ cmd_visibility() {
   [[ $verb == show ]] && echo "$name now shows in the picker" || echo "$name is now hidden from the picker"
 }
 
+# What this profile may launch, as the panel reads it. `all` is every entry
+# Omarchy would show if no profile hid anything — which is why it is taken from
+# the enumerator rather than from what is visible right now: an app this profile
+# has already hidden still has to appear in the list, or there is no way to
+# switch it back on.
+apps_list_json() {
+  local name=$1 master=false allowed
+  is_master "$name" && master=true
+  allowed=$(jq -c '.apps.allowed // []' "$(file_for "$name")" 2>/dev/null) || allowed='[]'
+
+  app_sources | awk -F'\t' '$4 == "false" { printf "%s\t%s\n", $1, ($7 == "" ? $1 : $7) }' |
+    sort -u -t$'\t' -k2,2 -k1,1 |
+    jq -R -s --argjson allowed "${allowed:-[]}" --argjson master "$master" '
+      [ split("\n")[] | select(length > 0) | split("\t") | {id: .[0], name: .[1]} ] as $apps
+      | { all: [$apps[].id],
+          allowed: $allowed,
+          visible: [ $apps[] | select($master or (.id as $i | $allowed | index($i) != null)) ] }'
+}
+
+apps_preview_json() {
+  app_visibility_plan "$1" | jq -R -s '
+    [ split("\n")[] | select(length > 0) | split("\t") ] as $rows
+    | { to_hide: [ $rows[] | select(.[0] == "H") | .[1] ],
+        to_show: [ $rows[] | select(.[0] == "S") | .[1] ] }'
+}
+
 # Applications. Master is a wildcard: it sees everything, so an install only has
 # to be registered to the profile it happened in.
 cmd_apps() {
-  local name=${1:-} verb=${2:-list} app=${3:-}
-  [[ -n $name ]] || die "usage: omarchy-profile apps <profile> [list|allow|deny] [app-id]"
+  # Both argument orders are accepted: `apps <profile> <verb> [id]`, which the
+  # keybindings and the panel have always used, and the contract's
+  # `apps <verb> --json <profile>`. A profile named after a verb loses, which is
+  # a price worth one line of documentation.
+  local json="" args=() a
+  for a in "$@"; do
+    if [[ $a == --json ]]; then json=1; else args+=("$a"); fi
+  done
+  local name verb app
+  case ${args[0]:-} in
+  list | preview | allow | deny | allow-all | deny-all)
+    verb=${args[0]}; name=${args[1]:-}; app=${args[2]:-} ;;
+  *)
+    name=${args[0]:-}; verb=${args[1]:-list}; app=${args[2]:-} ;;
+  esac
+
+  [[ -n $name ]] || die "usage: omarchy-profile apps <profile> [list|preview|allow|deny] [app-id]"
   exists "$name" || die "no such profile '$name'"
   local file; file=$(file_for "$name")
   case $verb in
   list)
-    if is_master "$name"; then echo "*  (master sees every application)"; else
-      jq -r '(.apps.allowed // [])[]' "$file"
+    if [[ -n $json ]]; then apps_list_json "$name"
+    elif is_master "$name"; then echo "*  (master sees every application)"
+    else jq -r '(.apps.allowed // [])[]' "$file"
     fi ;;
+  preview)
+    # What a switch into this profile would do to the menu, without doing it.
+    apps_preview_json "$name" ;;
   allow-all | deny-all)
     is_master "$name" && { echo "master already sees every application"; return 0; }
     local tmp; tmp=$(mktemp)
     if [[ $verb == deny-all ]]; then
       jq '.apps = ((.apps // {}) | .allowed = [])' "$file" >"$tmp"
     else
-      # Every desktop entry on the machine, the same set the launcher shows.
+      # Every entry Omarchy would show on its own. Taken from the enumerator, so
+      # it is the same set whichever profile is active and whatever is hidden
+      # right now — otherwise "allow all" in one profile would silently mean
+      # "allow all except what the profile I am standing in has hidden".
       local ids
-      ids=$(find "$DATA_HOME/applications" /usr/local/share/applications /usr/share/applications \
-              -maxdepth 1 -name '*.desktop' 2>/dev/null |
-            xargs -r -I{} sh -c 'grep -qiE "^(NoDisplay|Hidden)=true" "{}" || basename "{}" .desktop' |
-            sort -u | jq -R . | jq -sc .)
+      ids=$(app_sources | awk -F'\t' '$4 == "false" { print $1 }' | sort -u | jq -R . | jq -sc .)
       jq --argjson all "${ids:-[]}" '.apps = ((.apps // {}) | .allowed = $all)' "$file" >"$tmp"
     fi
     mv "$tmp" "$file" || die "could not update '$name'"
-    [[ $name == "$(current_profile)" ]] && write_allowed_apps "$name"
+    [[ $name == "$(current_profile)" ]] && apply_app_visibility "$name"
     echo "$verb in $name" ;;
   allow | deny)
     [[ -n $app ]] || die "usage: omarchy-profile apps $name $verb <app-id>"
@@ -1575,7 +1939,7 @@ cmd_apps() {
       jq --arg a "$app" '.apps = ((.apps // {}) | .allowed = ((.allowed // []) | map(select(. != $a))))' "$file" >"$tmp"
     fi
     mv "$tmp" "$file" || die "could not update '$name'"
-    [[ $name == "$(current_profile)" ]] && write_allowed_apps "$name"
+    [[ $name == "$(current_profile)" ]] && apply_app_visibility "$name"
     echo "$verb $app in $name" ;;
   *) die "unknown apps verb '$verb'" ;;
   esac
@@ -1796,7 +2160,7 @@ refresh)
   # that wrote none of them.
   cur=$(current_profile)
   write_index; write_catalog
-  [[ -n $cur ]] && write_allowed_apps "$cur"
+  [[ -n $cur ]] && apply_app_visibility "$cur"
   echo "refreshed"
   # Also the upgrade path: someone who installed before this check existed, or
   # who installed from the marketplace, finds out here rather than at a lock.
@@ -1814,7 +2178,8 @@ create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
 remove) shift; cmd_remove "${1:-}" ;;
 show) shift; cmd_visibility show "${1:-}" ;;
 hide) shift; cmd_visibility hide "${1:-}" ;;
-apps) shift; cmd_apps "${1:-}" "${2:-list}" "${3:-}" ;;
+apps) shift; cmd_apps "$@" ;;
+apps-sweep) apps_sweep ;;
 plugin) shift; cmd_plugin "${1:-}" "${2:-list}" "${3:-}" ;;
 ws) shift; cmd_ws "${1:-}" ;;
 move) shift; cmd_move "${1:-}" "${2:-}" ;;
@@ -1849,7 +2214,14 @@ omarchy-profile — profiles for the Omarchy desktop
 
   close <name>                     ask every window in a profile to close
 
-  apps <profile> [list|allow|deny] [app-id]
+  apps <profile> [list|allow|deny|allow-all|deny-all] [app-id]
+                                   which applications the profile may launch;
+                                   the others are hidden from the menu, the
+                                   launcher and search while it is active
+  apps preview --json <profile>    what switching into it would hide or show
+  apps-sweep                       put every application back, whatever profile
+                                   hid it — the way out if something went wrong
+
   plugin <profile> [list|enable|disable] [plugin-id]
 
   ws <1-10|next|prev>            focus a workspace inside this profile
