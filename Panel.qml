@@ -59,6 +59,9 @@ Panel {
           master: !!p.master,
           hidden: !!p.hidden,
           locked: !!p.locked,
+          // From the engine's root store, not from the profile's own JSON:
+          // this is the fact a settings edit must not be able to change.
+          hasPassword: !!p.hasPassword,
           identity: String(p.identity || "")
         })
         if (p.master) root.masterName = String(p.name || "")
@@ -113,11 +116,25 @@ Panel {
   // switches it back on is exactly the list it would drop out of.
   property var settingsAllApps: []
 
-  // Which profile a password is being asked for, and which Setup row is waiting
-  // on an answer. The prompt is a later phase; the idle timer already has to
-  // know that a question is on screen, because timing one out would dismiss it
-  // without anybody deciding anything.
+  // Which profile a password is being asked for, and what about. The idle timer
+  // watches passwordFor too: a question on screen must never be timed out
+  // without somebody deciding anything.
   property string passwordFor: ""
+  // "enter" | "set" | "change" | "reset" | "clear" | "rename" | "remove"
+  property string passwordMode: ""
+  property string passwordError: ""
+  // Seconds; while it is above zero the field is read-only and counting down.
+  property int passwordRetryIn: 0
+  property bool faceTrying: false
+  // The pending empty-stdin `set` that is trying a bound face, kept so it can
+  // be terminated the moment something is typed.
+  property var faceProc: null
+  // The second argument of a two-name verb — today only `rename`.
+  property string passwordArg: ""
+  // Whether a face can be tried at all. Asked once per open; `absent` means the
+  // face plugin is not installed and there is nothing to try.
+  property bool faceInstalled: false
+  property string createError: ""
   property string pendingSetup: ""
 
   // What Setup says, as the engine says it.
@@ -266,14 +283,19 @@ Panel {
   //   anything else ok = false, parsed = the engine's {"error": …} if it printed
   //                 one, else {error: "failed", code}. Code 2 is an auth
   //                 refusal and 3 is busy (plan-merged.md §2 rule 3).
+  // Returns the Process it started, so a caller can signal it — which is how a
+  // face attempt is cancelled the instant a password is typed. A call that had
+  // to queue returns null: nothing has started yet, so there is nothing to
+  // signal.
   function ask(args, stdinText, callback) {
     var job = { args: args || [], stdin: String(stdinText || ""), callback: callback || null }
     for (var i = 0; i < root.askPool.length; i++) {
-      if (!root.askPool[i].busy) { root.startAsk(root.askPool[i], job); return }
+      if (!root.askPool[i].busy) { root.startAsk(root.askPool[i], job); return root.askPool[i] }
     }
     // Four at once is more than the panel ever needs; a fifth waits rather than
     // letting a stuck engine call spawn processes without bound.
     root.askQueue = root.askQueue.concat([job])
+    return null
   }
 
   property var askQueue: []
@@ -384,28 +406,172 @@ Panel {
     })
   }
 
-  // Which profile is being asked about, and what to say about the last answer.
-  // The prompt itself is the password phase; until it exists, a locked profile
-  // goes through the engine, which draws the owner's prompt the old way.
+  // Opening a protected profile.
+  //
+  // Three cases, and only one of them shows a field straight away:
+  //
+  //   locked with no password  there is nothing to type. Empty stdin makes the
+  //                            engine raise the owner's prompt, which polkit
+  //                            draws for itself.
+  //   a bound face             worth trying silently first, but never at the
+  //                            cost of making the user wait: the field appears
+  //                            at once and the face attempt runs beside it.
+  //   plain password           the field, with no round trip spent first.
   function beginUnlock(id) {
-    root.startSwitch(id, "")
+    root.passwordFor = id
+    root.passwordMode = "enter"
+    root.passwordError = ""
+    root.passwordRetryIn = 0
+    root.faceTrying = false
+    root.faceProc = null
+    var e = root.entry(id)
+    if (!e) return
+    if (e.locked && !e.hasPassword) { root.startSwitch(id, ""); return }
+    if (e.identity !== "" && root.faceInstalled) {
+      root.faceTrying = true
+      root.faceProc = root.startSwitch(id, "")
+    }
   }
 
-  // The panel's half of the contract's error codes. The ones with their own UI
-  // — the password field, the countdown — arrive with the prompt; everything
-  // here has to at least say something true rather than fail silently.
+  // A late face success would take the state lock and turn this typed password
+  // into "busy" for a switch that is in fact happening. So the face attempt is
+  // cancelled, not ignored, and not waited for: authentication happens before
+  // the lock is taken, so a terminated attempt leaves nothing behind to undo.
+  function submitPassword(id, text) {
+    if (String(text || "") === "") return   // empty stdin means "no password supplied"
+    if (root.faceProc) { root.faceProc.signal(15); root.faceProc = null }
+    root.faceTrying = false
+    root.passwordError = ""
+    root.startSwitch(id, text)
+  }
+
+  // Managing a password, removing a profile, renaming one: everything whose
+  // secret is collected by the prompt but which is not a switch.
+  function submitManage(mode, id, secret) {
+    var args = null
+    if (mode === "set") args = ["password", "set", id, "--json"]
+    else if (mode === "reset") args = ["password", "reset", id, "--json"]
+    else if (mode === "change") args = ["password", "change", id, "--json"]
+    else if (mode === "clear") args = ["password", "clear", id, "--json"]
+    else if (mode === "remove") args = ["remove", id, "--json"]
+    else if (mode === "rename") args = ["rename", id, root.passwordArg, "--json"]
+    if (!args) return
+    root.passwordError = ""
+    root.ask(args, secret, function (ok, parsed, code) {
+      if (ok) {
+        root.passwordFor = ""
+        root.passwordMode = ""
+        root.passwordArg = ""
+        root.passwordError = ""
+        // Every one of these verbs rewrites the index itself; the watcher picks
+        // it up. Setup is asked again because `locks` and `stale-hashes` are
+        // about exactly what just changed.
+        root.loadSetup(false)
+        return
+      }
+      root.handleAuthError(id, parsed, code)
+    })
+  }
+
+  // Open the prompt for something other than entering a profile.
+  function beginManage(id, mode) {
+    root.passwordFor = id
+    root.passwordMode = mode
+    root.passwordError = ""
+    root.passwordRetryIn = 0
+    root.faceTrying = false
+    root.faceProc = null
+  }
+
+  // Phase 6's edit form calls this; the prompt does the rest.
+  function beginRename(id, to) {
+    root.passwordArg = to
+    var e = root.entry(id)
+    if (e && (e.hasPassword || e.locked)) { root.beginManage(id, "rename"); return }
+    root.submitManage("rename", id, "")
+  }
+
+  function cancelPassword() {
+    if (root.faceProc) { root.faceProc.signal(15); root.faceProc = null }
+    root.faceTrying = false
+    root.passwordFor = ""
+    root.passwordMode = ""
+    root.passwordArg = ""
+    root.passwordError = ""
+    root.passwordRetryIn = 0
+    root.applying = ""
+  }
+
+  // The contract's exit-2 codes, each with a different thing for the user to
+  // do. A wrong password and a rate limit must never render alike: one is "try
+  // again", the other is "you cannot try again yet".
   function handleAuthError(id, parsed, code) {
+    root.faceTrying = false
     var err = parsed && parsed.error ? String(parsed.error) : "failed"
-    if (code === 3) { root.switchError = "Another switch is still running"; return }
-    if (err === "interrupted_switch" || err === "held_paths") {
-      // Both belong to the `switch` Setup row, and both block every other
-      // switch, so the panel goes there rather than leaving the user to guess.
+
+    if (err === "needs_password") {
+      // Nothing was tried and nothing was wrong: the field simply appears.
+      root.passwordError = ""
+    } else if (err === "bad_password") {
+      root.passwordError = "Wrong password"
+    } else if (err === "rate_limited") {
+      root.passwordRetryIn = parsed.retry_after || 30
+      root.passwordError = ""
+    } else if (err === "owner_declined") {
+      root.passwordError = "Not authorised"
+      // On a profile locked without a password there is no field to fall back
+      // to, so there is nothing left to show.
+      var e = root.entry(id)
+      if (!e || !e.hasPassword) { root.cancelPassword(); return }
+    } else if (err === "no_password") {
+      // Not a refusal: the profile has no password at all. The index the panel
+      // is holding is out of date.
+      root.passwordFor = ""
+      root.runEngine("refresh")
+      return
+    } else if (err === "empty_password") {
+      root.passwordError = "Type the password"
+    } else if (err === "helper_unavailable") {
+      // Never "wrong password": the helper is missing or unregistered, which
+      // is the polkit row's business.
+      root.passwordFor = ""
+      root.switchError = "The password helpers are not installed — open Setup"
+      root.loadSetup(true)
+      root.pushView("setup")
+      return
+    } else if (err === "stale_password") {
+      root.passwordError = "A password is still stored under that name — clear it in Setup"
+    } else if (err === "interrupted_switch" || err === "held_paths") {
+      root.passwordFor = ""
       root.switchError = "The last switch did not finish — open Setup"
       root.loadSetup(true)
+      root.pushView("setup")
       return
+    } else if (code === 3) {
+      root.passwordError = "Another switch is still running"
+    } else {
+      root.passwordError = "Could not check the password"
     }
-    if (code === 2) { root.switchError = "Not authorised"; return }
-    root.switchError = "Could not switch to " + root.label(id)
+
+    if (root.passwordFor === "") {
+      root.passwordFor = id
+      if (root.passwordMode === "") root.passwordMode = "enter"
+    }
+    root.switchError = ""
+  }
+
+  // Creating a profile is the one form that can come back with something to
+  // say about a password: a hash left behind by a deleted profile of the same
+  // name.
+  function createProfile(name, fromMaster) {
+    root.createError = ""
+    root.ask(["create", name, fromMaster ? "--from-master" : "--clean"], "", function (ok, parsed, code) {
+      if (ok) return
+      var err = parsed && parsed.error ? String(parsed.error) : ""
+      root.createError = err === "stale_password"
+        ? "A password is still stored for a deleted profile with this name — clear it in Setup"
+        : "Could not create that profile"
+    })
   }
 
   // One line under the hero title, cleared by the next attempt or by arriving
@@ -510,6 +676,12 @@ Panel {
     // one that says what is wrong.
     root.setupError = ""
     root.loadSetup(true)
+    // Whether a bound face is worth trying at all. Asked here rather than
+    // guessed from the index: a profile can name an identity on a machine
+    // where the face plugin has since been removed.
+    root.ask(["capabilities", "--json"], "", function (ok, parsed) {
+      root.faceInstalled = !!(ok && parsed && parsed.face === "ok")
+    })
     if (root.switchStalled) root.resetView("setup")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
@@ -732,6 +904,19 @@ Panel {
       root.apply(id)
       return "ok"
     }
+
+    // omarchy-shell graveklar.profiles promptUnlock work
+    //
+    // How a keybinding asks for a password: `next` has nowhere to type, so it
+    // hands the profile here and stops. `login` uses it too.
+    function promptUnlock(name: string): string {
+      var id = String(name || "")
+      if (root.indexOf(id) < 0) return "unknown profile"
+      root.open()
+      root.resetView("picker")
+      root.beginUnlock(id)
+      return "ok"
+    }
   }
 
   BarIconButton {
@@ -772,10 +957,20 @@ Panel {
       fontFamily: root.fontFamily
       onCanceled: root.pendingRemoval = ""
       onConfirmed: {
-        root.runEngine("remove " + root.pendingRemoval)
+        var name = root.pendingRemoval
         root.pendingRemoval = ""
         // The removed profile may be the one the settings view was editing.
         if (root.view === "settings") root.navBack()
+        var e = root.entry(name)
+        if (e && (e.hasPassword || e.locked)) {
+          // The engine authenticates before it moves a single window, so a
+          // refused password here leaves the profile exactly as it was.
+          root.beginManage(name, "remove")
+          return
+        }
+        root.ask(["remove", name, "--json"], "", function (ok, parsed, code) {
+          if (!ok) root.handleAuthError(name, parsed, code)
+        })
       }
     }
 
@@ -797,6 +992,15 @@ Panel {
       }
     }
 
+    // Above the confirmations: a remove is confirmed first and authenticated
+    // second, so the prompt has to draw over the dialog that raised it.
+    PasswordPrompt {
+      id: passwordPrompt
+      anchors.fill: parent
+      z: 11
+      panel: root
+    }
+
     PanelKeyCatcher {
       id: keyCatcher
       anchors.fill: parent
@@ -813,20 +1017,26 @@ Panel {
         onTapped: root.keepAlive()
       }
 
+      // Inert while a password is being asked for: Enter belongs to the prompt,
+      // and an arrow key must not move a cursor the user cannot see.
       onMoveRequested: function (dx, dy) {
+        if (root.passwordFor !== "") return
         root.keepAlive()
         root.cursorActive = true
         var len = (root.view === "manage" ? root.profiles.length : root.visibleProfiles.length)
         if (dy !== 0) root.cursor = Math.max(0, Math.min(Math.max(0, len - 1), root.cursor + dy))
       }
       onActivateRequested: {
+        if (root.passwordFor !== "") return
         // Enter only switches in the picker; in the manage view the row's own
         // buttons are the actions, and an accidental Enter must not delete one.
         if (root.view !== "picker") return
         var e = root.visibleProfiles[root.cursor]
         if (e) root.apply(e.id)
       }
-      onCloseRequested: root.close()
+      // Escape answers the prompt first: it closes the question, not the panel
+      // behind it, and switches nothing.
+      onCloseRequested: if (root.passwordFor !== "") root.cancelPassword(); else root.close()
       onTabRequested: function (direction) { root.switchPanel(direction) }
 
       // The plugin list runs to ~60 rows, far past any sensible panel height.
@@ -990,6 +1200,9 @@ Panel {
           onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
           onOpenOverview: { root.keepAlive(); root.openOverview() }
           onOpenSettings: function (profile) { root.keepAlive(); root.openSettings(profile) }
+          createError: root.createError
+          onPasswordAction: function (profile, mode) { root.keepAlive(); root.beginManage(profile, mode) }
+          onCreateProfile: function (name, fromMaster) { root.keepAlive(); root.createProfile(name, fromMaster) }
         }
 
         OverviewView {

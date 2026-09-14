@@ -1,0 +1,225 @@
+#!/bin/bash
+
+# omarchy-profile-passwd — the owner half of the privileged pair.
+#
+# Everything here happens because the machine's owner authorised it at polkit's
+# own dialog, which this script never sees and never draws: polkit runs it or it
+# does not run at all. `auth_self` without `_keep`, deliberately — a cached
+# authorisation is exactly the hole the gate exists to close, since the threat
+# is a person at an unattended machine and "you authorised something five
+# minutes ago" is no evidence that you are the one standing here now.
+#
+#   set    <p>            create a hash where there is none (new password on stdin)
+#   reset  <p>            replace one without knowing the old (new password on stdin)
+#   clear  <p>            delete the hash
+#   bind   <p> <identity> record whose face opens this profile
+#   unbind <p>            forget it
+#   rename <old> <new>    move hash, identity and counter together
+#   remove <p>            delete all three
+#   purge                 remove the whole root store (uninstall)
+#
+# Identity lives here rather than in the profile's JSON because the JSON is
+# writable by the user: a partner with an enrolled face could otherwise bind it
+# to the owner's profile with a text editor.
+#
+# One JSON object on stdout. Exit 0 ok, 1 error, 2 refused, 3 busy.
+
+set -euo pipefail
+set +x
+umask 077
+PATH=/usr/sbin:/usr/bin
+export PATH
+unset IFS BASH_ENV ENV
+
+ROOT=/var/lib/omarchy-profiles
+PASSWORDS=$ROOT/passwords
+IDENTITY=$ROOT/identity
+ATTEMPTS=$ROOT/attempts
+LOG=$ROOT/log
+SELF=omarchy-profile-passwd
+
+VERB=${1:-}
+PROFILE=${2:-}
+ARG=${3:-}
+
+NEW_SECRET=""
+trap 'NEW_SECRET=""' EXIT
+
+log() {
+  local ts
+  ts=$(date -u +%Y-%m-%dT%H:%M:%SZ 2>/dev/null) || ts="?"
+  printf '%s %s verb=%s profile=%s uid=%s result=%s\n' \
+    "$ts" "$SELF" "${VERB:-?}" "${PROFILE:-?}" "${PKEXEC_UID:-?}" "$1" >>"$LOG" 2>/dev/null || true
+}
+
+ok() {
+  printf '%s\n' "$1"
+  log "${2:-ok}"
+  exit 0
+}
+
+fail() {
+  printf '{"error":"%s"%s}\n' "$2" "${3:-}"
+  log "$2"
+  exit "$1"
+}
+
+if [[ -z ${PKEXEC_UID:-} ]] && [[ $(id -ru) != 0 ]]; then
+  fail 1 not_privileged
+fi
+
+valid_profile() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; }
+valid_identity() { [[ $1 =~ ^[a-z0-9_-]{1,32}$ ]]; }
+
+if [[ $VERB != purge ]]; then
+  valid_profile "$PROFILE" || fail 1 bad_profile_name
+fi
+
+read_secret() {
+  local LC_ALL=C blob
+  blob=$(head -c 1025; printf .) || blob="."
+  blob=${blob%.}
+  if ((${#blob} > 1024)); then fail 1 too_long; fi
+  NEW_SECRET=${blob%$'\n'}
+}
+
+# The same per-profile lock the no-prompt helper takes, so an owner reset and a
+# password attempt cannot interleave on one counter.
+lock_for() {
+  local p=$1 fd=$2
+  mkdir -p "$ATTEMPTS" 2>/dev/null || true
+  chmod 0700 "$ATTEMPTS" 2>/dev/null || true
+  : >>"$ATTEMPTS/$p.lock" 2>/dev/null || fail 1 store_unwritable
+  chmod 0600 "$ATTEMPTS/$p.lock" 2>/dev/null || true
+  case $fd in 8 | 9) ;; *) fail 1 internal ;; esac
+  eval "exec $fd>\"\$ATTEMPTS/\$p.lock\"" || fail 1 store_unwritable
+  flock -w 5 "$fd" || fail 3 busy
+}
+
+write_hash() {
+  local p=$1 hash=$2 tmp
+  mkdir -p "$PASSWORDS" 2>/dev/null || true
+  chmod 0711 "$PASSWORDS" 2>/dev/null || true
+  tmp=$(mktemp "$PASSWORDS/.$p.XXXXXX") || fail 1 store_unwritable
+  printf '%s\n' "$hash" >"$tmp" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  chmod 0600 "$tmp"
+  chown root:root "$tmp" 2>/dev/null || true
+  mv -f "$tmp" "$PASSWORDS/$p" || { rm -f "$tmp"; fail 1 store_unwritable; }
+}
+
+# Sets NEW_HASH, and refuses from the MAIN shell rather than from a command
+# substitution.
+#
+# The first version was `write_hash "$p" "$(hash_new)"`, with the refusals
+# inside it. A `fail` in a command substitution exits only the subshell, and
+# its JSON goes to that subshell's stdout — so an empty new password was
+# answered with {"ok":true} and the refusal itself was written into the file as
+# the password hash. The profile then had a hash that nothing could ever match.
+NEW_HASH=""
+make_hash() {
+  if [[ -z $NEW_SECRET ]]; then fail 1 empty_password; fi
+  NEW_HASH=$(printf '%s\n' "$NEW_SECRET" | openssl passwd -6 -stdin 2>/dev/null) || NEW_HASH=""
+  # It has to look like what it claims to be before it is stored: anything else
+  # means openssl produced no hash, whatever its exit status said.
+  case $NEW_HASH in
+  '$6$'*) ;;
+  *) fail 1 hash_failed ;;
+  esac
+}
+
+case $VERB in
+set)
+  # `set` creates; `reset` replaces. Keeping them apart means a mis-sent `set`
+  # cannot quietly overwrite a password somebody is still using.
+  read_secret
+  lock_for "$PROFILE" 9
+  if [[ -e $PASSWORDS/$PROFILE ]]; then fail 1 already_set; fi
+  make_hash
+  write_hash "$PROFILE" "$NEW_HASH"
+  rm -f "$ATTEMPTS/$PROFILE"
+  ok '{"ok":true}' set
+  ;;
+
+reset)
+  read_secret
+  lock_for "$PROFILE" 9
+  make_hash
+  write_hash "$PROFILE" "$NEW_HASH"
+  # The way past a lockout somebody else triggered: the owner is not subject to
+  # the profile's counter, and clears it.
+  rm -f "$ATTEMPTS/$PROFILE"
+  ok '{"ok":true}' reset
+  ;;
+
+clear)
+  lock_for "$PROFILE" 9
+  rm -f "$PASSWORDS/$PROFILE" "$ATTEMPTS/$PROFILE"
+  ok '{"ok":true}' cleared
+  ;;
+
+bind)
+  valid_identity "$ARG" || fail 1 bad_identity_name
+  lock_for "$PROFILE" 9
+  mkdir -p "$IDENTITY" 2>/dev/null || true
+  chmod 0755 "$IDENTITY" 2>/dev/null || true
+  tmp=$(mktemp "$IDENTITY/.$PROFILE.XXXXXX") || fail 1 store_unwritable
+  printf '%s\n' "$ARG" >"$tmp" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$IDENTITY/$PROFILE" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  ok '{"ok":true}' "bound to $ARG"
+  ;;
+
+unbind)
+  lock_for "$PROFILE" 9
+  rm -f "$IDENTITY/$PROFILE"
+  ok '{"ok":true}' unbound
+  ;;
+
+rename)
+  valid_profile "$ARG" || fail 1 bad_profile_name
+  if [[ $ARG == "$PROFILE" ]]; then fail 1 same_name; fi
+  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
+  if [[ $PROFILE < $ARG ]]; then
+    lock_for "$PROFILE" 9
+    lock_for "$ARG" 8
+  else
+    lock_for "$ARG" 8
+    lock_for "$PROFILE" 9
+  fi
+  moved=""
+  for d in "$PASSWORDS" "$IDENTITY" "$ATTEMPTS"; do
+    [[ -e $d/$PROFILE ]] || continue
+    if mv -n "$d/$PROFILE" "$d/$ARG"; then
+      moved="$moved $d"
+    else
+      for b in $moved; do mv -n "$b/$ARG" "$b/$PROFILE" 2>/dev/null || true; done
+      fail 1 rename_failed
+    fi
+  done
+  # The lock file follows too, or the next caller would serialise on a name
+  # that no longer exists. If the new name already had one (we just created it
+  # taking both locks), the old one is simply dropped — it is an empty file
+  # whose only purpose was to be flocked.
+  mv -n "$ATTEMPTS/$PROFILE.lock" "$ATTEMPTS/$ARG.lock" 2>/dev/null || true
+  rm -f "$ATTEMPTS/$PROFILE.lock"
+  ok '{"ok":true}' "renamed to $ARG"
+  ;;
+
+remove)
+  lock_for "$PROFILE" 9
+  rm -f "$PASSWORDS/$PROFILE" "$IDENTITY/$PROFILE" "$ATTEMPTS/$PROFILE"
+  ok '{"ok":true}' removed
+  ;;
+
+purge)
+  # Uninstall. Named explicitly rather than taking a path, so there is no
+  # argument anybody could point at another directory.
+  rm -rf /var/lib/omarchy-profiles
+  printf '{"ok":true}\n'
+  exit 0
+  ;;
+
+*)
+  fail 1 unknown_verb
+  ;;
+esac

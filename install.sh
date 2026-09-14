@@ -22,20 +22,20 @@ rsync -a --delete \
   --exclude '.git' --exclude 'install.sh' --exclude '*.bak' --exclude '*.bak.*' \
   "$SRC/" "$DEST/"
 
-chmod +x "$DEST/bin/omarchy-profile"
+chmod +x "$DEST/bin/omarchy-profile" \
+         "$DEST/bin/omarchy-profile-auth" \
+         "$DEST/bin/omarchy-profile-passwd"
 
-# The unlock gate asks polkit for an authorisation decision, which needs the
-# action declared system-wide. Without it pkcheck refuses every check and every
-# locked profile becomes unenterable, so this goes in before the plugin that
-# depends on it.
-POLICY="$SRC/polkit/no.graveklar.profiles.policy"
-POLICY_DEST=/usr/share/polkit-1/actions/no.graveklar.profiles.policy
-if [[ -f $POLICY ]] && ! cmp -s "$POLICY" "$POLICY_DEST"; then
-  echo "installing polkit policy (needs root)"
-  SUDO=(sudo)
-  [[ ! -t 0 && -n ${SUDO_ASKPASS:-} ]] && SUDO=(sudo -A)
-  "${SUDO[@]}" install -o root -g root -m 0644 "$POLICY" "$POLICY_DEST"
-fi
+# Nothing privileged happens here, deliberately.
+#
+# This script only syncs the working tree into the plugin directory, which is
+# entirely the user's. The two root-owned helpers and the polkit actions are
+# installed by Setup's `helpers`/`polkit` rows, through one pkexec call the
+# engine owns — the same path a marketplace install takes, which never runs
+# this file at all. Installing the policy here as well would mean the dev tree
+# and Setup disagreeing about what is registered: every sync would push a copy
+# of whatever this checkout happens to hold, including an old single-action
+# policy, over the one Setup just installed and is checking against.
 
 if command -v omarchy >/dev/null; then
   omarchy plugin validate "$DEST" || { echo "install.sh: plugin failed validation" >&2; exit 1; }

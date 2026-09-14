@@ -98,12 +98,13 @@ command -v jq >/dev/null || die "jq is required"
 ensure_config() {
   mkdir -p "$PROFILE_DIR" "$STATE_DIR"
   [[ -s $CONFIG_FILE ]] && return 0
+  # No `last` and no `unlock.method`: `.last` always equalled current.json, so
+  # nothing could use it, and how a profile is authenticated is no longer a
+  # setting — it is whether the profile has a password.
   jq -n '{
     version: 1, master: "master", master_switchable: true,
-    restore_last_on_login: true, last: "",
     pinned_plugins: ["graveklar.profiles"], workspace_span: 10,
-    isolate: [],
-    unlock: {method: "polkit"}
+    isolate: []
   }' >"$CONFIG_FILE"
 }
 
@@ -116,7 +117,10 @@ cfg() {
 
 cfg_set() {
   local tmp
-  tmp=$(mktemp) || return 1
+  # In the config file's own directory. A bare mktemp is /tmp, on tmpfs, so the
+  # mv below would be a cross-filesystem copy rather than an atomic rename —
+  # and a half-written config.json is a machine with no master profile.
+  tmp=$(mktemp "$CONFIG_FILE.XXXXXX") || return 1
   jq "$@" "$CONFIG_FILE" >"$tmp" && mv "$tmp" "$CONFIG_FILE" || { rm -f "$tmp"; return 1; }
 }
 
@@ -150,363 +154,515 @@ next_offset() {
   echo $((max + span))
 }
 
-# ------------------------------------------------------------------- locks
+# ------------------------------------------------- passwords and the gate
 #
-# Password-protected profiles.
+# A profile is protected by a password of its own, not by the machine owner's.
 #
-# Authentication goes through PAM rather than a passphrase of our own, because
-# PAM is already where this user's identity is decided. On this machine the sudo
-# stack is:
+# The owner's password was the wrong question: a partner could not open THEIR
+# own desk without the owner standing there. So each profile carries its own
+# hash, and the owner is only asked for the things that are genuinely the
+# owner's — creating a password, resetting one somebody has forgotten, and
+# deciding whose face opens a profile.
 #
-#   auth [success=1 default=ignore] pam_exec.so ... omarchy-face-gate
-#   auth sufficient                 pam_exec.so ... omarchy-face-verify
-#   auth include                    system-auth
+# The hash is root-owned and this script is not privileged, so the gate reads
+# root-owned state and asks a root helper to do anything with it:
 #
-# so `sudo -v` accepts a face, and falls through to the password — and to a
-# fingerprint for anyone who has added pam_fprintd. None of that is implemented
-# here, and adding a new method later needs no change to this plugin.
+#   /var/lib/omarchy-profiles/passwords/<p>   root:root 0600   the hash
+#   /var/lib/omarchy-profiles/identity/<p>    root:root 0644   whose face opens it
+#   /var/lib/omarchy-profiles/attempts/<p>    root:root 0600   the rate-limit counter
 #
-# `sudo -k` first, deliberately: without it a cached sudo timestamp would let
-# someone walk up to an unattended machine and enter a locked profile with no
-# prompt at all. The cost is that the next real sudo asks again.
+# passwords/ is 0711: execute without read. This script can ask whether a hash
+# exists for a name it already knows — which is all `hasPassword` needs — and
+# cannot list the directory or open a hash. Profile names are not secret; they
+# are file names in ~/.config/omarchy/profiles.
 #
-# What this is and is not: it gates ENTERING a profile. Every profile runs as the
-# same Unix user, so it is not a security boundary — a process running as you can
-# read another profile's files whether or not this prompt exists. It stops a
-# person at the keyboard, not a program.
+# What this does and does not hold. Root ownership closes exactly one hole:
+# switching a lock off by editing a setting. It also makes the password itself
+# unreadable and unforgeable. It does NOT make the gate a security boundary —
+# the gate is decided by this script, which lives in a directory the user can
+# write, and every profile is the same Unix user, so anyone willing to edit
+# files can enter any profile and read any profile's data without entering it
+# at all. It stops a person at the keyboard using the desktop as intended.
+
+ROOT_STORE=/var/lib/omarchy-profiles
+HELPER_AUTH=/usr/local/bin/omarchy-profile-auth
+HELPER_PASSWD=/usr/local/bin/omarchy-profile-passwd
+POLICY_SRC="$PLUGIN_DIR/polkit/no.graveklar.profiles.policy"
+POLICY_DEST=/usr/share/polkit-1/actions/no.graveklar.profiles.policy
+# The single-action file this replaces. An install that leaves it registered
+# leaves a stale action behind, so it is removed by name as well as overwritten.
+POLICY_LEGACY=/usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
 
 profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; }
 
-# Every attempt is logged, pass or fail.
-#
-# Not for its own sake: with a face in the PAM stack a successful unlock is
-# silent and instant, which is indistinguishable from no check having run at
-# all. "It did not ask me for anything" is the expected experience and also
-# exactly what a broken gate looks like, so the only way to tell them apart is
-# a record. `journalctl --user -t omarchy-profile` shows it.
-audit() { logger -t omarchy-profile -p user.notice -- "$*" 2>/dev/null || true; }
+# The three questions the gate asks, and the only three. `hasPassword` is never
+# stored as truth anywhere the user can write: write_index puts a derived copy
+# in profiles.json for the panel to render, and this is where it comes from.
+has_password() { [[ -e $ROOT_STORE/passwords/$1 ]]; }
 
-# True only for methods that need somewhere to type. polkit draws its own
-# dialog through the session agent, so a locked switch started from the panel
-# no longer has to relaunch itself in a floating terminal just to have a place
-# to prompt.
-auth_needs_terminal() {
-  [[ $(cfg '.unlock.method // "polkit"') == sudo ]]
+# `locked` without a hash is the migration state — a profile locked under the
+# old owner-identity model. It falls back to the owner prompt and the `locks`
+# Setup row names it. In that state only, and nowhere else, editing the profile
+# JSON can remove the gate.
+asks_auth() { has_password "$1" || profile_locked "$1"; }
+
+# Whose face opens a profile. Root-side, written only by the owner helper: a
+# partner with an enrolled face can no longer bind it to somebody else's
+# profile by editing a JSON file.
+bound_identity() {
+  [[ -r $ROOT_STORE/identity/$1 ]] || return 1
+  local v
+  v=$(head -c 64 "$ROOT_STORE/identity/$1" 2>/dev/null | head -1)
+  [[ -n $v ]] || return 1
+  printf '%s\n' "$v"
 }
 
-authenticate() {
-  local method for_what=${1:-a locked profile} profile=${2:-}
-  method=$(cfg '.unlock.method // "polkit"')
+password_status() {
+  has_password "$1" && { echo set; return 0; }
+  profile_locked "$1" && { echo locked_no_password; return 0; }
+  echo none
+}
 
-  # A profile may name a face other than the owner's — a partner's, say. PAM
-  # cannot express that: it authenticates the Unix user, and there is only one.
-  # So the identity is asked first and separately.
-  #
-  # owner_override decides what happens when that face is not recognised:
-  #
-  #   true (default)  the owner check below still runs, so a camera that cannot
-  #                   see is never the reason somebody is locked out of their
-  #                   own machine.
-  #   false           refuse. Only the bound face opens this profile, and the
-  #                   machine owner's password does not.
-  #
-  # Read the honesty note under "What a lock is not" before trusting the second
-  # one: this file is writable by the owner, so owner_override=false is a
-  # courtesy between people sharing a laptop, not a boundary.
-  local identity="" owner_override=true
-  if [[ -n $profile ]]; then
-    identity=$(jq -r '.identity // empty' "$(file_for "$profile")" 2>/dev/null)
-    # `== false`, not `// true`: jq's alternative operator treats false as
-    # absent, so `.owner_override // true` returned TRUE for a profile that had
-    # explicitly set it to false — the setting was silently a no-op, and the
-    # owner's password kept opening a profile meant to refuse it.
-    owner_override=$(jq -r 'if (.owner_override == false) then "false" else "true" end' \
-      "$(file_for "$profile")" 2>/dev/null)
+# Absolute path first: PATH belongs to whoever called us, and the install
+# location does not. Replaces every hardcoded reference to the face helper.
+face_identity() {
+  local p=/usr/local/bin/omarchy-face-identity
+  [[ -x $p ]] && { printf '%s\n' "$p"; return 0; }
+  command -v omarchy-face-identity
+}
+
+face_installed() { face_identity >/dev/null 2>&1; }
+
+# Every attempt is logged, pass or fail.
+#
+# Not for its own sake: with a face bound, a successful unlock is silent and
+# instant, which is indistinguishable from no check having run at all. "It did
+# not ask me for anything" is the expected experience and also exactly what a
+# broken gate looks like, so the only way to tell them apart is a record.
+# `journalctl --user -t omarchy-profile` shows it.
+#
+# Advisory only, and labelled as such: this goes through logger as the user, so
+# any process running as the user can write to it. The helpers' root-owned log
+# at /var/lib/omarchy-profiles/log is the record to trust.
+audit() { logger -t omarchy-profile -p user.notice -- "$*" 2>/dev/null || true; }
+
+# ----------------------------------------------------------------- secrets
+#
+# A password in argv is readable through /proc/<pid>/cmdline by the same Unix
+# user this gate exists to stop — and a root process's cmdline is world
+# readable too. So: stdin only, never an argument, never an environment
+# variable, never a temp file, and never echoed back into an error, a log line
+# or a trace.
+
+SECRET=""
+OLD_SECRET=""
+NEW_SECRET=""
+HELPER_STDIN=""
+
+clear_secrets() { SECRET=""; OLD_SECRET=""; NEW_SECRET=""; HELPER_STDIN=""; }
+
+# Whatever path is taken out of this process, the secrets go with it.
+trap 'clear_secrets' EXIT
+
+# Bounded, because reading an unbounded stream into a variable is how a caller
+# turns a password field into a memory bomb. Exactly one trailing newline is
+# stripped — the sender adds exactly one — and nothing else, because a password
+# may legitimately end in a space.
+#
+# Empty stdin means "no password supplied", never "an empty password".
+read_secret() {
+  local LC_ALL=C blob
+  blob=$(head -c 1025; printf .) || blob="."
+  blob=${blob%.}
+  ((${#blob} > 1024)) && refuse 1 too_long "that is not a password anyone typed"
+  SECRET=${blob%$'\n'}
+  return 0
+}
+
+# `password change` sends the current password and the new one, one per line.
+read_secret_pair() {
+  local LC_ALL=C blob rest
+  blob=$(head -c 2051; printf .) || blob="."
+  blob=${blob%.}
+  ((${#blob} > 2050)) && refuse 1 too_long "that is not a password anyone typed"
+  OLD_SECRET=${blob%%$'\n'*}
+  rest=${blob#*$'\n'}
+  [[ $rest == "$blob" ]] && rest=""
+  NEW_SECRET=${rest%%$'\n'*}
+  return 0
+}
+
+# At a terminal there is no GUI to collect anything, so ask here — with `read
+# -rs`, which echoes nothing. The panel never takes this path: its stdin is a
+# pipe.
+prompt_secret() {
+  local label=$1
+  printf '%s: ' "$label" >&2
+  IFS= read -rs SECRET
+  printf '\n' >&2
+  return 0
+}
+
+# The one way a secret is collected for a profile, whichever side called.
+collect_secret() {
+  local name=$1
+  SECRET=""
+  if [[ -t 0 ]]; then
+    has_password "$name" || return 0
+    prompt_secret "Password for $name (empty to authorise as the owner)"
+    return 0
+  fi
+  read_secret
+}
+
+# ------------------------------------------------------------- the helpers
+#
+# Two of them, because the two halves answer to different people:
+#
+#   omarchy-profile-auth    allow_active, no dialog. Everything it does is
+#                           gated by the profile's own password, which is why
+#                           it needs no prompt of its own.
+#   omarchy-profile-passwd  auth_self. The owner's operations: create a
+#                           password, reset one, bind a face, purge.
+#
+# The secret is piped in with bash's builtin printf — never /usr/bin/printf,
+# never echo from a subshell, never a here-string, all of which would put it
+# somewhere another process can read.
+
+HELPER_OUT=""
+
+helper_call() {
+  local which=$1
+  shift
+  local bin rc
+  if [[ $which == owner ]]; then bin=$HELPER_PASSWD; else bin=$HELPER_AUTH; fi
+
+  if [[ ! -x $bin ]]; then
+    HELPER_OUT='{"error":"helper_unavailable"}'
+    return 1
+  fi
+  if ! command -v pkexec >/dev/null; then
+    HELPER_OUT='{"error":"helper_unavailable"}'
+    return 1
   fi
 
-  if [[ -n $identity ]]; then
-    if [[ ! -x /usr/local/bin/omarchy-face-identity ]]; then
-      # A bound identity with no way to check it. Normally that falls through to
-      # the owner, because refusing would strand the profile on a machine where
-      # the face plugin was removed.
-      #
-      # But with owner_override off, falling through is the one thing the
-      # setting exists to prevent: the owner's password would open a profile
-      # marked as opening only for somebody else. Removing the helper -- or
-      # simply making it unreachable -- must not be a way to downgrade that.
-      if [[ $owner_override == false ]]; then
-        warn "'$profile' opens only for '$identity', and the face tooling is missing"
-        warn "as it stands nothing opens it. To undo the binding, remove the"
-        warn "\"identity\" and \"owner_override\" keys from:"
-        warn "  $(file_for "$profile" | sed "s|^$HOME|~|")"
-        audit "unlock of $for_what REFUSED: identity '$identity' unverifiable and owner_override is off"
-        return 1
-      fi
-      warn "'$profile' is bound to the face '$identity', but omarchy-face-identity is not installed"
-      audit "unlock of $for_what: identity '$identity' unverifiable, face tooling missing"
-    elif ! /usr/local/bin/omarchy-face-identity list 2>/dev/null | grep -qx -- "$identity"; then
-      # Not "unrecognised" -- gone. The model was cleared, or the engine behind
-      # it was uninstalled, which is what omarchy-remove-security-face does:
-      # the helper stays in /usr/local/bin while howdy and every model leave.
-      # `verify` cannot tell that from a stranger at the camera, so without
-      # this the profile would answer "the camera did not recognise you"
-      # forever and the reason would never appear anywhere.
-      #
-      # Refused rather than waved through when owner_override is off, for the
-      # same reason a missing helper is: clearing a model must not be a way to
-      # downgrade --only. But it says what happened and how to undo it.
-      if [[ $owner_override == false ]]; then
-        warn "'$profile' opens only for '$identity', which is no longer enrolled"
-        warn "as it stands nothing opens it. To undo the binding, remove the"
-        warn "\"identity\" and \"owner_override\" keys from:"
-        warn "  $(file_for "$profile" | sed "s|^$HOME|~|")"
-        audit "unlock of $for_what REFUSED: identity '$identity' no longer enrolled and owner_override is off"
-        return 1
-      fi
-      warn "'$profile' is bound to the face '$identity', which is no longer enrolled"
-      audit "unlock of $for_what: identity '$identity' no longer enrolled, falling back to the owner check"
-    elif /usr/local/bin/omarchy-face-identity verify "$identity"; then
-      audit "unlock of $for_what succeeded: face matched identity '$identity'"
-      return 0
-    elif [[ $owner_override == false ]] && /usr/local/bin/omarchy-face-identity verify "$identity"; then
-      # One retry, and only on the path that has nowhere else to go. With
-      # owner_override off there is no password to fall back to, so a camera
-      # that simply did not see anyone would lock the owner out of their own
-      # profile -- and the check is silent, which means the first attempt is
-      # often spent before anyone thinks to look up. A second attempt costs a
-      # couple of seconds and proves nothing different about who is there:
-      # howdy keeps its own attempt limits underneath this.
-      audit "unlock of $for_what succeeded: face matched identity '$identity' on retry"
-      return 0
-    elif [[ $owner_override == false ]]; then
-      warn "this profile opens only for '$identity' — the camera did not recognise you"
-      audit "unlock of $for_what REFUSED: identity '$identity' not recognised and owner_override is off"
-      return 1
-    else
-      audit "unlock of $for_what: identity '$identity' not recognised, falling back to the owner check"
+  HELPER_OUT=$(printf '%s\n' "$HELPER_STDIN" | pkexec "$bin" "$@" 2>/dev/null)
+  rc=$?
+
+  # pkexec's own codes, which are not the helper's. 126 is a dismissed dialog
+  # and 127 is not authorised.
+  if ((rc == 126 || rc == 127)); then
+    if [[ $which == owner ]]; then
+      HELPER_OUT='{"error":"owner_declined"}'
+      return 2
     fi
+    # From the no-prompt helper these mean the action is missing or
+    # unannotated, so pkexec fell back to its generic admin action and there
+    # was nobody to answer it. That is never "wrong password".
+    HELPER_OUT='{"error":"helper_unavailable"}'
+    return 1
   fi
+  [[ -n $HELPER_OUT ]] || HELPER_OUT=$(jq -nc --argjson c "$rc" '{error: "failed", code: $c}')
+  return $rc
+}
 
-  case $method in
-  polkit)
-    command -v pkcheck >/dev/null || {
-      warn "pkcheck is not available; set unlock.method to sudo or none"
-      audit "unlock of $for_what refused: pkcheck missing"
-      return 1
-    }
-    # pkcheck asks the question without running anything as root: this is an
-    # authorisation decision, not a privileged action, and it should not need
-    # to become one. The agent runs the polkit-1 PAM stack, so a face is tried
-    # first where omarchy-face has configured one, then the password.
-    local pkout
-    if pkout=$(pkcheck --action-id no.graveklar.profiles.unlock \
-               --process "$$" --allow-user-interaction 2>&1); then
-      audit "unlock of $for_what succeeded via polkit (polkit-1 stack: face, fingerprint or password)"
-      return 0
-    fi
-
-    # "not registered" is not a wrong password, and must not be treated as one.
-    #
-    # The action is declared by a file under /usr/share/polkit-1/actions, which
-    # install.sh puts there with sudo. A marketplace install copies the plugin
-    # and never runs install.sh, so on that path the action is simply absent --
-    # and polkit says so rather than asking anything. Counting that as a failed
-    # authentication would leave every locked profile permanently unenterable,
-    # while telling the user their password was wrong.
-    if [[ $pkout == *"not registered"* ]]; then
-      audit "unlock of $for_what: polkit action not registered"
-      warn "the polkit action is not installed, so the password check cannot run"
-      warn "install it with:"
-      warn "  sudo install -m 0644 $PLUGIN_DIR/polkit/no.graveklar.profiles.policy \\"
-      warn "    /usr/share/polkit-1/actions/"
-      # sudo can stand in, but only where there is somewhere to type. From the
-      # bar there is not, and a silent hang would be worse than a clear refusal.
-      if [[ -t 0 ]] && command -v sudo >/dev/null; then
-        warn "falling back to your password for this one switch"
-        sudo -k >/dev/null 2>&1
-        if sudo -v; then
-          audit "unlock of $for_what succeeded via sudo (polkit action missing)"
-          return 0
-        fi
-      fi
-      return 1
-    fi
-
-    audit "unlock of $for_what failed via polkit"
-    return 1 ;;
-  none)
-    audit "unlock of $for_what allowed without a check (unlock.method=none)"
-    return 0 ;;
-  sudo)
-    command -v sudo >/dev/null || {
-      warn "sudo is not available; set unlock.method to none"
-      audit "unlock of $for_what refused: sudo missing"
-      return 1
-    }
-    # -k so a cached timestamp cannot stand in for a real prompt.
-    sudo -k >/dev/null 2>&1
-    if sudo -v; then
-      audit "unlock of $for_what succeeded via PAM (sudo stack: face, fingerprint or password)"
-      return 0
-    fi
-    audit "unlock of $for_what FAILED via PAM"
-    return 1 ;;
-  *)
-    warn "unknown unlock.method '$method'"
-    audit "unlock of $for_what refused: unknown unlock.method '$method'"
-    return 1 ;;
+# The same refusal said to a person. The panel renders the error code itself;
+# this is for a terminal.
+auth_message() {
+  case $1 in
+  needs_password) echo "that profile asks for its password" ;;
+  bad_password) echo "wrong password" ;;
+  rate_limited) echo "too many attempts — wait ${2:-a while} seconds and try again" ;;
+  owner_declined) echo "not authorised" ;;
+  no_password) echo "that profile has no password" ;;
+  empty_password) echo "a password is required" ;;
+  helper_unavailable) echo "the password helpers are not installed yet — open Setup" ;;
+  busy) echo "the profile is busy — try again in a moment" ;;
+  stale_password) echo "a password is still stored under that name" ;;
+  *) echo "the password check failed ($1)" ;;
   esac
 }
 
-# Bind a named face to a profile, so that face opens it without the owner
-# having to authorise. The face itself is enrolled by omarchy-face; this only
-# records which one this profile answers to.
-#
-# Deliberately gated the same way unlocking is: choosing who else may enter a
-# profile is at least as consequential as entering it, and an ungated version
-# would let anyone at the keyboard point a locked profile at their own face.
-cmd_identity() {
-  local name=${1:-} identity=${2:-} only=""
-  [[ ${3:-} == --only ]] && only=1
-  [[ -n $name ]] || die "usage: omarchy-profile identity <profile> <identity|none> [--only]"
-  exists "$name" || die "no such profile '$name'"
-
-  if [[ -z $identity ]]; then
-    jq -r '.identity // "none"' "$(file_for "$name")"
-    return 0
-  fi
-
-  if [[ -t 0 ]] || ! auth_needs_terminal; then
-    authenticate "the face bound to $name" "$name" ||
-      die "authentication failed — '$name' is unchanged"
-  else
-    # --only must survive the hop. Dropping it would set the binding and leave
-    # owner_override ON, which looks like success and is the opposite of what
-    # was asked for -- the one failure mode this flag cannot have.
-    relaunch_in_terminal identity "$name" "$identity" ${only:+--only}
-    return 0
-  fi
-
-  local tmp file
-  file=$(file_for "$name")
-  tmp=$(mktemp)
-
-  if [[ $identity == none ]]; then
-    # owner_override goes back to its default too: leaving it off with no
-    # identity bound would leave a profile nothing could open.
-    jq 'del(.identity) | del(.owner_override)' "$file" >"$tmp" && mv "$tmp" "$file"
-    audit "identity cleared on $name"
-    echo "$name no longer answers to a face of its own"
-    return 0
-  fi
-
-  [[ -x /usr/local/bin/omarchy-face-identity ]] ||
-    die "omarchy-face is not installed, so named faces cannot be verified"
-
-  # Refuse to point a profile at a face that was never enrolled: the profile
-  # would look configured and silently never open for anyone but the owner.
-  if ! /usr/local/bin/omarchy-face-identity list | grep -qx -- "$identity"; then
-    rm -f "$tmp"
-    die "no face enrolled as '$identity' — enrol it first with omarchy-face"
-  fi
-
-  # An identity is only ever consulted by the lock: `set` authenticates a
-  # profile that asks to be authenticated, and walks straight into one that does
-  # not. Binding a face to an unlocked profile therefore protects nothing, while
-  # printing a message that says it does -- so the binding brings the lock with
-  # it, and says so rather than leaving a profile that only looks guarded.
-  local was_locked=0
-  profile_locked "$name" && was_locked=1
-
-  jq --arg i "$identity" --argjson override "$([[ -n $only ]] && echo false || echo true)" \
-    '.identity = $i | .owner_override = $override | .locked = true' "$file" >"$tmp" && mv "$tmp" "$file"
-  write_index
-
-  if ((!was_locked)); then
-    audit "locked $name (an identity is only consulted at the lock)"
-    echo "Locked '$name' too — a bound face is only consulted when the profile asks"
-    echo "for authentication, so on an unlocked profile the binding would do nothing."
-    echo
-  fi
-
-  if [[ -n $only ]]; then
-    audit "identity '$identity' bound to $name, owner override OFF"
-    cat <<EOF
-$name now opens only for the face enrolled as '$identity'.
-Your own password will not open it.
-
-Read this before relying on it. $(file_for "$name" | sed "s|^$HOME|~|") is writable
-by whoever owns this machine, so anyone who can edit it can turn this back on,
-or clear the binding, or read the profile's files directly without entering it
-at all. As a courtesy between people sharing a laptop it holds. As a boundary
-it does not, and nothing kept in ~/.config could.
-
-For a part of the profile that a password genuinely cannot reach:
-
-  omarchy-profile vault init $name
-
-The vault's key comes from its passphrase, so it is not a rule anybody can edit
-— without the passphrase the contents are ciphertext to every account on the
-machine, root included.
-EOF
-  else
-    audit "identity '$identity' bound to $name"
-    echo "$name now also opens for the face enrolled as '$identity'"
-    echo "(your own password still opens it too — use --only to change that)"
-  fi
+# Call a helper and, on refusal, hand its verdict straight on: the helper's
+# JSON is the contract's JSON, so nothing is reworded on the way out.
+helper_or_refuse() {
+  helper_call "$@"
+  local rc=$?
+  ((rc == 0)) && return 0
+  local out=$HELPER_OUT err retry
+  err=$(jq -r '.error // "failed"' <<<"$out" 2>/dev/null) || err=failed
+  retry=$(jq -r '.retry_after // ""' <<<"$out" 2>/dev/null)
+  [[ -n $JSON ]] && printf '%s\n' "$out"
+  warn "$(auth_message "$err" "$retry")"
+  clear_secrets
+  exit "$rc"
 }
 
-cmd_lock() {
-  local verb=$1 name=${2:-}
-  [[ -n $name ]] || die "usage: omarchy-profile $verb <name>"
-  exists "$name" || die "no such profile '$name'"
-  local want=true; [[ $verb == unlock ]] && want=false
+# ------------------------------------------------------- entering a profile
 
-  # Removing the lock proves you could get in, so it needs the same gate as
-  # entering would. Otherwise the lock is a label anyone can peel off.
-  if [[ $verb == unlock ]]; then
-    if [[ -t 0 ]] || ! auth_needs_terminal; then
-      authenticate "the lock on $name" "$name" || die "authentication failed — '$name' stays locked"
-    else
-      relaunch_in_terminal unlock "$name"
+# The pid, its start time and the uid — not the bare pid, which is racy: a pid
+# can be recycled between the check and the decision. Field 22 of
+# /proc/<pid>/stat, read after the LAST ')', so a process whose comm contains a
+# space or a bracket cannot shift the field index.
+proc_start_time() {
+  local stat rest
+  stat=$(</proc/$$/stat) || return 1
+  rest=${stat##*") "}
+  # Deliberate word splitting: everything after the comm is numeric fields.
+  # shellcheck disable=SC2206
+  local -a f=($rest)
+  printf '%s\n' "${f[19]}"
+}
+
+# Who may enter this profile, decided before anything is locked or written.
+#
+# Called by `set` stage 1 with the secret already collected. Returns 0 to let
+# the switch proceed, or exits 2 with the contract's verdict.
+#
+# `face` is deliberately a global: stage 1's TERM trap kills it, which is what
+# makes the panel's "stop looking for a face, I am typing" instant.
+face=""
+
+auth_entry() {
+  local name=$1
+
+  if has_password "$name"; then
+    if [[ -n $SECRET ]]; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth verify "$name"
+      clear_secrets
+      audit "entered $name by password"
       return 0
     fi
+
+    # Empty stdin with a bound face is the shortcut: try the face, and say
+    # `needs_password` if it does not answer. Nothing was guessed, so the
+    # counter is untouched either way.
+    local id fbin
+    id=$(bound_identity "$name") || id=""
+    fbin=$(face_identity 2>/dev/null) || fbin=""
+    if [[ -n $id && -n $fbin && -x $fbin ]]; then
+      # Background and `wait`, never foreground: bash defers a TERM trap until
+      # a FOREGROUND child exits, which measured 3011 ms against 307 ms. The
+      # trap kills $face, so a typed password cancels the camera immediately.
+      timeout 12 "$fbin" verify "$id" >/dev/null 2>&1 &
+      face=$!
+      if wait "$face"; then
+        face=""
+        audit "entered $name by bound face '$id'"
+        return 0
+      fi
+      face=""
+    fi
+    refuse 2 needs_password "'$name' asks for its password"
   fi
 
-  local tmp; tmp=$(mktemp)
-  jq --argjson l "$want" '.locked = $l' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
-  write_index
-  [[ $want == true ]] && echo "$name now asks for authentication" || echo "$name no longer asks"
+  if profile_locked "$name"; then
+    # Locked from before passwords existed: there is no profile password to
+    # type, so the owner answers. pkcheck asks polkit for a decision without
+    # running anything as root — an authorisation question, not a privileged
+    # action, and it should not have to become one.
+    command -v pkcheck >/dev/null ||
+      refuse 1 helper_unavailable "pkcheck is not available, so the owner cannot be asked"
+    local start
+    start=$(proc_start_time)
+    if pkcheck --action-id no.graveklar.profiles.owner \
+         --process "$$,${start:-0},$UID" --allow-user-interaction >/dev/null 2>&1; then
+      audit "entered $name by owner authorisation (locked without a password)"
+      return 0
+    fi
+    refuse 2 owner_declined "not authorised — '$name' is locked without a password of its own"
+  fi
+
+  return 0
 }
 
-# The panel runs this script through the bar with no terminal attached, so a
-# password prompt has nowhere to appear. Hand the same command to a floating
-# themed terminal, which has a tty, and let that copy do the work.
-#
-# Deliberately NOT omarchy-launch-floating-terminal-with-presentation: that
-# wrapper ends with omarchy-show-done, which waits for a keypress. It is right
-# for an installer whose output you want to read, and wrong here — a profile
-# switch that succeeds should leave nothing behind to dismiss, especially when
-# a face unlocks it in a second and there was never anything to read.
-#
-# So: close on success, and linger only on failure, where there is an error
-# worth reading.
-relaunch_in_terminal() {
-  local self="${BASH_SOURCE[0]}" cmd
-  printf -v cmd '%q ' "$self" "$@" 2>/dev/null || cmd="$self $*"
-  local script="$cmd || { printf '\\n'; read -rsn1 -p 'Failed. Press any key to close...'; }"
+# ------------------------------------------------------ managing a password
 
-  if command -v xdg-terminal-exec >/dev/null; then
-    # The app-id is what Omarchy's window rules float and centre.
-    setsid uwsm-app -- xdg-terminal-exec \
-      --app-id=org.omarchy.terminal --title=Omarchy \
-      -e bash -c "$script" >/dev/null 2>&1
-  elif command -v omarchy-launch-floating-terminal-with-presentation >/dev/null; then
-    omarchy-launch-floating-terminal-with-presentation "$cmd" >/dev/null 2>&1
-  else
-    warn "no terminal available to ask for authentication"
+# `locked` in the profile JSON is belt and braces, not the gate: a hash lost or
+# orphaned by a failed rename fails closed to the owner rather than open. It is
+# written after the helper has succeeded, never before.
+set_locked() {
+  local name=$1 want=$2 file tmp
+  file=$(file_for "$name")
+  [[ -f $file ]] || return 0
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  jq --argjson l "$want" '.locked = $l' "$file" >"$tmp" && mv "$tmp" "$file" || {
+    rm -f "$tmp"
+    warn "could not record the lock state of '$name' — it stays as it was"
     return 1
-  fi
+  }
+}
+
+# What an older version of this plugin left in a profile's JSON.
+#
+# The `identity` key is deleted rather than copied into the root store: copying
+# a user-writable value into root storage would launder exactly the edit the
+# root store exists to prevent — anyone who could type a face name into a JSON
+# file would get it blessed as a root-side binding. So the binding is dropped
+# and the `locks` row asks for it to be made again, by the owner. Its dead
+# companion `owner_override` goes with it: the setting it modified is gone.
+migrate_profiles() {
+  local n file tmp changed=0
+  while read -r n; do
+    [[ -n $n ]] || continue
+    file=$(file_for "$n")
+    jq -e 'has("identity") or has("owner_override")' "$file" >/dev/null 2>&1 || continue
+    tmp=$(mktemp "$file.XXXXXX") || continue
+    if jq 'del(.identity) | del(.owner_override)' "$file" >"$tmp" && mv "$tmp" "$file"; then
+      changed=$((changed + 1))
+      audit "migration: dropped the editable face binding on $n"
+    else
+      rm -f "$tmp"
+      warn "could not migrate '$n'"
+    fi
+  done < <(profile_names)
+  ((changed > 0)) && echo "migrated $changed profile(s) off the old face binding"
+  return 0
+}
+
+# Names this machine has given a password to.
+#
+# passwords/ is 0711 on purpose, so nothing unprivileged can list it: the modes
+# are what make `hasPassword` answerable without being able to read a hash. The
+# cost is that a hash under a name nothing else remembers is invisible, so the
+# names are also written down here as a hint — not as truth. Nothing is gated
+# on this file; it only gives the `stale-hashes` row somewhere to look, and
+# every name it offers is checked against the root store and against the
+# profile directory before it is shown, let alone acted on.
+PASSWORD_NAMES="$STATE_DIR/password-names"
+
+note_password_name() {
+  mkdir -p "$STATE_DIR" 2>/dev/null
+  grep -qxF -- "$1" "$PASSWORD_NAMES" 2>/dev/null && return 0
+  printf '%s\n' "$1" >>"$PASSWORD_NAMES" 2>/dev/null || true
+}
+
+cmd_password() {
+  local verb="" name="" a
+  for a in "$@"; do
+    case $a in
+    --json) JSON=1 ;;
+    -*) die "unknown option '$a'" ;;
+    *) if [[ -z $verb ]]; then verb=$a; elif [[ -z $name ]]; then name=$a; fi ;;
+    esac
+  done
+  [[ -n $verb ]] || die "usage: omarchy-profile password <set|change|clear|reset|status> <name>"
+  [[ -n $name ]] || die "usage: omarchy-profile password $verb <name>"
+  exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
+
+  case $verb in
+  status)
+    answer "$(jq -nc --arg s "$(password_status "$name")" '{status: $s}')" "$(password_status "$name")" ;;
+
+  set | reset)
+    # The owner authorises; the new password itself is typed by whoever will be
+    # using the profile, and travels on stdin like every other secret.
+    if [[ -t 0 ]]; then prompt_secret "New password for $name"; else read_secret; fi
+    [[ -n $SECRET ]] || refuse 1 empty_password "a password is required"
+    HELPER_STDIN=$SECRET
+    helper_or_refuse owner "$verb" "$name"
+    clear_secrets
+    note_password_name "$name"
+    set_locked "$name" true
+    write_index
+    audit "password $verb on $name"
+    answer '{"ok":true}' "'$name' now asks for its password" ;;
+
+  change)
+    if [[ -t 0 ]]; then
+      prompt_secret "Current password for $name"; OLD_SECRET=$SECRET
+      prompt_secret "New password for $name"; NEW_SECRET=$SECRET
+      SECRET=""
+    else
+      read_secret_pair
+    fi
+    [[ -n $NEW_SECRET ]] || refuse 1 empty_password "a new password is required"
+    HELPER_STDIN="$OLD_SECRET"$'\n'"$NEW_SECRET"
+    helper_or_refuse auth change "$name"
+    clear_secrets
+    note_password_name "$name"
+    set_locked "$name" true
+    write_index
+    audit "password changed on $name"
+    answer '{"ok":true}' "the password for '$name' was changed" ;;
+
+  clear)
+    collect_secret "$name"
+    if [[ -n $SECRET ]]; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth clear "$name"
+    else
+      HELPER_STDIN=""
+      helper_or_refuse owner clear "$name"
+    fi
+    clear_secrets
+    # Only once the helper has succeeded, and on EVERY clear path: otherwise
+    # "remove password" would leave the profile locked_no_password, asking for
+    # the owner on every entry — which is not what the button says.
+    set_locked "$name" false
+    write_index
+    audit "password cleared on $name"
+    answer '{"ok":true}' "'$name' no longer asks for a password" ;;
+
+  *) die "unknown password verb '$verb' (set, change, clear, reset, status)" ;;
+  esac
+}
+
+# Which face opens which profile. The binding itself is root-side; this only
+# asks the owner helper to write it.
+cmd_identity() {
+  local verb="" name="" identity="" a
+  for a in "$@"; do
+    case $a in
+    --json) JSON=1 ;;
+    -*) die "unknown option '$a'" ;;
+    *)
+      if [[ -z $verb ]]; then verb=$a
+      elif [[ -z $name ]]; then name=$a
+      elif [[ -z $identity ]]; then identity=$a; fi ;;
+    esac
+  done
+
+  case ${verb:-list} in
+  list)
+    local fbin names='[]' installed=false
+    fbin=$(face_identity 2>/dev/null) || fbin=""
+    if [[ -n $fbin && -x $fbin ]]; then
+      installed=true
+      names=$("$fbin" list 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))') || names='[]'
+    fi
+    answer "$(jq -nc --argjson i "$installed" --argjson n "${names:-[]}" '{installed: $i, names: $n}')" \
+           "$(printf '%s\n' "${names}" | jq -r '.[]' 2>/dev/null)" ;;
+
+  bind)
+    [[ -n $name && -n $identity ]] || die "usage: omarchy-profile identity bind <profile> <identity>"
+    exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
+    [[ $identity =~ ^[a-z0-9_-]{1,32}$ ]] || refuse 1 bad_identity "'$identity' is not a face name"
+    # Refuse to point a profile at a face that was never enrolled: it would
+    # look configured and silently never open for anybody.
+    local fbin
+    fbin=$(face_identity 2>/dev/null) || fbin=""
+    [[ -n $fbin && -x $fbin ]] || refuse 1 face_absent "omarchy-face is not installed, so a face cannot be bound"
+    "$fbin" list 2>/dev/null | grep -qx -- "$identity" ||
+      refuse 1 no_such_identity "no face enrolled as '$identity' — enrol it in Face Unlock first"
+    HELPER_STDIN=""
+    helper_or_refuse owner bind "$name" "$identity"
+    write_index
+    audit "identity '$identity' bound to $name"
+    answer '{"ok":true}' "$name also opens for the face enrolled as '$identity'" ;;
+
+  clear)
+    [[ -n $name ]] || die "usage: omarchy-profile identity clear <profile>"
+    exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
+    HELPER_STDIN=""
+    helper_or_refuse owner unbind "$name"
+    write_index
+    audit "identity cleared on $name"
+    answer '{"ok":true}' "$name no longer opens for a face of its own" ;;
+
+  *) die "usage: omarchy-profile identity <list|bind|clear> ..." ;;
+  esac
 }
 
 # --------------------------------------------------------------- isolation
@@ -811,7 +967,7 @@ capture_into() {
   disabled=$(jq -c '.disabledPlugins // []' "$SHELL_JSON" 2>/dev/null)
 
   local tmp
-  tmp=$(mktemp) || return 1
+  tmp=$(mktemp "$file.XXXXXX") || return 1
   jq \
     --arg theme "$theme" \
     --argjson dnd "$dnd" \
@@ -834,32 +990,47 @@ capture_into() {
 # both slow and racy. One JSON file it can FileView, rewritten by whichever
 # command changed the set, keeps the UI declarative and means the panel has no
 # opinion about where profiles live or what a profile is.
+index_json() {
+  local master cur
+  master=$(cfg .master)
+  cur=$(current_profile)
+  printf '['
+  local first=1 n
+  while read -r n; do
+    [[ -n $n ]] || continue
+    ((first)) || printf ','
+    first=0
+    # hasPassword and identity come from the root store, never from the profile
+    # JSON: both are the facts a user must not be able to edit, and a derived
+    # copy here is for rendering only. `locked` is still the JSON's, because
+    # without a hash it is the migration state the `locks` row reports.
+    jq -c --arg name "$n" \
+       --argjson is_master "$([[ $n == "$master" ]] && echo true || echo false)" \
+       --argjson active "$([[ $n == "$cur" ]] && echo true || echo false)" \
+       --argjson has_password "$(has_password "$n" && echo true || echo false)" \
+       --arg identity "$(bound_identity "$n" || true)" '{
+      name: $name,
+      label: $name,
+      description: (._description // ""),
+      master: $is_master,
+      active: $active,
+      hidden: (.hidden // false),
+      locked: (.locked // false),
+      hasPassword: $has_password,
+      identity: $identity,
+      theme: (.theme // ""),
+      icon: (.icon // ""),
+      offset: (.workspaces.offset // 0)
+    }' "$(file_for "$n")"
+  done < <(profile_names)
+  printf ']'
+}
+
 write_index() {
   mkdir -p "$STATE_DIR"
-  local master tmp
-  master=$(cfg .master)
+  local tmp
   tmp=$(mktemp "$STATE_DIR/profiles.json.XXXXXX") || return 1
-  {
-    printf '['
-    local first=1
-    while read -r n; do
-      [[ -n $n ]] || continue
-      ((first)) || printf ','
-      first=0
-      jq -c --arg name "$n" --argjson is_master "$([[ $n == "$master" ]] && echo true || echo false)" '{
-        name: $name,
-        description: (._description // ""),
-        master: $is_master,
-        hidden: (.hidden // false),
-        locked: (.locked // false),
-        identity: (.identity // ""),
-        theme: (.theme // ""),
-        icon: (.icon // ""),
-        offset: (.workspaces.offset // 0)
-      }' "$(file_for "$n")"
-    done < <(profile_names)
-    printf ']'
-  } >"$tmp" && mv "$tmp" "$STATE_DIR/profiles.json" || { rm -f "$tmp"; warn "could not write the profile index"; return 1; }
+  index_json >"$tmp" && mv "$tmp" "$STATE_DIR/profiles.json" || { rm -f "$tmp"; warn "could not write the profile index"; return 1; }
 }
 
 # The installable set, for the settings view's toggle lists.
@@ -1259,12 +1430,16 @@ write_state() {
      --argjson span "$(cfg .workspace_span)" --arg updated "$(date -Iseconds)" \
      '{profile: $profile, ws_offset: $ws_offset, ws_span: $span, updated: $updated}' \
      >"$tmp" && mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; return 1; }
-  cfg_set --arg last "$name" '.last = $last' || warn "could not record last profile"
 
   # Stamped on the profile itself, so the overview can say "not opened in three
   # weeks" — which is the signal that it is holding windows you have forgotten.
+  #
+  # In the profile's own directory, like every other write here: a bare mktemp
+  # lands on /tmp, which is a different filesystem, so the mv that follows is a
+  # copy rather than an atomic rename — and a half-written profile is exactly
+  # what the switch journal's recovery argument assumes cannot happen.
   local ptmp
-  ptmp=$(mktemp) || return 0
+  ptmp=$(mktemp "$(file_for "$name").XXXXXX") || return 0
   # UTC with a Z: jq's fromdateiso8601 rejects a +02:00 offset outright, and
   # the reader should not have to carry a timezone parser.
   jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '.last_used = $t' "$(file_for "$name")" >"$ptmp" &&
@@ -1935,19 +2110,19 @@ cmd_current() { local c; c=$(current_profile); [[ -n $c ]] && echo "$c" || echo 
 cmd_set() {
   # A switch cancelled before its commit point must leave nothing behind, so the
   # trap goes up before the first thing that could leave something. 143 is the
-  # code the panel drops in silence, having cancelled deliberately.
-  trap 'exit 143' TERM
+  # code the panel drops in silence, having cancelled deliberately — and the
+  # face attempt, if one is running, dies with it rather than a second later.
+  trap '[[ -n ${face:-} ]] && kill "$face" 2>/dev/null; exit 143' TERM
 
-  local name="" as_owner="" a
+  local name="" a
   for a in "$@"; do
     case $a in
     --json) JSON=1 ;;
-    --as-owner) as_owner=1 ;;
     -*) die "unknown option '$a'" ;;
     *) [[ -n $name ]] || name=$a ;;
     esac
   done
-  [[ -n $name ]] || die "usage: omarchy-profile set <name> [--json] [--as-owner]"
+  [[ -n $name ]] || die "usage: omarchy-profile set <name> [--json]"
 
   # Preflight, before anything is captured, swapped or written: a stale intent,
   # a path held by a failed swap, or a tier-3 path with nothing to seed from all
@@ -1977,33 +2152,15 @@ cmd_set() {
   # lock is taken — a prompt on screen must not make every other verb busy. A
   # failed unlock has to leave the machine exactly where it was, not half-way
   # into a profile it never opened.
-  if profile_locked "$name"; then
-    if [[ -t 0 ]] || ! auth_needs_terminal; then
-      # --as-owner skips the bound-identity attempt.
-      #
-      # The identity check runs the camera engine, which waits out its own
-      # timeout before failing — around nine seconds with the IR emitter
-      # warm-up. Without this the owner of the machine pays that wait, every
-      # time, before their own prompt even appears, on any profile that has
-      # somebody else's face bound to it.
-      #
-      # Racing the two would be better than choosing between them: start the
-      # identity check in the background, raise the prompt immediately, first
-      # success wins. That needs a per-call timeout and clean cancellation from
-      # omarchy-face, so this flag is the interim.
-      # Passing no profile is what suppresses the identity attempt, since
-      # authenticate() only looks for a bound identity when it is given one.
-      local auth_profile="$name"
-      [[ -n $as_owner ]] && auth_profile=""
-      # The error code is today's mechanism told truthfully: what answers here
-      # is the machine owner's prompt, and a refusal is the owner declining it.
-      # The per-profile password codes arrive with the password phase.
-      authenticate "$name" "$auth_profile" ||
-        refuse 2 owner_declined "authentication failed — staying in ${cur:-the current profile}"
-    else
-      relaunch_in_terminal set "$name"
-      return 0
-    fi
+  #
+  # The panel does not wait for a face before showing the field: it shows the
+  # field at once and runs an empty-stdin `set` beside it, then TERMs that one
+  # the moment something is typed. Both are this same code path; which secret
+  # arrived on stdin is the only difference.
+  if asks_auth "$name"; then
+    collect_secret "$name"
+    auth_entry "$name"
+    clear_secrets
   fi
 
   if ! take_state_lock; then
@@ -2043,8 +2200,17 @@ cmd_capture() {
 cmd_create() {
   local name=${1:-} mode=${2:---from-master}
   [[ -n $name ]] || die "usage: omarchy-profile create <name> [--from-master|--clean]"
-  [[ $name =~ ^[a-zA-Z0-9_-]+$ ]] || die "profile names may use letters, digits, - and _ only"
+  [[ $name =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || die "profile names may use letters, digits, - and _ only"
   exists "$name" && die "profile '$name' already exists"
+
+  # A hash or a binding left over from a profile of this name that no longer
+  # exists. Creating on top of it would hand the new profile a password nobody
+  # present knows, so it is refused and the `stale-hashes` Setup row clears it.
+  if has_password "$name" || [[ -e $ROOT_STORE/identity/$name ]]; then
+    refuse 1 stale_password \
+      "a password is still stored for a deleted profile called '$name' — clear it in Setup" \
+      "$(jq -nc --arg p "$name" '{profile: $p}')"
+  fi
 
   local offset master
   offset=$(next_offset); master=$(cfg .master)
@@ -2105,8 +2271,15 @@ cmd_create() {
 }
 
 cmd_remove() {
-  local name=${1:-}
-  [[ -n $name ]] || die "usage: omarchy-profile remove <name>"
+  local name="" a
+  for a in "$@"; do
+    case $a in
+    --json) JSON=1 ;;
+    -*) die "unknown option '$a'" ;;
+    *) [[ -n $name ]] || name=$a ;;
+    esac
+  done
+  [[ -n $name ]] || die "usage: omarchy-profile remove <name> [--json]"
   # It deletes a profile's stores, so it may not run beside a switch that is
   # moving files into them, nor while an unfinished switch still names one.
   require_no_journal
@@ -2114,6 +2287,30 @@ cmd_remove() {
   exists "$name" || die "no such profile '$name'"
   is_master "$name" && die "refusing to remove the master profile"
   [[ $name == "$(current_profile)" ]] && die "refusing to remove the active profile — switch away first"
+
+  # Authenticate FIRST, before a single window moves.
+  #
+  # The first version of this moved the windows and then asked, so a refused
+  # password still emptied the profile's block — the deletion was refused and
+  # the damage was done anyway. Nothing below runs unless the password (or the
+  # owner) has answered.
+  if has_password "$name" || [[ -e $ROOT_STORE/identity/$name ]]; then
+    collect_secret "$name"
+    if [[ -n $SECRET ]]; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth remove "$name"
+    else
+      HELPER_STDIN=""
+      helper_or_refuse owner remove "$name"
+    fi
+    clear_secrets
+    audit "root-side password and identity removed with $name"
+  elif profile_locked "$name"; then
+    # Locked with no hash: the owner is the only one who can answer, exactly as
+    # entering it would.
+    SECRET=""
+    auth_entry "$name"
+  fi
 
   # Its windows have to go somewhere.
   #
@@ -2162,14 +2359,107 @@ cmd_remove() {
   if [[ $(visible_names | wc -l) -eq 0 ]]; then
     local master; master=$(cfg .master)
     if exists "$master"; then
-      local tmp; tmp=$(mktemp)
+      local tmp; tmp=$(mktemp "$(file_for "$master").XXXXXX")
       jq '.hidden = false' "$(file_for "$master")" >"$tmp" && mv "$tmp" "$(file_for "$master")"
       echo "removed $name — $master is visible again, since nothing else was"
     fi
   else
     echo "removed $name"
   fi
+  # The session record goes with it, and so does anything it was owed.
+  rm -f "$STATE_DIR/sessions/$name.txt" 2>/dev/null
   write_index
+  [[ -n $JSON ]] && printf '{"ok":true}\n'
+  return 0
+}
+
+# Rename a profile, root-owned files first.
+#
+# The order is the whole design. If the root files move first and the rest
+# fails, <old> keeps "locked": true with no hash — it falls back to the owner,
+# closed rather than open — and the `stale-hashes` row shows <new>. The reverse
+# order would leave a profile with no hash under its own name, briefly and
+# silently open. That is why it is not used.
+cmd_rename() {
+  local old="" new="" a
+  for a in "$@"; do
+    case $a in
+    --json) JSON=1 ;;
+    -*) die "unknown option '$a'" ;;
+    *)
+      if [[ -z $old ]]; then old=$a
+      elif [[ -z $new ]]; then new=$a; fi ;;
+    esac
+  done
+  [[ -n $old && -n $new ]] || die "usage: omarchy-profile rename <old> <new> [--json]"
+
+  require_no_journal
+  lock_or_busy
+
+  exists "$old" || refuse 1 no_such_profile "no such profile '$old'"
+  [[ $new =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || refuse 1 bad_name "profile names may use letters, digits, - and _ only"
+  [[ $old == "$new" ]] && { answer '{"ok":true}' "'$old' already has that name"; return 0; }
+  exists "$new" && refuse 1 name_taken "a profile called '$new' already exists"
+  if has_password "$new" || [[ -e $ROOT_STORE/identity/$new ]]; then
+    refuse 1 stale_password \
+      "a password is still stored for a deleted profile called '$new' — clear it in Setup" \
+      "$(jq -nc --arg p "$new" '{profile: $p}')"
+  fi
+
+  # Step 2: the root files, before anything of ours moves.
+  if has_password "$old" || [[ -e $ROOT_STORE/identity/$old ]]; then
+    collect_secret "$old"
+    if [[ -n $SECRET ]]; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth rename "$old" "$new"
+    else
+      HELPER_STDIN=""
+      helper_or_refuse owner rename "$old" "$new"
+    fi
+    clear_secrets
+  fi
+
+  # Step 3: everything keyed by the name on this side. Every one of these is a
+  # record that would point at a profile that no longer exists if it were
+  # missed.
+  mv -n "$(file_for "$old")" "$(file_for "$new")" ||
+    refuse 1 rename_failed "could not rename the profile file — the password moved to '$new' and '$old' now asks the owner"
+
+  [[ -d $ISOLATE_DIR/$old ]] && mv -n "$ISOLATE_DIR/$old" "$ISOLATE_DIR/$new"
+  [[ -f $STATE_DIR/sessions/$old.txt ]] && mv -n "$STATE_DIR/sessions/$old.txt" "$STATE_DIR/sessions/$new.txt"
+
+  # The master is named in config.json, not in the profile file: a renamed
+  # master that was not followed here would leave the machine with no master at
+  # all, which is the one profile everything else falls back to.
+  [[ $(cfg .master) == "$old" ]] && cfg_set --arg n "$new" '.master = $n'
+
+  if [[ $(current_profile) == "$old" ]]; then
+    local tmp
+    tmp=$(mktemp "$STATE_FILE.XXXXXX") &&
+      jq --arg n "$new" '.profile = $n' "$STATE_FILE" >"$tmp" &&
+      mv "$tmp" "$STATE_FILE" || { rm -f "$tmp"; warn "could not update current.json"; }
+  fi
+
+  local errors="$STATE_DIR/hypr-errors.json"
+  if [[ -s $errors ]] && jq -e --arg o "$old" 'has($o)' "$errors" >/dev/null 2>&1; then
+    local etmp
+    etmp=$(mktemp "$errors.XXXXXX") &&
+      jq --arg o "$old" --arg n "$new" '.[$n] = .[$o] | del(.[$o])' "$errors" >"$etmp" &&
+      mv "$etmp" "$errors" || { rm -f "$etmp"; warn "could not update hypr-errors.json"; }
+  fi
+
+  if [[ -s $PENDING_OWNER ]]; then
+    local ptmp
+    ptmp=$(mktemp "$PENDING_OWNER.XXXXXX") &&
+      awk -F'\t' -v o="$old" -v n="$new" 'BEGIN{OFS="\t"} {if ($2 == o) $2 = n; print}' "$PENDING_OWNER" >"$ptmp" &&
+      mv "$ptmp" "$PENDING_OWNER" || { rm -f "$ptmp"; warn "could not update the held-path record"; }
+  fi
+
+  note_password_name "$new"
+  write_index
+  write_catalog
+  audit "renamed $old to $new"
+  answer "$(jq -nc --arg n "$new" '{ok: true, name: $n}')" "renamed $old to $new"
 }
 
 # Profiles the picker will offer.
@@ -2195,7 +2485,7 @@ cmd_visibility() {
   fi
 
   local hidden=true; [[ $verb == show ]] && hidden=false
-  local tmp; tmp=$(mktemp)
+  local tmp; tmp=$(mktemp "$(file_for "$name").XXXXXX")
   jq --argjson h "$hidden" '.hidden = $h' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
   write_index
   [[ $verb == show ]] && echo "$name now shows in the picker" || echo "$name is now hidden from the picker"
@@ -2266,7 +2556,7 @@ cmd_apps() {
     apps_preview_json "$name" ;;
   allow-all | deny-all)
     is_master "$name" && { echo "master already sees every application"; return 0; }
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "$file.XXXXXX")
     if [[ $verb == deny-all ]]; then
       jq '.apps = ((.apps // {}) | .allowed = [])' "$file" >"$tmp"
     else
@@ -2284,7 +2574,7 @@ cmd_apps() {
   allow | deny)
     [[ -n $app ]] || die "usage: omarchy-profile apps $name $verb <app-id>"
     is_master "$name" && { echo "master already sees every application"; return 0; }
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "$file.XXXXXX")
     if [[ $verb == allow ]]; then
       jq --arg a "$app" '.apps = ((.apps // {}) | .allowed = (((.allowed // []) + [$a]) | unique))' "$file" >"$tmp"
     else
@@ -2335,7 +2625,7 @@ cmd_plugin() {
             else "Other" end) == $cat)
         | .id')
     [[ -n $ids ]] || { echo "nothing to change"; return 0; }
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "$file.XXXXXX")
     if [[ $verb == disable-all ]]; then
       jq --argjson add "$(printf '%s\n' "$ids" | jq -R . | jq -sc .)" \
         '.plugins = ((.plugins // {}) | .disabled = (((.disabled // []) + $add) | unique))' "$file" >"$tmp"
@@ -2358,7 +2648,7 @@ cmd_plugin() {
     if [[ $verb == disable ]] && cfg '.pinned_plugins // []' | jq -e --arg i "$id" 'index($i)' >/dev/null 2>&1; then
       die "'$id' is pinned and cannot be disabled — disabling it would leave no way back into another profile"
     fi
-    local tmp; tmp=$(mktemp)
+    local tmp; tmp=$(mktemp "$file.XXXXXX")
     if [[ $verb == disable ]]; then
       jq --arg i "$id" '.plugins = ((.plugins // {}) | .disabled = (((.disabled // []) + [$i]) | unique))' "$file" >"$tmp"
     else
@@ -2464,10 +2754,26 @@ cmd_move() {
 cmd_next() {
   local cur next first
   cur=$(current_profile)
-  first=$(profile_names | head -1)
-  [[ -n $first ]] || die "no profiles yet"
-  next=$(profile_names | awk -v c="$cur" 'found { print; exit } $0 == c { found = 1 }')
+  # VISIBLE profiles only. A hidden profile is one the user took out of the
+  # picker; landing on it from a keybinding is the same surprise by another
+  # route.
+  first=$(visible_names | head -1)
+  [[ -n $first ]] || die "no profiles in the picker"
+  next=$(visible_names | awk -v c="$cur" 'found { print; exit } $0 == c { found = 1 }')
   [[ -n $next ]] || next=$first
+  [[ $next == "$cur" ]] && return 0
+
+  # A keybinding has nowhere to type. If the next profile asks for anything,
+  # hand it to the panel, which has a field, and stop here — switching would
+  # otherwise sit on an invisible prompt with no way to answer it.
+  if asks_auth "$next"; then
+    if command -v omarchy-shell >/dev/null &&
+       omarchy-shell graveklar.profiles promptUnlock "$next" >/dev/null 2>&1; then
+      return 0
+    fi
+    warn "'$next' asks for a password and there is no panel to ask in"
+    return 1
+  fi
   cmd_set "$next"
 }
 
@@ -2490,26 +2796,6 @@ cmd_init() {
   write_catalog
   write_state "$master"
   echo "initialised master profile '$master' from the current machine"
-  check_polkit_action
-}
-
-# Locking a profile depends on a polkit action declared system-wide, and
-# `omarchy plugin add` cannot put a file in /usr/share -- so on a fresh install
-# from the marketplace the action is missing. Nothing notices until somebody
-# locks a profile and then cannot get back into it, which is far too late and
-# looks like the lock is broken rather than unconfigured. Say it once, here,
-# while the fix is still cheap.
-check_polkit_action() {
-  command -v pkcheck >/dev/null || return 0
-  local out
-  out=$(pkcheck --action-id no.graveklar.profiles.unlock --process "$$" 2>&1)
-  [[ $out == *"not registered"* ]] || return 0
-  echo
-  warn "profile locks will not work yet: the polkit action is not installed."
-  warn "one command, once:"
-  warn "  sudo install -m 0644 $PLUGIN_DIR/polkit/no.graveklar.profiles.policy \\"
-  warn "    /usr/share/polkit-1/actions/"
-  warn "Everything else works without it."
 }
 
 # ------------------------------------------------------------------- setup
@@ -2990,6 +3276,267 @@ file_held_paths() {
   return 0
 }
 
+# ------------------------------------------------- rows: helpers and polkit
+#
+# `omarchy plugin add --enable` clones files and enables the plugin. It installs
+# nothing under /usr/local/bin and registers no polkit action, so the two
+# privileged pieces this phase depends on are missing on a fresh install. These
+# two rows close that gap from the panel, with one dialog between them.
+
+# The script the owner authorises, fixed and embedded here rather than a path
+# passed to a shell: what runs as root is this text, whatever else is on disk.
+#
+# It runs under polkit's generic exec action (auth_admin), because the annotated
+# actions it is installing do not exist yet at that point — a real chicken and
+# egg, and the reason this one call is not covered by our own policy. What that
+# authorisation trusts is the plugin directory: it installs whatever
+# bin/omarchy-profile-auth contains at that moment, which is the trust model of
+# every install from a user checkout. Hence: only offered when `helpers` is not
+# already ok, and later drift is reported as broken rather than reinstalled.
+SYSTEM_INSTALL='
+set -euo pipefail
+umask 022
+plugin=${1:?no plugin directory}
+for h in omarchy-profile-auth omarchy-profile-passwd; do
+  [ -f "$plugin/bin/$h" ] || { echo "missing $plugin/bin/$h" >&2; exit 1; }
+  install -o root -g root -m 0755 "$plugin/bin/$h" "/usr/local/bin/$h"
+done
+policy=$plugin/polkit/no.graveklar.profiles.policy
+[ -f "$policy" ] || { echo "missing $policy" >&2; exit 1; }
+install -o root -g root -m 0644 "$policy" /usr/share/polkit-1/actions/no.graveklar.profiles.policy
+rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
+install -d -o root -g root -m 0711 /var/lib/omarchy-profiles
+install -d -o root -g root -m 0711 /var/lib/omarchy-profiles/passwords
+install -d -o root -g root -m 0755 /var/lib/omarchy-profiles/identity
+install -d -o root -g root -m 0700 /var/lib/omarchy-profiles/attempts
+[ -e /var/lib/omarchy-profiles/log ] || : >/var/lib/omarchy-profiles/log
+chown root:root /var/lib/omarchy-profiles/log
+chmod 0640 /var/lib/omarchy-profiles/log
+echo installed
+'
+
+system_install() {
+  command -v pkexec >/dev/null || die "pkexec is not available, so this cannot be installed"
+  [[ -f $PLUGIN_DIR/bin/omarchy-profile-auth && -f $PLUGIN_DIR/bin/omarchy-profile-passwd ]] ||
+    die "this copy of the plugin has no helpers in bin/ to install"
+  local out rc
+  out=$(pkexec /bin/bash -c "$SYSTEM_INSTALL" install-system "$PLUGIN_DIR" 2>&1)
+  rc=$?
+  if ((rc == 126 || rc == 127)); then
+    refuse 2 owner_declined "the install was not authorised — nothing was changed"
+  fi
+  if ((rc != 0)); then
+    [[ -n $out ]] && warn "$out"
+    refuse 1 install_failed "the privileged install did not finish"
+  fi
+  # polkit reads the actions directory itself; nothing to reload. The helper
+  # binaries are in place from the moment install(1) returns.
+  echo "installed the password helpers and the polkit actions"
+}
+
+# 1 missing, 2 wrong owner or mode, 3 content drift.
+helper_state() {
+  local name=$1 f=/usr/local/bin/$1 src="$PLUGIN_DIR/bin/$1"
+  [[ -f $f ]] || return 1
+  [[ $(stat -c '%U %G %a' "$f" 2>/dev/null) == "root root 755" ]] || return 2
+  [[ -f $src ]] || return 0
+  cmp -s "$f" "$src" || return 3
+  return 0
+}
+
+# The store's modes are what make hasPassword computable without privilege
+# while a hash stays unreadable, so a wrong mode is not cosmetic.
+root_store_state() {
+  [[ -d $ROOT_STORE ]] || return 1
+  local want
+  for want in "$ROOT_STORE 711" "$ROOT_STORE/passwords 711" "$ROOT_STORE/identity 755" "$ROOT_STORE/attempts 700"; do
+    local dir=${want% *} mode=${want#* }
+    [[ -d $dir ]] || return 1
+    [[ $(stat -c '%U %a' "$dir" 2>/dev/null) == "root $mode" ]] || return 2
+  done
+  return 0
+}
+
+setup_row_helpers() {
+  local label="Password helpers" a p store
+  helper_state omarchy-profile-auth; a=$?
+  helper_state omarchy-profile-passwd; p=$?
+  root_store_state; store=$?
+
+  if ((a == 1 && p == 1 && store == 1)); then
+    setup_row helpers "$label" needs_action \
+      "Protecting a profile with a password needs two small programs installed outside your home directory, and a root-owned place to keep the password hashes. Nothing here can be read by a program running as you — that is the point of it. Fixing asks for your password once and installs both." true
+    return
+  fi
+  if ((a == 0 && p == 0 && store == 0)); then
+    setup_row helpers "$label" ok \
+      "Both helpers are installed and match this copy of the plugin, and the password store has the permissions it should." false
+    return
+  fi
+  local why=""
+  ((a == 1 || p == 1)) && why="one of the two helpers is missing"
+  ((a == 2 || p == 2)) && why="a helper is installed with the wrong owner or permissions"
+  ((a == 3 || p == 3)) && why="an installed helper no longer matches this copy of the plugin"
+  ((store == 1)) && why="${why:+$why, and }the password store is missing"
+  ((store == 2)) && why="${why:+$why, and }the password store has the wrong permissions"
+  setup_row helpers "$label" broken \
+    "Passwords cannot be checked as things stand: $why. Fixing reinstalls both helpers and the store from this copy of the plugin." true
+}
+
+# Does a face answer the OWNER prompt on this machine? 0 yes, 1 no, 2 cannot tell.
+face_answers_polkit() {
+  [[ -r /etc/pam.d/polkit-1 ]] || return 2
+  grep -q 'omarchy-face-verify' /etc/pam.d/polkit-1 2>/dev/null || return 1
+  local fc=/etc/omarchy-face/config
+  if [[ -e $fc ]]; then
+    [[ -r $fc ]] || return 2
+    # The gate honours this key; an absent file means its default, which is on.
+    grep -Eq '^[[:space:]]*polkit[[:space:]]*=[[:space:]]*(false|no|0)' "$fc" && return 1
+  fi
+  return 0
+}
+
+policy_annotated() {
+  command -v pkaction >/dev/null || return 2
+  pkaction --action-id no.graveklar.profiles.auth --verbose 2>/dev/null |
+    grep -q 'exec.path.*omarchy-profile-auth' || return 1
+  pkaction --action-id no.graveklar.profiles.owner --verbose 2>/dev/null |
+    grep -q 'exec.path.*omarchy-profile-passwd' || return 1
+  return 0
+}
+
+legacy_action_present() {
+  [[ -e $POLICY_LEGACY ]] && return 0
+  command -v pkaction >/dev/null || return 1
+  pkaction 2>/dev/null | grep -qx 'no.graveklar.profiles.unlock'
+}
+
+# Only ever run after the annotation has been seen, so a status query can never
+# be the thing that pops an admin dialog. Any of needs_password, no_password,
+# rate_limited or busy proves the helper ran without prompting.
+polkit_probe() {
+  [[ -x $HELPER_AUTH ]] || return 1
+  local out err
+  out=$(printf '' | timeout 15 pkexec "$HELPER_AUTH" verify "$(cfg .master)" 2>/dev/null)
+  err=$(jq -r '.error // ""' <<<"$out" 2>/dev/null) || err=""
+  case $err in
+  needs_password | no_password | rate_limited | busy) return 0 ;;
+  esac
+  return 1
+}
+
+setup_row_polkit() {
+  local label="Password permissions"
+
+  if [[ ! -e $POLICY_DEST ]]; then
+    setup_row polkit "$label" needs_action \
+      "The rules that say who may check a profile password are not registered yet. Fixing installs them together with the helpers — one password prompt for both." true
+    return
+  fi
+  if ! cmp -s "$POLICY_SRC" "$POLICY_DEST"; then
+    setup_row polkit "$label" broken \
+      "The registered rules are not the ones this copy of the plugin ships. Fixing installs the current ones." true
+    return
+  fi
+  if legacy_action_present; then
+    setup_row polkit "$label" broken \
+      "An old 'enter a locked profile' rule from before per-profile passwords is still registered. It gates nothing now and should not be left behind. Fixing removes it." true
+    return
+  fi
+  policy_annotated
+  local ann=$?
+  if ((ann == 2)); then
+    setup_row polkit "$label" unknown "pkaction is not available, so what polkit has registered cannot be read." false
+    return
+  fi
+  if ((ann == 1)); then
+    setup_row polkit "$label" broken \
+      "The rules are registered without the annotation that ties them to the helpers, so checking a profile password would ask for the machine password instead. Fixing reinstalls them." true
+    return
+  fi
+  if ! polkit_probe; then
+    setup_row polkit "$label" broken \
+      "The password checker did not answer when it was asked. Fixing reinstalls the helpers and the rules." true
+    return
+  fi
+
+  face_answers_polkit
+  local face=$?
+  if ((face == 2)); then
+    setup_row polkit "$label" unknown \
+      "Face Unlock's configuration could not be read, so whether a face can answer the owner's prompt is not something this can say." false
+    return
+  fi
+  if ((face == 0)); then
+    # Reported, not fixed: Profiles does not rewire another plugin's PAM stack.
+    setup_row polkit "$label" needs_action \
+      "Face unlock answers the owner's prompt, so any program you run can reset a profile password or rebind a face while you are in front of the camera. Turn face off for polkit in Face Unlock. Everything else about passwords is set up correctly." false
+    return
+  fi
+  setup_row polkit "$label" ok \
+    "Checking a profile's password asks nobody else, and managing one asks you." false
+}
+
+# ------------------------------------------------------- rows: locks, hashes
+
+setup_row_locks() {
+  local label="Profile locks" migrating="" legacy="" n
+  while read -r n; do
+    [[ -n $n ]] || continue
+    if ! has_password "$n" && profile_locked "$n"; then migrating="$migrating $n"; fi
+    if jq -e 'has("identity")' "$(file_for "$n")" >/dev/null 2>&1; then legacy="$legacy $n"; fi
+  done < <(profile_names)
+
+  if [[ -z $migrating && -z $legacy ]]; then
+    setup_row locks "$label" ok "Every profile that asks for something has a password to ask for." false
+    return
+  fi
+  local detail=""
+  [[ -n $migrating ]] &&
+    detail="Locked without a password of their own:${migrating}. They were locked under the old model, so they ask for the machine owner every time — and a lock with no password is the one thing a settings edit can still switch off. Set a password on each from its Manage row."
+  [[ -n $legacy ]] &&
+    detail="${detail:+$detail } A face was bound to${legacy} in a file you can edit, which is exactly what the new binding exists to prevent, so it is ignored and removed. Bind the face again from the profile's Manage row and it will be kept where only the owner can change it."
+  setup_row locks "$label" needs_action "$detail" false
+}
+
+# Root files whose profile is gone.
+#
+# passwords/ is deliberately not listable without root, so this reports the
+# names it can see: everything in identity/, plus every name that still has a
+# store, a session record or a binding on this side. A hash under a name
+# nothing else remembers is invisible until somebody tries to create that
+# profile again, which is refused with `stale_password` and points here.
+stale_root_names() {
+  {
+    [[ -d $ROOT_STORE/identity ]] && find "$ROOT_STORE/identity" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null
+    [[ -d $ISOLATE_DIR ]] && find "$ISOLATE_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null
+    [[ -d $STATE_DIR/sessions ]] && find "$STATE_DIR/sessions" -maxdepth 1 -name '*.txt' -printf '%f\n' 2>/dev/null | sed 's/\.txt$//'
+    [[ -s $PASSWORD_NAMES ]] && cat "$PASSWORD_NAMES"
+    # And if the store ever IS listable, believe it over the hint.
+    [[ -d $ROOT_STORE/passwords ]] && find "$ROOT_STORE/passwords" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null
+  } | sort -u | while read -r n; do
+    [[ -n $n ]] || continue
+    [[ $n =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || continue
+    exists "$n" && continue
+    if has_password "$n" || [[ -e $ROOT_STORE/identity/$n ]]; then printf '%s\n' "$n"; fi
+  done
+}
+
+setup_row_stale_hashes() {
+  local label="Leftover passwords" names
+  if [[ ! -d $ROOT_STORE ]]; then
+    setup_row stale-hashes "$label" ok "There is no password store yet, so there is nothing left over in it." false
+    return
+  fi
+  names=$(stale_root_names | paste -sd', ')
+  if [[ -z $names ]]; then
+    setup_row stale-hashes "$label" ok "Every stored password belongs to a profile that still exists." false
+    return
+  fi
+  setup_row stale-hashes "$label" needs_action \
+    "A password or a face binding is still stored for profiles that no longer exist: $names. Nothing can use them, and they stop a new profile being created under the same name. Fixing asks for your password and deletes them." true
+}
+
 # ------------------------------------------------------------ status and fix
 
 setup_status() {
@@ -2999,6 +3546,10 @@ setup_status() {
   setup_row_keys
   setup_row_indicator
   setup_row_switch
+  setup_row_helpers
+  setup_row_polkit
+  setup_row_locks
+  setup_row_stale_hashes
 
   if [[ -n $JSON ]]; then
     printf '%s\n' "${SETUP_ROWS[@]}" | jq -sc .
@@ -3018,7 +3569,7 @@ cmd_setup() {
   case $verb in
   status) setup_status ;;
   fix)
-    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch>"
+    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch|helpers|polkit|stale-hashes>"
     # Every fix takes the state lock: each of them writes something a switch
     # also writes.
     lock_or_busy
@@ -3060,6 +3611,25 @@ cmd_setup() {
         exit 0
       fi
       echo "nothing to repair" ;;
+    # One call, one dialog, both rows: the helpers and the actions that make
+    # them reachable are installed together or not at all.
+    helpers | polkit) system_install ;;
+    stale-hashes)
+      local stale n=0
+      stale=$(stale_root_names)
+      [[ -n $stale ]] || { echo "nothing left over"; return 0; }
+      while read -r name; do
+        [[ -n $name ]] || continue
+        # Deleting root-owned files is the owner's to authorise, and only ever
+        # for a name that has no profile of its own.
+        exists "$name" && continue
+        HELPER_STDIN=""
+        helper_or_refuse owner remove "$name"
+        echo "cleared the leftover password for '$name'"
+        n=$((n + 1))
+      done <<<"$stale"
+      echo "cleared $n leftover record(s)" ;;
+    locks) die "each profile's lock is set from its own Manage row — Setup cannot choose a password for you" ;;
     *) die "unknown setup row '$id'" ;;
     esac ;;
   *) die "usage: omarchy-profile setup [status|fix <id>]" ;;
@@ -3075,15 +3645,30 @@ cmd_capabilities() {
   # this engine has measured.
   local reload=unknown face=absent polkit=absent helpers=absent
 
-  local identity=""
-  command -v omarchy-face-identity >/dev/null && identity=$(command -v omarchy-face-identity)
-  [[ -z $identity && -x /usr/local/bin/omarchy-face-identity ]] && identity=/usr/local/bin/omarchy-face-identity
-  [[ -n $identity ]] && face=ok
+  face_installed && face=ok
 
-  # Both belong to the password phase. They are reported as absent rather than
-  # as needing action because there is nothing installed to act on yet.
-  [[ -x /usr/local/bin/omarchy-profile-auth && -x /usr/local/bin/omarchy-profile-passwd ]] && helpers=unknown
-  [[ -r /usr/share/polkit-1/actions/no.graveklar.profiles.auth.policy ]] && polkit=unknown
+  # Installed, owned by root, and the same bytes this copy of the plugin ships.
+  # Anything else is broken rather than absent: something is there and it is not
+  # what the gate is about to rely on.
+  local a p store
+  helper_state omarchy-profile-auth; a=$?
+  helper_state omarchy-profile-passwd; p=$?
+  root_store_state; store=$?
+  if ((a == 0 && p == 0 && store == 0)); then helpers=ok
+  elif ((a == 1 && p == 1)); then helpers=absent
+  else helpers=broken; fi
+
+  # Never the probe here: capabilities is a status query, and a status query
+  # does not run anything through pkexec.
+  if [[ -e $POLICY_DEST ]]; then
+    policy_annotated
+    case $? in
+    0) polkit=ok ;;
+    2) polkit=unknown ;;
+    *) polkit=broken ;;
+    esac
+    legacy_action_present && polkit=broken
+  fi
 
   jq -nc --arg r "$reload" --arg f "$face" --arg p "$polkit" --arg h "$helpers" \
     '{hyprland_reload: $r, face: $f, polkit: $p, helpers: $h}'
@@ -3103,10 +3688,8 @@ refresh)
   cur=$(current_profile)
   write_index; write_catalog
   [[ -n $cur ]] && apply_app_visibility "$cur"
-  echo "refreshed"
-  # Also the upgrade path: someone who installed before this check existed, or
-  # who installed from the marketplace, finds out here rather than at a lock.
-  check_polkit_action ;;
+  migrate_profiles
+  echo "refreshed" ;;
 isolate)
   shift
   # Two sub-verbs the isolate phase builds; named here so the panel gets a JSON
@@ -3118,25 +3701,20 @@ isolate)
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 overview) shift; cmd_overview "${1:-}" ;;
 close) shift; cmd_close_profile "${1:-}" ;;
-lock) shift; cmd_lock lock "${1:-}" ;;
-unlock) shift; cmd_lock unlock "${1:-}" ;;
-identity)
-  shift
-  # The contract's `identity list --json` is the password phase's shape, and is
-  # a different thing from today's `identity <profile> [<face>]`.
-  [[ ${1:-} == list ]] && not_implemented "identity list"
-  cmd_identity "${1:-}" "${2:-}" "${3:-}" ;;
+identity) shift; cmd_identity "$@" ;;
+password) shift; cmd_password "$@" ;;
+rename) shift; cmd_rename "$@" ;;
 # Everything below is named in the contract and built by a later phase. Each
 # answers in JSON and exits 1, so the panel can call any verb the contract has
 # from the day it freezes and render a real answer.
-password | meta | rename | config | session | login | purge)
+meta | config | session | login | purge)
   not_implemented "$1 ${2:-}" ;;
 setup) shift; cmd_setup "$@" ;;
 capabilities) cmd_capabilities ;;
 set) shift; cmd_set "$@" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
-remove) shift; cmd_remove "${1:-}" ;;
+remove) shift; cmd_remove "$@" ;;
 show) shift; cmd_visibility show "${1:-}" ;;
 hide) shift; cmd_visibility hide "${1:-}" ;;
 apps) shift; cmd_apps "$@" ;;
@@ -3148,11 +3726,9 @@ next) cmd_next ;;
 current) cmd_current ;;
 init) cmd_init ;;
 list | ls | "")
-  # The contract's `list --json` carries two fields — hasPassword and identity —
-  # that only the password phase's root store can answer. Rather than print a
-  # shape with invented values in it, the flag says so until that store exists.
-  [[ ${2:-} == --json ]] && not_implemented "list --json"
-  cmd_list ;;
+  # hasPassword and identity come from the root store, so the JSON shape is the
+  # index's, built by one function both this and profiles.json go through.
+  if [[ ${2:-} == --json ]]; then index_json | jq -c .; else cmd_list; fi ;;
 -h | --help | help)
   cat <<'USAGE'
 omarchy-profile — profiles for the Omarchy desktop
@@ -3165,9 +3741,22 @@ omarchy-profile — profiles for the Omarchy desktop
   capture                          save live state into the active profile now
 
   create <name> [--from-master|--clean]
-  remove <name>                    moves its windows to the master first
+  remove <name>                    authenticates, then moves its windows to master
+  rename <old> <new>               the password and the face binding follow it
   show <name> | hide <name>        whether it appears in the picker
-  lock <name> | unlock <name>      whether entering it needs authentication
+
+  password status <name>           none | set | locked_no_password
+  password set <name>              the owner authorises; the new password is typed
+  password change <name>           current password, then the new one, one per line
+  password clear <name>            the current password, or empty to ask the owner
+  password reset <name>            the owner authorises; forgotten passwords
+
+  identity list [--json]           faces enrolled in Face Unlock
+  identity bind <name> <identity>  that face opens this profile too
+  identity clear <name>            it no longer does
+
+  Passwords are read from stdin, never from an argument: anything typed on a
+  command line is readable by every process on the machine.
 
   isolate [list|add|remove] [path]  give each profile its own copy of a
                                     plugin's own config or state file

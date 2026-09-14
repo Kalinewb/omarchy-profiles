@@ -30,6 +30,17 @@ Column {
   // The panel owns the confirmation dialog; a Column cannot host one.
   signal confirmRemove(string profile)
   signal openOverview()
+  // The panel owns the password prompt for the same reason, and it is the only
+  // thing that ever holds a typed secret.
+  signal passwordAction(string profile, string mode)
+  signal createProfile(string name, bool fromMaster)
+
+  // Which row has its password controls open. One at a time: they are a second
+  // line of buttons, and two open at once reads as one row's controls belonging
+  // to the other.
+  property string passwordRow: ""
+  // What the engine said about the last create attempt, if anything.
+  property string createError: ""
 
   // How many profiles the picker currently offers. Hiding the last one is
   // refused, so the button is disabled rather than failing after the click.
@@ -184,6 +195,17 @@ Column {
       onAccepted: root.submitCreate()
     }
 
+    Text {
+      width: parent.width
+      textFormat: Text.PlainText
+      wrapMode: Text.WordWrap
+      visible: root.createError !== ""
+      text: root.createError
+      color: Color.urgent
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+    }
+
     Row {
       width: parent.width
       spacing: Style.space(6)
@@ -237,7 +259,10 @@ Column {
   function submitCreate() {
     var name = String(nameField.text || "").trim()
     if (name === "") return
-    root.runEngine("create " + name + (root.createFromMaster ? " --from-master" : " --clean"))
+    // Through the panel's ask(), not runEngine(): creating can be refused with
+    // `stale_password` — a hash left behind by a deleted profile of this name —
+    // and a fire-and-forget call has no way to hear that.
+    root.createProfile(name, root.createFromMaster)
     nameField.text = ""
     root.creating = false
   }
@@ -262,22 +287,35 @@ Column {
     // Visible now and the only one left: hiding it would empty the picker.
     readonly property bool hideWouldEmpty: !(row.entry && row.entry.hidden) && root.visibleCount <= 1
     readonly property bool locked: !!(row.entry && row.entry.locked)
+    readonly property bool hasPassword: !!(row.entry && row.entry.hasPassword)
+    // The engine's three states, computed from the same two facts it uses:
+    // a hash in the root store, and `locked` in the profile's own JSON.
+    readonly property string passwordState: row.hasPassword ? "set"
+                                            : (row.locked ? "locked_no_password" : "none")
     readonly property string identity: row.entry ? String(row.entry.identity || "") : ""
+    readonly property bool passwordOpen: root.passwordRow === row.name
 
     foreground: root.foreground
     accent: root.accent
     hasCursor: root.cursorActive && root.cursor === row.rowIndex
     current: row.active
 
-    implicitHeight: rowBody.implicitHeight + Style.space(14)
+    implicitHeight: stack.implicitHeight + Style.space(14)
 
-    Item {
-      id: rowBody
+    // The row and, under it, whatever the key button opened. One column so the
+    // row grows rather than the controls drawing over the next profile.
+    Column {
+      id: stack
       anchors.left: parent.left
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       anchors.leftMargin: Style.space(10)
       anchors.rightMargin: Style.space(6)
+      spacing: Style.space(6)
+
+    Item {
+      id: rowBody
+      width: stack.width
       implicitHeight: Math.max(labels.implicitHeight, actions.implicitHeight)
 
       Column {
@@ -314,11 +352,17 @@ Column {
         Text {
           textFormat: Text.PlainText
           width: labels.width
-          visible: row.locked && row.identity !== ""
-          // Whose lock this is, stated on the row. Enrolment is deliberately
-          // not here: the face plugin owns the camera and the model store, and
-          // two plugins competing for one IR sensor is a bug in waiting.
-          text: "Opens for " + row.identity
+          visible: text !== ""
+          // What this profile asks for, stated on the row. Enrolment is
+          // deliberately not here: the face plugin owns the camera and the
+          // model store, and two plugins competing for one IR sensor is a bug
+          // in waiting.
+          text: {
+            if (row.passwordState === "locked_no_password")
+              return "Locked without a password — set one"
+            if (!row.hasPassword) return ""
+            return row.identity !== "" ? "Password set · opens for " + row.identity : "Password set"
+          }
           color: root.accent
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -365,22 +409,25 @@ Column {
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
 
-        // Master can be locked too: it is the profile that sees everything, so
-        // it is the one most worth gating.
+        // Master can be protected too: it is the profile that sees everything,
+        // so it is the one most worth gating.
+        //
+        // A key, not a toggle. Protecting a profile means giving it a password,
+        // which is a thing to type, not a switch to flip — and taking one off
+        // has to be answered for, which a toggle cannot ask.
         PanelActionButton {
-          iconText: row.locked ? "󰌾" : "󰌿"
-          // Naming whose face opens it is the point. A lock that opens for
-          // somebody else and does not say so is worse than no lock: you would
-          // believe it was yours.
-          tooltipText: !row.locked
-            ? "Ask for a face or password before entering " + row.name
-            : (row.identity !== ""
-               ? "Opens for " + row.identity + ", or for you — click to stop asking"
-               : "Entering " + row.name + " asks for your face or password — click to stop asking")
-          foreground: row.locked ? root.accent : root.foreground
+          iconText: row.hasPassword ? "󰌾" : "󰌿"
+          tooltipText: row.passwordState === "set"
+            ? (row.identity !== ""
+               ? row.name + " opens for its password, or for " + row.identity
+               : "Change or remove the password on " + row.name)
+            : row.passwordState === "locked_no_password"
+              ? row.name + " is locked without a password of its own — set one"
+              : "Give " + row.name + " a password of its own"
+          foreground: row.passwordState === "none" ? root.foreground : root.accent
           size: actions.actionSize
           fontFamily: root.fontFamily
-          onClicked: root.runEngine((row.locked ? "unlock " : "lock ") + row.name)
+          onClicked: root.passwordRow = row.passwordOpen ? "" : row.name
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
 
@@ -415,6 +462,77 @@ Column {
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
       }
+    }
+
+    // What the key button opens: the password itself, and nothing else.
+    //
+    // Each of these hands the profile back to the panel, which raises the
+    // prompt. Setting and resetting also raise polkit's own dialog for the
+    // owner — this panel never collects the owner's password, and could not
+    // do anything useful with it if it did.
+    Column {
+      width: stack.width
+      visible: row.passwordOpen
+      spacing: Style.space(4)
+
+      Text {
+        textFormat: Text.PlainText
+        width: parent.width
+        wrapMode: Text.WordWrap
+        text: row.passwordState === "set"
+          ? "Anyone entering " + row.name + " is asked for this password. Your own password is not asked for and does not open it."
+          : row.passwordState === "locked_no_password"
+            ? "Locked before passwords existed, so it asks the machine owner every time — and that is the one lock a settings edit can still switch off. Give it a password of its own."
+            : "A password is asked for when this profile is entered. It is kept where a program running as you cannot read it, and it is not your machine password."
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+
+      Row {
+        spacing: Style.space(6)
+
+        Button {
+          visible: row.passwordState !== "set"
+          text: "Set a password"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.passwordAction(row.name, "set")
+        }
+
+        Button {
+          visible: row.passwordState === "set"
+          text: "Change"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.passwordAction(row.name, "change")
+        }
+
+        Button {
+          visible: row.passwordState === "set"
+          text: "Remove password"
+          bordered: true
+          foreground: root.foreground
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.passwordAction(row.name, "clear")
+        }
+
+        Button {
+          visible: row.passwordState === "set"
+          text: "Reset as owner"
+          bordered: true
+          foreground: root.dim
+          fontFamily: root.fontFamily
+          fontSize: Style.font.caption
+          onClicked: root.passwordAction(row.name, "reset")
+        }
+      }
+    }
     }
 
     HoverHandler {

@@ -5,7 +5,7 @@
   "version": "1.1.0",
   "author": "graveklar",
   "license": "MIT",
-  "description": "Several desks on one machine: each profile keeps its own workspaces, apps, theme, bar and plugins, and can be locked to a face or hold an encrypted vault.",
+  "description": "Several desks on one machine: each profile keeps its own workspaces, apps, theme, bar and plugins, and can ask for a password of its own before it opens.",
   "kinds": [
     "bar-widget"
   ],
