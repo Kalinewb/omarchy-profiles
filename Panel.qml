@@ -76,7 +76,20 @@ Panel {
   // "picker" switches profiles; "manage" creates, removes and hides them.
   // One panel with two views rather than two plugins, because they are the same
   // list seen two ways and a second bar icon would be clutter.
-  property string view: "picker"
+  //
+  // A stack rather than a flat string: every view is reached from somewhere, and
+  // "back" means the place it was opened from. The hand-rolled chain this
+  // replaces had to name each return path, so a view reachable from two places
+  // could only go back to one of them.
+  property var viewStack: ["picker"]
+  readonly property string view: viewStack[viewStack.length - 1]
+
+  // Moving between views resets the cursor: the lists are different lengths, so
+  // a carried-over index can point past the end of the one now on screen.
+  function pushView(v) { viewStack = viewStack.concat([v]); cursor = 0; cursorActive = false }
+  function popView() { if (viewStack.length > 1) viewStack = viewStack.slice(0, -1); cursor = 0 }
+  function resetView(v) { viewStack = [v] }
+
   property string masterName: ""
 
   // Which profile a remove confirmation is about. Empty means no dialog.
@@ -94,6 +107,14 @@ Panel {
     + "/omarchy-profiles/overview.json"
   property var settingsDisabled: []
   property var settingsAllowedApps: []
+
+  // Which profile a password is being asked for, and which Setup row is waiting
+  // on an answer. Nothing writes them yet — the prompt and the Setup view are
+  // later phases — but the idle timer already has to know that a question is on
+  // screen, and a property that is always "" is a cheaper stub than a timer
+  // condition that changes shape later.
+  property string passwordFor: ""
+  property string pendingSetup: ""
 
   readonly property string catalogPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/plugins.json"
@@ -137,6 +158,73 @@ Panel {
   // Set while the engine runs so a row can show it was the one picked; the
   // state file arriving is what actually clears it.
   property string applying: ""
+
+  // Ask the engine and get the answer back, rather than watching a file for a
+  // side effect. "That password was wrong" needs an exit code, and bar.run() is
+  // execDetached: no stdout, no status, nothing to wait on. runEngine stays for
+  // the mutations whose result IS a watched file (hide, show, plugin enable,
+  // catalog, overview).
+  //
+  // Through `bash -c 'exec "$@"' -- <engine> <args>`. The exec matters: without
+  // it the wrapper shell stays alive as the parent, and a TERM sent to cancel a
+  // face attempt would kill the wrapper while the engine kept running. Bash
+  // still exits 126/127 itself when exec fails, so a missing engine fires
+  // onExited instead of leaving the panel waiting forever.
+  //
+  // args is an argv array, never a joined string: a profile named "old work"
+  // has to arrive as one argument, and a password never goes near argv at all.
+  //
+  // callback(ok, parsed, code):
+  //   exit 0        ok = true, parsed = the JSON if stdout parsed, else null.
+  //                 Prose-only verbs succeed with parsed === null.
+  //   anything else ok = false, parsed = the engine's {"error": …} if it printed
+  //                 one, else {error: "failed", code}. Code 2 is an auth
+  //                 refusal and 3 is busy (plan-merged.md §2 rule 3).
+  function ask(args, stdinText, callback) {
+    var job = { args: args || [], stdin: String(stdinText || ""), callback: callback || null }
+    for (var i = 0; i < root.askPool.length; i++) {
+      if (!root.askPool[i].busy) { root.startAsk(root.askPool[i], job); return }
+    }
+    // Four at once is more than the panel ever needs; a fifth waits rather than
+    // letting a stuck engine call spawn processes without bound.
+    root.askQueue = root.askQueue.concat([job])
+  }
+
+  property var askQueue: []
+
+  function startAsk(proc, job) {
+    proc.busy = true
+    proc.job = job
+    proc.collected = ""
+    proc.stdinText = job.stdin
+    proc.stdinEnabled = true
+    proc.command = ["bash", "-c", "exec \"$@\"", "--", root.engine].concat(job.args)
+    proc.running = true
+  }
+
+  function askFinished(proc, code) {
+    var job = proc.job
+    var out = String(proc.collected || "")
+    proc.busy = false
+    proc.job = null
+
+    var parsed = null
+    if (out.trim() !== "") {
+      try { parsed = JSON.parse(out) } catch (e) { parsed = null }
+    }
+    var ok = code === 0
+    if (!ok && (!parsed || typeof parsed !== "object" || parsed.error === undefined))
+      parsed = { error: "failed", code: code }
+
+    // The slot is handed on before the callback runs: a callback that throws
+    // must not strand whatever was queued behind it.
+    if (root.askQueue.length > 0) {
+      var next = root.askQueue[0]
+      root.askQueue = root.askQueue.slice(1)
+      root.startAsk(proc, next)
+    }
+    if (job && job.callback) job.callback(ok, parsed, code)
+  }
 
   function indexOf(id) {
     for (var i = 0; i < profiles.length; i++) if (profiles[i].id === id) return i
@@ -182,6 +270,53 @@ Panel {
     root.close()
   }
 
+  // Where each view says it is, in one table rather than a ternary chain per
+  // piece of chrome. config, setup and edit arrive in later phases; their rows
+  // are here now so a lookup for a view that is not built yet still answers.
+  readonly property var viewChrome: ({
+    "picker":   { title: "Profiles",        meta: "Same files, a different desk",
+                  hint: "j/k move · enter apply · middle-click the bar to cycle" },
+    "manage":   { title: "Manage profiles", meta: "Create, remove, or hide a profile",
+                  hint: "esc closes · the arrow returns to switching" },
+    "settings": { title: "",                meta: "What this profile may use",
+                  hint: "back returns to the list · closes itself if left alone" },
+    "overview": { title: "What is open",    meta: "Nothing closes when you switch",
+                  hint: "measured from each window's cgroup, not estimated" },
+    "config":   { title: "Configuration",   meta: "", hint: "" },
+    "setup":    { title: "Setup",           meta: "", hint: "" },
+    "edit":     { title: "Edit profile",    meta: "", hint: "" }
+  })
+
+  function chrome() {
+    var c = root.viewChrome[root.view]
+    return c ? c : { title: "Profiles", meta: "", hint: "" }
+  }
+
+  // The settings view is titled by what it is editing, which no table can hold.
+  function viewTitle() {
+    return root.view === "settings" ? root.settingsProfile : root.chrome().title
+  }
+
+  // Navigation, in functions rather than in the controls, so the back arrow and
+  // the removal confirmation take exactly the same route out of a view.
+  function navBack() {
+    // From the picker the arrow goes the other way: it is the only way in.
+    if (root.view === "picker") { root.pushView("manage"); return }
+    if (root.view === "settings") root.settingsProfile = ""
+    root.popView()
+  }
+
+  function openOverview() {
+    root.runEngine("overview")
+    root.pushView("overview")
+  }
+
+  function openSettings(profile) {
+    root.settingsProfile = profile
+    root.pushView("settings")
+    root.runEngine("catalog")
+  }
+
   function parseState(content) {
     try {
       var parsed = JSON.parse(String(content || ""))
@@ -214,6 +349,12 @@ Panel {
     root.runEngine("overview")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
+
+  AskProcess { id: askProc0 }
+  AskProcess { id: askProc1 }
+  AskProcess { id: askProc2 }
+  AskProcess { id: askProc3 }
+  readonly property var askPool: [askProc0, askProc1, askProc2, askProc3]
 
   FileView {
     id: stateFile
@@ -374,10 +515,12 @@ Panel {
     interval: root.idleCloseMs
     repeat: false
     // Stops for good once anything has been touched, and never runs while a
-    // confirmation is open: that is a question waiting for an answer, and
-    // timing it out would dismiss the dialog without the user deciding.
+    // confirmation, a password prompt or a Setup step is open: each is a
+    // question waiting for an answer, and timing it out would dismiss it
+    // without the user deciding.
     running: root.opened && !root.touchedSinceOpen
              && root.pendingRemoval === "" && root.pendingClose === ""
+             && root.passwordFor === "" && root.pendingSetup === ""
     onTriggered: if (root.opened && !root.touchedSinceOpen) root.close()
   }
 
@@ -451,7 +594,7 @@ Panel {
         root.runEngine("remove " + root.pendingRemoval)
         root.pendingRemoval = ""
         // The removed profile may be the one the settings view was editing.
-        if (root.view === "settings") { root.view = "manage"; root.settingsProfile = "" }
+        if (root.view === "settings") root.navBack()
       }
     }
 
@@ -531,18 +674,13 @@ Panel {
 
         PanelHero {
           width: parent.width
-          title: root.view === "settings" ? root.settingsProfile
-                 : root.view === "overview" ? "What is open"
-                 : (root.view === "manage" ? "Manage profiles" : "Profiles")
+          title: root.viewTitle()
           // Empty outside the picker: the pill names the profile you are IN,
           // which only matters while choosing one. Showing "Master" beside the
           // title "test" read as a label on test.
           detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile) : ""
           meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
-                : root.view === "settings" ? "What this profile may use"
-                : root.view === "overview" ? "Nothing closes when you switch"
-                : root.view === "manage" ? "Create, remove, or hide a profile"
-                : "Same files, a different desk"
+                : root.chrome().meta
           foreground: root.foreground
           fontFamily: root.fontFamily
 
@@ -557,9 +695,9 @@ Panel {
             }
           }
 
-          // The way between the two views, in the one place a hero control
-          // belongs. Switching resets the cursor: the two lists are different
-          // lengths, so a carried-over index can point past the end.
+          // The way between the views, in the one place a hero control belongs.
+          // One step back each press, so a view returns to whatever opened it
+          // rather than jumping to the switcher.
           trailingControl: Component {
             PanelActionButton {
               iconText: root.view === "picker" ? "󰒓" : "󰌍"
@@ -568,14 +706,7 @@ Panel {
               fontFamily: root.fontFamily
               onClicked: {
                 root.keepAlive()
-                // One step back each press, so settings returns to the list it
-                // was opened from rather than jumping to the switcher.
-                if (root.view === "settings") { root.view = "manage"; root.settingsProfile = "" }
-                else if (root.view === "overview") root.view = "manage"
-                else if (root.view === "manage") root.view = "picker"
-                else root.view = "manage"
-                root.cursor = 0
-                root.cursorActive = false
+                root.navBack()
               }
             }
           }
@@ -641,13 +772,8 @@ Panel {
           onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
           onCursorMoved: function (index) { root.keepAlive(); root.cursorActive = true; root.cursor = index }
           onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
-          onOpenOverview: { root.keepAlive(); root.runEngine("overview"); root.view = "overview" }
-          onOpenSettings: function (profile) {
-            root.keepAlive()
-            root.settingsProfile = profile
-            root.view = "settings"
-            root.runEngine("catalog")
-          }
+          onOpenOverview: { root.keepAlive(); root.openOverview() }
+          onOpenSettings: function (profile) { root.keepAlive(); root.openSettings(profile) }
         }
 
         OverviewView {
@@ -684,10 +810,7 @@ Panel {
           textFormat: Text.PlainText
           width: parent.width
           topPadding: Style.space(2)
-          text: root.view === "overview" ? "measured from each window's cgroup, not estimated"
-                : root.view === "settings" ? "back returns to the list · closes itself if left alone"
-                : (root.view === "manage" ? "esc closes · the arrow returns to switching"
-                   : "j/k move · enter apply · middle-click the bar to cycle")
+          text: root.chrome().hint
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
@@ -697,6 +820,33 @@ Panel {
       }
       }
     }
+  }
+
+  // One slot of ask()'s pool. Reused rather than created per call, because a
+  // Process built at call time would be garbage while it was still running.
+  component AskProcess: Process {
+    id: proc
+    property bool busy: false
+    property var job: null
+    property string collected: ""
+    property string stdinText: ""
+
+    running: false
+    stdinEnabled: true
+    // waitForEnd, so the whole document is there when onExited reads it; the
+    // copy kept on streamFinished is what the house pattern reads back.
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: proc.collected = text
+    }
+    onStarted: {
+      if (proc.stdinText !== "") proc.write(proc.stdinText)
+      proc.stdinText = ""
+      // Closing the stream is what makes the engine's read return — without it
+      // a verb that reads a password waits for EOF that never comes.
+      proc.stdinEnabled = false
+    }
+    onExited: function (code, status) { root.askFinished(proc, code) }
   }
 
   // One profile: icon, name, one line of what it does. CursorSurface carries

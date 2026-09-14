@@ -161,8 +161,7 @@ authenticate() {
   #
   # Read the honesty note under "What a lock is not" before trusting the second
   # one: this file is writable by the owner, so owner_override=false is a
-  # courtesy between people sharing a laptop, not a boundary. The encrypted
-  # vault is the part that a password cannot talk its way past.
+  # courtesy between people sharing a laptop, not a boundary.
   local identity="" owner_override=true
   if [[ -n $profile ]]; then
     identity=$(jq -r '.identity // empty' "$(file_for "$profile")" 2>/dev/null)
@@ -1059,165 +1058,6 @@ hl_close_window() {
   hyprctl dispatch "hl.dsp.window.close({ window = \"address:$1\" })" >/dev/null
 }
 
-# ------------------------------------------------------------------ vaults
-#
-# An encrypted folder per profile.
-#
-# gocryptfs rather than LUKS or fscrypt: it needs no root, it works on btrfs
-# (fscrypt does not — it wants ext4 or f2fs), and a cipherdir is an ordinary
-# directory that a normal backup picks up.
-#
-#   ~/.local/state/omarchy-profiles/vaults/<profile>   ciphertext, always there
-#   ~/Vaults/<profile>                                 plaintext, only while open
-#
-# What this protects: the contents while the vault is CLOSED. From another
-# profile, from a file manager, from `grep -r ~`, from a lost laptop — all of it
-# is ciphertext. The vault closes automatically when you leave the profile.
-#
-# What it does not protect: the contents while the vault is OPEN. Every profile
-# runs as the same Unix user, so any process running as you can read the mount
-# while it is mounted. It is a closed-safe, not a sandbox.
-#
-# Opening is deliberately manual. Auto-opening on every switch would mean a
-# passphrase prompt on every switch, and a vault that is open whenever you are
-# in the profile is only protecting you against someone browsing a profile you
-# are not using — which is most of the value, but not enough to pay a prompt
-# for on every switch.
-
-VAULT_DIR="$STATE_DIR/vaults"
-vault_cipher() { printf '%s/%s\n' "$VAULT_DIR" "$1"; }
-vault_mount() { printf '%s/Vaults/%s\n' "$HOME" "$1"; }
-
-vault_is_open() { mountpoint -q "$(vault_mount "$1")" 2>/dev/null; }
-
-# Unmount a vault: 0 clean, 2 only a lazy unmount worked, 1 neither did.
-#
-# The distinction is not pedantry. A lazy unmount detaches the mount point, so
-# the vault disappears from the filesystem and nothing NEW can open it -- but a
-# process that already had a file open keeps reading plaintext through that
-# descriptor until it exits. Printing "closed" for that case would claim a seal
-# that has not happened yet, which is the one thing this feature must not do.
-vault_unmount() {
-  local mnt=$1
-  fusermount3 -u "$mnt" 2>/dev/null && return 0
-  fusermount3 -uz "$mnt" 2>/dev/null && return 2
-  return 1
-}
-
-# Names of the programs sitting in the mount, so the warning says something
-# actionable. Must be called BEFORE unmounting -- afterwards there is no mount
-# left to ask about. Silent when fuser is unavailable; a missing list is not
-# worth failing a close over.
-vault_holders() {
-  command -v fuser >/dev/null || return 0
-  local pids p out=()
-  pids=$(fuser -m "$1" 2>/dev/null) || return 0
-  for p in $pids; do
-    [[ $p =~ ^[0-9]+$ ]] || continue
-    out+=("$(ps -o comm= -p "$p" 2>/dev/null)")
-  done
-  ((${#out[@]})) || return 0
-  printf '%s\n' "${out[@]}" | sed '/^$/d' | sort -u | paste -sd', ' -
-}
-
-vault_exists() { [[ -f "$(vault_cipher "$1")/gocryptfs.conf" ]]; }
-
-need_gocryptfs() {
-  command -v gocryptfs >/dev/null && return 0
-  warn "gocryptfs is not installed — run: omarchy pkg add gocryptfs"
-  return 1
-}
-
-cmd_vault() {
-  local verb=${1:-status} name=${2:-}
-  case $verb in
-  status)
-    local any=0 n
-    while read -r n; do
-      [[ -n $n ]] || continue
-      vault_exists "$n" || continue
-      any=1
-      printf '  %-12s %s\n' "$n" "$(vault_is_open "$n" && echo "open at $(vault_mount "$n" | sed "s|^$HOME|~|")" || echo closed)"
-    done < <(profile_names)
-    ((any)) || echo "no vaults — make one with: omarchy-profile vault init <profile>"
-    command -v gocryptfs >/dev/null || echo; command -v gocryptfs >/dev/null || warn "gocryptfs is not installed" ;;
-  init)
-    [[ -n $name ]] || die "usage: omarchy-profile vault init <profile>"
-    exists "$name" || die "no such profile '$name'"
-    need_gocryptfs || return 1
-    vault_exists "$name" && die "'$name' already has a vault"
-    if [[ ! -t 0 ]]; then relaunch_in_terminal vault init "$name"; return 0; fi
-    mkdir -p "$(vault_cipher "$name")" "$(vault_mount "$name")"
-    echo "Creating an encrypted folder for '$name'."
-    echo "Choose a passphrase. gocryptfs then prints a master key once — that key is"
-    echo "the only way back in if the passphrase is forgotten, so write it down now."
-    echo
-    gocryptfs -init -- "$(vault_cipher "$name")" || die "could not create the vault"
-    audit "vault created for $name"
-    echo
-    echo "Open it with: omarchy-profile vault open $name" ;;
-  open)
-    [[ -n $name ]] || name=$(current_profile)
-    [[ -n $name ]] || die "usage: omarchy-profile vault open <profile>"
-    vault_exists "$name" || die "'$name' has no vault (make one: omarchy-profile vault init $name)"
-    vault_is_open "$name" && { echo "already open"; return 0; }
-    if [[ ! -t 0 ]]; then relaunch_in_terminal vault open "$name"; return 0; fi
-    need_gocryptfs || return 1
-    mkdir -p "$(vault_mount "$name")"
-    if gocryptfs -- "$(vault_cipher "$name")" "$(vault_mount "$name")"; then
-      audit "vault opened for $name"
-      echo "open at $(vault_mount "$name" | sed "s|^$HOME|~|")"
-    else
-      audit "vault open FAILED for $name"
-      die "could not open the vault"
-    fi ;;
-  close)
-    [[ -n $name ]] || name=$(current_profile)
-    [[ -n $name ]] || die "usage: omarchy-profile vault close <profile>"
-    vault_is_open "$name" || { echo "not open"; return 0; }
-    # A lazy unmount is the fallback, and the report says which one happened:
-    # something still holding a file open must not mean the vault stays browsable,
-    # but it also must not be called sealed while that program can still read.
-    local mnt holders rc
-    mnt=$(vault_mount "$name")
-    holders=$(vault_holders "$mnt")
-    vault_unmount "$mnt"; rc=$?
-    case $rc in
-    0) audit "vault closed for $name"; echo "closed" ;;
-    2) audit "vault closed for $name (lazily; ${holders:-a program} still had it open)"
-       echo "closed — nothing new can reach it."
-       warn "${holders:-a program} still had a file open, and keeps reading that file until it exits" ;;
-    *) audit "vault close FAILED for $name (${holders:-unknown})"
-       warn "could not close the vault for '$name' — ${holders:-something} is still using it"
-       return 1 ;;
-    esac ;;
-  *) die "unknown vault verb '$verb' (status, init, open, close)" ;;
-  esac
-}
-
-# Close every open vault that does not belong to the profile being entered.
-# This is the half of the feature that does the protecting: leaving a profile
-# seals it without anyone having to remember to.
-close_foreign_vaults() {
-  local keep=${1:-} n
-  while read -r n; do
-    [[ -n $n ]] || continue
-    [[ $n == "$keep" ]] && continue
-    vault_is_open "$n" || continue
-    local mnt holders rc
-    mnt=$(vault_mount "$n")
-    holders=$(vault_holders "$mnt")
-    vault_unmount "$mnt"; rc=$?
-    case $rc in
-    0) audit "vault closed for $n (left the profile)" ;;
-    2) audit "vault closed for $n (left the profile; lazily, ${holders:-a program} had it open)"
-       warn "'$n' vault is detached, but ${holders:-a program} keeps the files it already opened" ;;
-    *) audit "vault close FAILED for $n (left the profile; ${holders:-unknown})"
-       warn "could not close '$n' vault — ${holders:-something} is still using it" ;;
-    esac
-  done < <(profile_names)
-}
-
 # ------------------------------------------------------------------ global
 #
 # A workspace that belongs to the machine rather than to a profile.
@@ -1522,7 +1362,6 @@ cmd_set() {
   # Plugin state that lives outside shell.json follows the profile too, so a
   # Spotify session or a dock layout belongs to one profile rather than all.
   prune_isolated
-  close_foreign_vaults "$name"
   swap_isolated "$cur" "$name"
 
   apply_profile "$name"
@@ -1951,7 +1790,6 @@ ensure_config
 case "${1:-}" in
 catalog) write_catalog ;;
 global) shift; cmd_global "${1:-status}" "${2:-}" ;;
-vault) shift; cmd_vault "${1:-status}" "${2:-}" ;;
 refresh)
   # Rewrite every file the panel and launcher read, without switching. Useful
   # after editing a profile by hand, and after installing over an older version
@@ -2009,8 +1847,6 @@ omarchy-profile — profiles for the Omarchy desktop
   global [status|enable|disable|send|toggle] [name]
                                    a workspace that survives every switch
 
-  vault [status|init|open|close] [profile]
-                                   an encrypted folder, sealed when you leave
   close <name>                     ask every window in a profile to close
 
   apps <profile> [list|allow|deny] [app-id]
