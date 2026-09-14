@@ -682,14 +682,38 @@ cmd_identity() {
 #
 # Swapping is lossless and self-healing:
 #   leaving F, entering T, for each isolated path P
-#     P is a symlink   -> remove it (the target is already F's store)
-#     P is real        -> move it into F's store, since the live data is F's
-#     T has a store    -> symlink P at it
-#     T has none       -> leave P absent, and the plugin makes a fresh one;
-#                         the next switch away adopts that into T's store
+#     P is a symlink we own -> remove it (the target is already F's store)
+#     P is real, F exists   -> move it into F's store, since the live data is F's
+#     P is real, no F       -> move it into .orphaned/, never unlink it
+#     T has a store         -> symlink P at it, with -n and no -f
+#     T has none            -> tier 2: leave P absent, and the plugin makes a
+#                              fresh one; tier 3: seed T's store first, because
+#                              a `require`d Hyprland file may never be absent
 # Nothing is ever deleted and no symlink is ever left dangling.
+#
+# Three tiers, and only the third needs anything more than the swap:
+#
+#   1  theme, wallpaper, bar, plugins, apps, workspaces — captured wholesale
+#   2  plugin data outside shell.json — the swap plus the shell restart
+#   3  ~/.config/hypr/{looknfeel,bindings,input}.lua — the swap plus
+#      `hyprctl reload`, which is confirmed to re-read a swapped Lua file here
+#      and probed rather than assumed anywhere else
+#
+# Tier 3 is the one that can take the desktop with it, so it carries three
+# safeguards the others do not need: a blocklist, a seeding rule, and a reload
+# that rolls a file back when the compositor reports a new error for it.
 
 ISOLATE_DIR="$STATE_DIR/isolated"
+# Where Omarchy's own Hyprland config lives, and the three files this engine
+# writes beside the isolate stores.
+HYPR_DIR="$CONFIG_HOME/hypr"
+# Tier-3 rollbacks, one key per profile with one outstanding. A watched file.
+HYPR_ERRORS="$STATE_DIR/hypr-errors.json"
+# Every packaged version of a hypr file this engine has ever read, so a store
+# that is a stock copy can be recognised as one and quietly updated.
+HYPR_PKG_HASHES="$STATE_DIR/hypr-packaged.sha256"
+# What this machine was measured to be able to do, keyed by Hyprland version.
+PROBES_FILE="$STATE_DIR/probes.json"
 # A path a swap could not file under its owner is left exactly where it is and
 # recorded here, `path<TAB>owner`. While a line exists no switch may start, so
 # no later swap ever has to wonder whose data is at that path. Written by the
@@ -712,6 +736,74 @@ isolated_paths() {
       [[ -n $p ]] || continue
       printf '%s\n' "${p/#\~/$HOME}"
     done
+}
+
+# The same list with each path's reload mode beside it, `path<TAB>reload`.
+#
+# `reload` is `none` — the swap is enough, because the shell restarts anyway —
+# or `hypr`, which means the compositor has to be told. A bare string entry and
+# an entry with no `reload` key are both `none`, so nothing written by an older
+# version changes meaning.
+isolated_rows() {
+  cfg -c '.isolate // []' |
+    jq -r '.[] | if type == "object" then [.path, (.reload // "none")] else [., "none"] end | @tsv' 2>/dev/null |
+    while IFS=$'\t' read -r p r; do
+      [[ -n $p ]] || continue
+      printf '%s\t%s\n' "${p/#\~/$HOME}" "${r:-none}"
+    done
+}
+
+# Is anything isolated that the compositor has to be told about? Asked before a
+# swap takes a `configerrors` baseline, so a machine with no tier-3 entry never
+# pays for one.
+has_tier3() { isolated_rows | grep -q $'\thypr$'; }
+
+# --------------------------------------------------------------- blocklist
+#
+# Four files are refused outright, and the reason is different in each case:
+# two are hardware, one is the loader that would take the rest with it, and one
+# is managed by Setup and must be identical in every profile — a per-profile
+# copy of it means exactly one profile has working workspace keys.
+#
+# Checked at `isolate add`, and again inside swap_isolated: config.json is the
+# user's file and can be edited by hand, and the swap is the step that would
+# act on it.
+blocklist_reason() {
+  local p=${1/#\~/$HOME}
+  case $p in
+  "$HYPR_DIR"/monitors.lua)
+    echo "monitors.lua is hardware, not preference — a switch that relayouts your displays is a bug" ;;
+  "$HYPR_DIR"/hyprmoncfg-monitors.lua)
+    echo "hyprmoncfg-monitors.lua is generated from your displays, not from your taste" ;;
+  "$HYPR_DIR"/hyprland.lua)
+    echo "hyprland.lua is the loader every other Hyprland file is required from, and it carries this plugin's managed line" ;;
+  "$HYPR_DIR"/profiles-keys.lua)
+    echo "profiles-keys.lua is managed by Setup and has to be identical in every profile, or only one profile has working workspace keys" ;;
+  "$ISOLATE_DIR" | "$ISOLATE_DIR"/* | "$STATE_DIR" | "$STATE_DIR"/* | "$PROFILE_DIR" | "$PROFILE_DIR"/*)
+    echo "that is this plugin's own data" ;;
+  esac
+  [[ $p == "$HOME"/* ]] || echo "it is outside your home directory"
+}
+
+is_blocklisted() { [[ -n $(blocklist_reason "$1") ]]; }
+
+# Omarchy's own copy of a hypr file, resolved the way Omarchy's migrations
+# resolve it (1781485962.sh:11-19). This is what a clean profile starts from and
+# what a broken store falls back to.
+packaged_hypr_file() {
+  local name=$1 p
+  for p in "${OMARCHY_PATH:-/usr/share/omarchy}/config/hypr/$name" "/etc/skel/.config/hypr/$name"; do
+    [[ -f $p ]] && { printf '%s\n' "$p"; return 0; }
+  done
+  return 1
+}
+
+# The packaged file for an isolated path, or nothing if the path is not one of
+# Omarchy's hypr files.
+packaged_for_path() {
+  local path=${1/#\~/$HOME}
+  [[ $path == "$HYPR_DIR"/* ]] || return 1
+  packaged_hypr_file "${path##*/}"
 }
 
 # Paths this plugin owns, whether isolated right now or parked in `shared`.
@@ -779,78 +871,637 @@ prune_isolated() {
   done
 }
 
+# ------------------------------------------------------- tier-3 seeding
+#
+# hyprland.lua requires hypr.input, hypr.bindings and hypr.looknfeel without
+# pcall, so a missing one aborts the chunk at the next reload: autostart, the
+# toggles and the managed workspace keys never load, and SUPER+1..0 are gone.
+# One rule — every profile has a store for every tier-3 path — applied wherever
+# a profile could otherwise end up without one: `isolate add`, `create --clean`,
+# a switch into a profile that has no store, and (phase 8) `purge`.
+
+# A same-directory temp file and a rename, so a store is never half-written:
+# the file it stands in for is required by a config that may be reloaded at any
+# moment by something other than us.
+copy_into_store() {
+  local src=$1 store=$2 tmp
+  mkdir -p "$(dirname "$store")" || return 1
+  tmp=$(mktemp "$store.XXXXXX") || return 1
+  cp -- "$src" "$tmp" && mv -T "$tmp" "$store" || { rm -f "$tmp"; return 1; }
+}
+
+# seed_tier3 <profile> <path> [<fallback-source>]
+#
+# The packaged file first — that is what a profile with no opinion should
+# start from — and otherwise whatever was live at the path before this switch,
+# which is the only other content that is certainly loadable. Stage 1 has
+# already refused the switch if neither exists.
+seed_tier3() {
+  local p=$1 path=$2 fallback=${3:-} store pkg
+  store=$(store_for "$p" "$path")
+  [[ -e $store || -L $store ]] && return 0
+  if pkg=$(packaged_for_path "$path"); then
+    note_packaged_hash "$pkg"
+    copy_into_store "$pkg" "$store" && return 0
+    warn "could not seed $p's copy of ${path/#$HOME/\~} from $pkg"
+    return 1
+  fi
+  if [[ -n $fallback && -f $fallback ]]; then
+    copy_into_store "$fallback" "$store" && return 0
+  fi
+  warn "nothing to seed $p's copy of ${path/#$HOME/\~} from"
+  return 1
+}
+
+# Every packaged version of a hypr file this engine has read. Without it
+# "byte-identical to a packaged version" has no force: against the current
+# packaged file alone a stock copy is either already current or unrecognisable.
+note_packaged_hash() {
+  local pkg=$1 h
+  h=$(sha256sum <"$pkg" 2>/dev/null | cut -d' ' -f1) || return 0
+  [[ -n $h ]] || return 0
+  mkdir -p "$STATE_DIR"
+  grep -qxF "$h" "$HYPR_PKG_HASHES" 2>/dev/null || printf '%s\n' "$h" >>"$HYPR_PKG_HASHES"
+}
+
+# An Omarchy update rewrites the packaged file, and a migration only reaches the
+# active profile's store. A store that is a stock copy of some packaged version
+# is brought up to date silently; anything else is the user's own override,
+# which Omarchy itself leaves alone (hyprland.lua:15-18).
+refresh_if_packaged() {
+  local p=$1 path=$2 pkg store s pkg_hash
+  pkg=$(packaged_for_path "$path") || return 0
+  note_packaged_hash "$pkg"
+  store=$(store_for "$p" "$path")
+  [[ -f $store && ! -L $store ]] || return 0
+  s=$(sha256sum <"$store" 2>/dev/null | cut -d' ' -f1)
+  pkg_hash=$(sha256sum <"$pkg" 2>/dev/null | cut -d' ' -f1)
+  [[ -n $s && -n $pkg_hash ]] || return 0
+  [[ $s == "$pkg_hash" ]] && return 0
+  # Not a version of the packaged file we have ever seen: the user's own.
+  grep -qxF "$s" "$HYPR_PKG_HASHES" 2>/dev/null || return 0
+  copy_into_store "$pkg" "$store" &&
+    echo "updated $p's copy of ${path/#$HOME/\~} to the packaged version"
+}
+
+# ------------------------------------------------- tier-3 reload and rollback
+
+hypr_live() { command -v hyprctl >/dev/null && [[ -n ${HYPRLAND_INSTANCE_SIGNATURE:-} ]]; }
+
+# `configerrors -j` answers `[""]` on a clean config, so the empty string is
+# dropped rather than compared.
+hypr_config_errors() {
+  local out
+  out=$(hyprctl configerrors -j 2>/dev/null) || { echo '[]'; return 0; }
+  jq -c 'if type == "array" then map(select(. != "")) else [] end' <<<"$out" 2>/dev/null || echo '[]'
+}
+
+# What is at a path right now, as one comparable string.
+path_desc() {
+  local p=$1
+  if [[ -L $p ]]; then printf 'link:%s\n' "$(readlink "$p")"
+  elif [[ -e $p ]]; then echo real
+  else echo absent; fi
+}
+
+hypr_errors_read() { [[ -s $HYPR_ERRORS ]] && cat "$HYPR_ERRORS" || echo '{}'; }
+
+hypr_errors_put() {
+  local doc=$1 tmp
+  mkdir -p "$STATE_DIR"
+  tmp=$(mktemp "$HYPR_ERRORS.XXXXXX") || return 1
+  printf '%s\n' "$doc" >"$tmp" && mv -T "$tmp" "$HYPR_ERRORS" || { rm -f "$tmp"; return 1; }
+}
+
+# A profile's entry goes when a later switch into it reloads cleanly, and when
+# the file it names stops being isolated.
+hypr_errors_drop() {
+  local p=$1 doc
+  [[ -s $HYPR_ERRORS ]] || return 0
+  doc=$(jq -c --arg p "$p" 'del(.[$p])' "$HYPR_ERRORS" 2>/dev/null) || return 0
+  hypr_errors_put "$doc"
+}
+
+hypr_errors_drop_path() {
+  local path=${1/#\~/$HOME} doc rel
+  [[ -s $HYPR_ERRORS ]] || return 0
+  rel=${path/#$HOME/\~}
+  doc=$(jq -c --arg p "$path" --arg r "$rel" '
+    with_entries(.value.files = ((.value.files // []) | map(select(. != $p and . != $r))))
+    | with_entries(select((.value.files // []) | length > 0))' "$HYPR_ERRORS" 2>/dev/null) || return 0
+  hypr_errors_put "$doc"
+}
+
+# tier3_reload <to> <baseline-json> <path> <prev-source> [<path> <prev-source> ...]
+#
+# One reload for the whole switch, compared against a baseline taken before
+# anything moved — a config that was already reporting errors must not roll a
+# file back on every switch. Only the files the compositor names are rolled
+# back, so a good override beside a broken one stays linked; when it names none
+# of them, every changed file is rolled back, because something in the set is
+# the cause and nothing is overwritten either way.
+tier3_reload() {
+  local to=$1 baseline=${2:-[]}
+  shift 2
+  hypr_live || return 0
+  hyprctl reload >/dev/null 2>&1
+
+  local now new
+  now=$(hypr_config_errors)
+  new=$(jq -nc --argjson a "$now" --argjson b "${baseline:-[]}" '$a - $b' 2>/dev/null) || new='[]'
+  if [[ -z $new || $new == "[]" ]]; then
+    [[ -n $to ]] && hypr_errors_drop "$to"
+    return 0
+  fi
+
+  local paths=() prevs=() path prev
+  while (($# >= 2)); do
+    paths+=("$1"); prevs+=("$2"); shift 2
+  done
+
+  # Blamed by a `path:line:` prefix in the error text, in whichever form the
+  # compositor writes the path.
+  local blamed=() i
+  for i in "${!paths[@]}"; do
+    path=${paths[$i]}
+    if jq -e --arg p "$path" --arg r "${path/#$HOME/\~}" \
+         'any(.[]; contains($p + ":") or contains($r + ":"))' <<<"$new" >/dev/null 2>&1; then
+      blamed+=("$i")
+    fi
+  done
+  # The error names none of them. Something in the set is still the cause.
+  ((${#blamed[@]})) || blamed=("${!paths[@]}")
+
+  local rolled=() kept=() store keptcopy src pkg
+  for i in "${blamed[@]}"; do
+    path=${paths[$i]}; prev=${prevs[$i]}
+    [[ -n $to ]] || continue
+    store=$(store_for "$to" "$path")
+    [[ -e $store || -L $store ]] || continue
+
+    # What to put back: the file that was live before the switch, else the
+    # packaged one. Without either there is nothing better than what is there.
+    src=""
+    [[ -n $prev && $prev != - && -f $prev ]] && src=$prev
+    [[ -z $src ]] && { pkg=$(packaged_for_path "$path") && src=$pkg; }
+    [[ -n $src ]] || { warn "${path/#$HOME/\~} broke the config and there is nothing to put back"; continue; }
+
+    # Timestamped, so a second rollback can never erase the first kept copy —
+    # and the profile's own copy is often a hand-edited file that exists
+    # nowhere else.
+    keptcopy="$store.broken.$(date +%s)"
+    if ! mv -T "$store" "$keptcopy"; then
+      warn "could not keep $to's broken copy of ${path/#$HOME/\~}"
+      continue
+    fi
+    if ! copy_into_store "$src" "$store"; then
+      mv -T "$keptcopy" "$store"
+      warn "could not roll ${path/#$HOME/\~} back"
+      continue
+    fi
+    [[ -e $path || -L $path ]] || ln -sn "$store" "$path" 2>/dev/null
+    rolled+=("${path/#$HOME/\~}")
+    kept+=("${keptcopy/#$HOME/\~}")
+    warn "${path/#$HOME/\~} had config errors — $to's copy is kept at ${keptcopy/#$HOME/\~} and the previous file is in use"
+  done
+
+  hyprctl reload >/dev/null 2>&1
+
+  ((${#rolled[@]})) || return 0
+  local doc
+  doc=$(jq -c --arg p "$to" \
+           --argjson files "$(printf '%s\n' "${rolled[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+           --argjson kept "$(printf '%s\n' "${kept[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')" \
+           --argjson errors "$new" --argjson at "$(date +%s)" \
+           '.[$p] = {files: $files, kept: $kept, errors: $errors, at: $at}' <<<"$(hypr_errors_read)")
+  [[ -n $doc ]] && hypr_errors_put "$doc"
+  return 0
+}
+
+# --------------------------------------------------------- the reload probe
+#
+# Swapping a Lua file and reloading was confirmed on this machine (§0.1). That
+# proves one machine, not another Hyprland build or another way of layering a
+# config — so whether tier 3 works here is measured, cached against the
+# Hyprland version, and reported as a state string rather than assumed.
+#
+# The block is APPENDED, never substituted: keys set in looknfeel.lua are
+# overridden after it here — hyprmoncfg-monitors.lua is dofile'd last from
+# hyprland.lua:34 — so a probe that edited the file in place could be overruled
+# by a later file and report `broken` on a machine where tier 3 works.
+HYPR_PROBE_KEYS=(decoration:rounding decoration:dim_strength general:border_size)
+
+hypr_version_tag() { hyprctl version -j 2>/dev/null | jq -r '.tag // ""'; }
+
+# The cached answer, or `unknown` — never a guess. A different Hyprland version
+# resets it: the thing measured is the compositor's behaviour.
+hypr_reload_state() {
+  hypr_live || { echo unknown; return 0; }
+  [[ -s $PROBES_FILE ]] || { echo unknown; return 0; }
+  local tag; tag=$(hypr_version_tag)
+  [[ -n $tag ]] || { echo unknown; return 0; }
+  jq -r --arg v "$tag" '
+    if ((.hyprland_reload.version // "") == $v)
+    then (.hyprland_reload.state // "unknown") else "unknown" end' "$PROBES_FILE" 2>/dev/null ||
+    echo unknown
+}
+
+hypr_probe_store() {
+  local state=$1 doc tmp
+  mkdir -p "$STATE_DIR"
+  doc=$(jq -nc --slurpfile old <(([[ -s $PROBES_FILE ]] && cat "$PROBES_FILE") || echo '{}') \
+           --arg s "$state" --arg v "$(hypr_version_tag)" --argjson at "$(date +%s)" \
+           '($old[0] // {}) + {hyprland_reload: {state: $s, version: $v, at: $at}}') || return 1
+  tmp=$(mktemp "$PROBES_FILE.XXXXXX") || return 1
+  printf '%s\n' "$doc" >"$tmp" && mv -T "$tmp" "$PROBES_FILE" || { rm -f "$tmp"; return 1; }
+}
+
+# The §0.1 test, automated and self-restoring. Probes THROUGH a symlink, which
+# is what tier 3 does, and puts back exactly what was there — a real file as a
+# real file, a symlink as a symlink — from a trap that runs whatever happens.
+hypr_reload_probe() {
+  hypr_live ||
+    { warn "there is no Hyprland session to probe — this is only answerable from inside one"; return 1; }
+
+  local target="$HYPR_DIR/looknfeel.lua" work="$STATE_DIR/probe" result
+  mkdir -p "$work" || return 1
+  rm -f "$work/looknfeel.lua" "$work/original"
+
+  result=$(
+    orig=$(path_desc "$target")
+    restore() {
+      case $orig in
+      absent) rm -f "$target" ;;
+      link:*) rm -f "$target"; ln -sn "${orig#link:}" "$target" ;;
+      real)
+        # A copy, not a move: restore runs once per key as well as from the
+        # trap, and a move would leave the second key's iteration with nothing
+        # to put back. `cp -a` restores the mode and the timestamp too, so the
+        # file is exactly what it was. The copy goes with $work at the end.
+        if [[ -f $work/original ]]; then
+          rm -f "$target"
+          cp -a "$work/original" "$target"
+        fi ;;
+      esac
+      hyprctl reload >/dev/null 2>&1
+    }
+    # Unconditional, and up before the first thing that could move the file.
+    trap restore EXIT
+
+    content=""
+    [[ -e $target ]] && content=$(cat "$target" 2>/dev/null)
+    if [[ $orig == real ]]; then
+      cp -a "$target" "$work/original" || { echo unknown; exit 0; }
+    fi
+
+    for key in "${HYPR_PROBE_KEYS[@]}"; do
+      raw=$(hyprctl getoption -j "$key" 2>/dev/null)
+      [[ -n $raw ]] || continue
+      kind=$(jq -r 'if has("int") then "int" elif has("float") then "float" else "" end' <<<"$raw" 2>/dev/null)
+      [[ $kind == int || $kind == float ]] || continue
+      v=$(jq -r 'if has("int") then (.int | tostring) else (.float | tostring) end' <<<"$raw")
+      # Far enough from the current value that no rounding can confuse the two.
+      if [[ $kind == int ]]; then want=$((${v%.*} + 3))
+      else want=$(awk -v x="$v" 'BEGIN { printf "%.3f", x + 0.17 }'); fi
+
+      printf '%s\n\n-- graveklar.profiles reload probe; removed again immediately\nhl.config({ %s = { %s = %s } })\n' \
+        "$content" "${key%%:*}" "${key##*:}" "$want" >"$work/looknfeel.lua" || continue
+      rm -f "$target"
+      ln -sn "$work/looknfeel.lua" "$target" || continue
+      hyprctl reload >/dev/null 2>&1
+      got=$(hyprctl getoption -j "$key" 2>/dev/null |
+            jq -r 'if has("int") then (.int | tostring) else (.float | tostring) end' 2>/dev/null)
+      restore
+      # The swapped value came back: the compositor re-read the file through
+      # the symlink, which is the whole question.
+      if [[ -n $got ]] &&
+         awk -v a="$got" -v b="$want" 'BEGIN { d = a - b; if (d < 0) d = -d; exit !(d < 0.005) }'; then
+        echo ok
+        exit 0
+      fi
+      # V unchanged, or something else entirely: ambiguous, try the next key.
+    done
+    echo broken
+  )
+
+  # The copy the probe linked at is inert once the path is back, and leaving a
+  # stray looknfeel.lua in the state directory invites someone to wonder whose
+  # it is.
+  rm -rf "$work"
+
+  case ${result:-unknown} in
+  ok | broken) hypr_probe_store "$result" ;;
+  *) result=unknown ;;
+  esac
+  printf '%s\n' "$result"
+}
+
+# A path that cannot be filed is held, never handed on: the real file stays
+# where it is, `to` is not linked over it, and the line written here blocks
+# every later switch until `setup fix switch` files it.
+hold_path() {
+  local path=$1 owner=$2
+  mkdir -p "$ISOLATE_DIR"
+  printf '%s\t%s\n' "$path" "$owner" >>"$PENDING_OWNER"
+  warn "could not move ${path/#$HOME/\~} into $owner's store — it is left in place, and switching is blocked until Setup files it"
+}
+
+# Runs inside the state lock. Never overwrites a real file, never unlinks one it
+# could not save, and never deletes a store before the live file is safely
+# somewhere else.
 swap_isolated() {
-  local from=${1:-} to=${2:-} path from_store to_store
-  while read -r path; do
+  local from=${1:-} to=${2:-} path reload from_store to_store
+  local prev prev_src dest owner baseline='[]' changed=()
+
+  # Before anything moves: a config that was already broken must not look like
+  # something this switch did.
+  if has_tier3 && hypr_live; then baseline=$(hypr_config_errors); fi
+
+  while IFS=$'\t' read -r path reload; do
     [[ -n $path ]] || continue
     [[ $path == "$HOME"/* ]] || { warn "refusing to isolate '$path' (outside your home)"; continue; }
+    if is_blocklisted "$path"; then
+      warn "not isolating ${path/#$HOME/\~}: $(blocklist_reason "$path")"
+      continue
+    fi
 
-    if [[ -L $path ]]; then
+    # What is here now, and where its content can still be read from after this
+    # iteration has moved it. Both are needed: the first says whether anything
+    # changed, the second is what a rollback puts back.
+    prev=$(path_desc "$path")
+    prev_src=""
+    [[ $prev == link:* ]] && prev_src=${prev#link:}
+
+    # No switch runs while a path is held (§4.9), so whatever is here belongs to
+    # the outgoing profile and to nobody else.
+    owner=$from
+
+    if [[ -L $path && $(readlink "$path") == "$ISOLATE_DIR"/* ]]; then
+      # Ours. The target is already a store, so there is nothing to save.
       rm -f "$path"
-    elif [[ -e $path ]]; then
-      if [[ -n $from ]]; then
-        from_store=$(store_for "$from" "$path")
-        mkdir -p "$(dirname "$from_store")"
-        rm -rf "$from_store"
-        mv "$path" "$from_store" || warn "could not save '$path' into $from"
+    elif [[ -e $path || -L $path ]]; then
+      if [[ -n $owner ]]; then
+        from_store=$(store_for "$owner" "$path")
+        mkdir -p "$(dirname "$from_store")" || { hold_path "$path" "$owner"; continue; }
+        # .prev may be a tier-2 directory, and `mv -T` onto a non-empty
+        # directory fails — so it is cleared first, and only the previous
+        # store is ever at risk, never the live file.
+        rm -rf "$from_store.prev"
+        if [[ -e $from_store || -L $from_store ]]; then
+          mv -T "$from_store" "$from_store.prev" || { hold_path "$path" "$owner"; continue; }
+        fi
+        if mv -T "$path" "$from_store"; then
+          prev_src=$from_store
+        else
+          [[ -e $from_store.prev || -L $from_store.prev ]] && mv -T "$from_store.prev" "$from_store"
+          hold_path "$path" "$owner"
+          continue
+        fi
+      else
+        # Nobody to file it under. Moved aside rather than unlinked: this is
+        # the user's Hyprland config or a dock they have been editing, and an
+        # absent current.json is not a reason to lose it.
+        dest="$ISOLATE_DIR/.orphaned/$(date +%s)/$(store_key "$path")"
+        mkdir -p "${dest%/*}"
+        mv -T "$path" "$dest" || { warn "could not move ${path/#$HOME/\~} aside"; continue; }
+        prev_src=$dest
+        warn "moved ${path/#$HOME/\~} aside to ${dest/#$HOME/\~}: no current profile owned it"
       fi
-      # With no outgoing profile the live data has no owner to be filed under,
-      # so it is left alone rather than moved somewhere arbitrary.
     fi
 
     if [[ -n $to ]]; then
       to_store=$(store_for "$to" "$path")
-      if [[ -e $to_store ]]; then
+      if [[ $reload == hypr ]]; then
+        # A required file may never be absent, so tier 3 seeds rather than
+        # leaving the path empty the way tier 2 does.
+        [[ -e $to_store || -L $to_store ]] || seed_tier3 "$to" "$path" "$prev_src"
+        refresh_if_packaged "$to" "$path"
+      fi
+      if [[ ! -e $to_store && ! -L $to_store ]]; then
+        : # Tier 2 with no store: absent, and the plugin makes a fresh one.
+      elif [[ -e $path || -L $path ]]; then
+        warn "something recreated ${path/#$HOME/\~} during the switch; not linking over it"
+      else
         mkdir -p "$(dirname "$path")"
-        ln -sfn "$to_store" "$path"
+        # -n so a link to a directory is replaced rather than written inside
+        # it, and deliberately no -f: this never replaces anything.
+        ln -sn "$to_store" "$path" || warn "could not point ${path/#$HOME/\~} at $to's copy"
       fi
     fi
-  done < <(isolated_paths)
+
+    [[ $reload == hypr ]] || continue
+    [[ $(path_desc "$path") == "$prev" ]] && continue
+    changed+=("$path" "${prev_src:--}")
+  done < <(isolated_rows)
+
+  ((${#changed[@]})) && tier3_reload "$to" "$baseline" "${changed[@]}"
+  return 0
+}
+
+# ------------------------------------------------- the manifest convention
+#
+# A plugin says where its own state lives and the config page offers it, with
+# no table here to maintain as the suite grows:
+#
+#   "omarchy": { "profileData": ["~/.local/state/omarchy-spotify"] }
+#
+# Read from the installed manifests directly rather than through
+# `omarchy-plugin-catalog`, which does not carry the `omarchy` object — it
+# emits id, name, description, kinds, entry points and the bar-widget block,
+# and nothing else. The catalog is still the source for everything else; this
+# is the one field it does not have.
+PLUGIN_ROOT="$CONFIG_HOME/omarchy/plugins"
+
+# Known third-party plugins that keep state outside shell.json and declare
+# nothing. `id<TAB>path<TAB>label`; only offered when the plugin is installed.
+PROFILE_DATA_FALLBACK=(
+  $'quickshell.spotify\t~/.local/state/omarchy-spotify\tSpotify account'
+  $'io.github.claudsondouglas.arcdock\t~/.config/omarchy/arc-dock.json\tDock layout'
+)
+
+# `plugin<TAB>path<TAB>label<TAB>source`, declarations first so a plugin that
+# has started declaring wins over its entry in the table above.
+declared_profile_data() {
+  local mf id p name row
+  {
+    for mf in "$PLUGIN_ROOT"/*/manifest.json; do
+      [[ -f $mf ]] || continue
+      jq -r '(.omarchy.profileData // [])[] as $p
+             | [(.id // ""), $p, (.name // .id // ""), "declared"] | @tsv' "$mf" 2>/dev/null
+    done
+    for row in "${PROFILE_DATA_FALLBACK[@]}"; do
+      IFS=$'\t' read -r id p name <<<"$row"
+      [[ -d $PLUGIN_ROOT/$id ]] || continue
+      printf '%s\t%s\t%s\ttable\n' "$id" "$p" "$name"
+    done
+  } | while IFS=$'\t' read -r id p name src; do
+    [[ -n $id && -n $p ]] || continue
+    printf '%s\t%s\t%s\t%s\n' "$id" "${p/#\~/$HOME}" "$name" "$src"
+  done | awk -F'\t' '!seen[$2]++'
+}
+
+# Where an isolated path came from, for the config page's grouping.
+isolate_source() {
+  local path=${1/#\~/$HOME} src
+  src=$(declared_profile_data | awk -F'\t' -v p="$path" '$2 == p { print $4; exit }')
+  [[ -n $src ]] && { printf '%s\n' "$src"; return 0; }
+  [[ $path == "$HYPR_DIR"/* ]] && { echo hypr; return 0; }
+  echo custom
+}
+
+isolate_list_json() {
+  local cur; cur=$(current_profile)
+  local path reload active store
+  while IFS=$'\t' read -r path reload; do
+    [[ -n $path ]] || continue
+    active=false
+    if [[ -L $path && -n $cur ]]; then
+      store=$(store_for "$cur" "$path")
+      [[ $(readlink "$path") == "$store" ]] && active=true
+    fi
+    printf '%s\t%s\t%s\t%s\t%s\n' "$path" \
+      "$(cfg -c '.isolate // []' | jq -r --arg p "$path" --arg h "$HOME" '
+          def norm: if startswith("~/") then ($h + .[1:]) else . end;
+          .[] | select(type == "object") | select((.path | norm) == $p) | .plugin // ""' | head -1)" \
+      "$reload" "$active" "$(isolate_source "$path")"
+  done < <(isolated_rows) |
+    jq -R -s --arg home "$HOME" '
+      [ split("\n")[] | select(length > 0) | split("\t")
+        | {path: (.[0] | sub("^" + $home; "~")), plugin: .[1], reload: .[2],
+           active: (.[3] == "true"), source: .[4]} ]'
+}
+
+# Declared and table entries not yet isolated, minus the blocklist: what the
+# config page offers with one click.
+isolate_candidates_json() {
+  local isolated id path name src
+  isolated=$(isolated_paths)
+  while IFS=$'\t' read -r id path name src; do
+    [[ -n $path ]] || continue
+    grep -qxF "$path" <<<"$isolated" && continue
+    is_blocklisted "$path" && continue
+    local kind=absent
+    [[ -L $path ]] && kind=symlink
+    [[ -d $path ]] && kind=directory
+    [[ -f $path && ! -L $path ]] && kind=file
+    printf '%s\t%s\t%s\t%s\t%s\n' "$id" "$path" "$name" "$src" "$kind"
+  done < <(declared_profile_data) |
+    jq -R -s --arg home "$HOME" '
+      [ split("\n")[] | select(length > 0) | split("\t")
+        | {plugin: .[0], path: (.[1] | sub("^" + $home; "~")), name: .[2],
+           source: .[3], kind: .[4], exists: (.[4] != "absent")} ]'
+}
+
+# `stat` and the blocklist, and nothing else: this is what the custom-path field
+# calls while someone is still typing, so it never follows a path into anything
+# and never writes.
+isolate_resolve_json() {
+  local path=${1/#\~/$HOME} kind=absent size=0 reason
+  if [[ -L $path ]]; then kind=symlink
+  elif [[ -d $path ]]; then kind=directory
+  elif [[ -e $path ]]; then kind=file; fi
+  [[ $kind == file ]] && size=$(stat -c %s "$path" 2>/dev/null || echo 0)
+  reason=$(blocklist_reason "$path")
+  jq -nc --arg p "${path/#$HOME/\~}" --arg k "$kind" --argjson s "${size:-0}" \
+         --argjson b "$([[ -n $reason ]] && echo true || echo false)" --arg r "$reason" \
+    '{path: $p, exists: ($k != "absent"), kind: $k, size: $s, blocklisted: $b, reason: $r}'
+}
+
+# Rule 1 of the seeding rule (§5.3a): the live file goes into every other
+# profile that has no copy, before the swap files it under the current one.
+# Without this, a switch into a profile that existed before the add would find
+# no store and — for a required Hyprland file — no file at all.
+seed_other_profiles() {
+  local path=$1 cur=$2 src="" name store pkg
+  if [[ -e $path && ! -d $path ]]; then src=$path
+  elif pkg=$(packaged_for_path "$path"); then src=$pkg; note_packaged_hash "$pkg"; fi
+  [[ -n $src ]] || return 0
+  while read -r name; do
+    [[ -n $name && $name != "$cur" ]] || continue
+    store=$(store_for "$name" "$path")
+    [[ -e $store || -L $store ]] && continue
+    copy_into_store "$src" "$store" ||
+      warn "could not give $name its own copy of ${path/#$HOME/\~}"
+  done < <(profile_names)
 }
 
 cmd_isolate() {
-  local verb=${1:-list} path=${2:-}
+  local verb=${1:-list} plugin="" reload="" path="" a
+  shift || true
+  # Flags in any order, and the first bare word is the path: the panel sends
+  # `--reload hypr` and a person sends neither.
+  while (($#)); do
+    a=$1
+    case $a in
+    --json) JSON=1 ;;
+    --plugin) plugin=${2:-}; shift ;;
+    --reload) reload=${2:-}; shift ;;
+    -*) die "unknown option '$a'" ;;
+    *) [[ -n $path ]] || path=$a ;;
+    esac
+    shift
+  done
+
   # Adding or removing a path moves real files between stores, which is exactly
-  # what a switch is doing; the two may not interleave. `list` never waits.
+  # what a switch is doing; the two may not interleave. The read verbs never
+  # wait — the config page calls `resolve` on every keystroke.
   case $verb in
   add | remove) require_no_journal; lock_or_busy ;;
   esac
+
   case $verb in
   list)
-    local any=0
+    if [[ -n $JSON ]]; then isolate_list_json; return 0; fi
+    local any=0 p
     while read -r p; do
       [[ -n $p ]] || continue
       any=1
       local mark="  "
       [[ -L $p ]] && mark="* "
-      printf '%s%s\n' "$mark" "${p/#$HOME/~}"
+      printf '%s%s\n' "$mark" "${p/#$HOME/\~}"
     done < <(isolated_paths)
     ((any)) || echo "nothing isolated — try: omarchy-profile isolate add ~/.local/state/omarchy-spotify"
     echo
     echo "* = currently pointed at the active profile's copy" ;;
+  candidates) isolate_candidates_json ;;
+  resolve)
+    [[ -n $path ]] || die "usage: omarchy-profile isolate resolve <path> --json"
+    isolate_resolve_json "$path" ;;
   add)
-    # isolate add [--plugin <id>] <path>
+    # isolate add [--plugin <id>] [--reload hypr|none] <path>
     #
-    # The tag is what lets one "same in every profile" control move a plugin's
-    # paths together. It cannot be guessed: quickshell.spotify keeps its session
-    # in omarchy-spotify, and nothing in either name implies the other.
-    local plugin=""
-    if [[ $path == --plugin ]]; then plugin=${3:-}; path=${4:-}; fi
-    [[ -n $path ]] || die "usage: omarchy-profile isolate add [--plugin <id>] <path>"
-    local rel; rel=$(printf '%s' "$path" | sed "s|^$HOME/|~/|")
-    if [[ -n $plugin ]]; then
-      drop_isolate_path "$path"
-      cfg_set --arg p "$rel" --arg id "$plugin" \
-        '.isolate = ((.isolate // []) + [{path: $p, plugin: $id}])' ||
-        die "could not record '$path'"
-    else
-      cfg_set --arg p "$rel" '.isolate = (((.isolate // []) + [$p]) | unique)' ||
-        die "could not record '$path'"
+    # The plugin tag is what lets one "same in every profile" control move a
+    # plugin's paths together. It cannot be guessed: quickshell.spotify keeps
+    # its session in omarchy-spotify, and nothing in either name implies the
+    # other.
+    [[ -n $path ]] || die "usage: omarchy-profile isolate add [--plugin <id>] [--reload hypr] <path>"
+    local expanded=${path/#\~/$HOME}
+    local reason; reason=$(blocklist_reason "$expanded")
+    [[ -n $reason ]] &&
+      refuse 1 blocklisted "cannot isolate ${expanded/#$HOME/\~}: $reason" \
+        "$(jq -nc --arg p "${expanded/#$HOME/\~}" --arg r "$reason" '{path: $p, reason: $r}')"
+
+    # A file under ~/.config/hypr is tier 3 unless the caller says otherwise:
+    # the compositor has to be told, and nobody adding looknfeel.lua by hand
+    # should have to know that.
+    if [[ -z $reload ]]; then
+      if [[ $expanded == "$HYPR_DIR"/* ]]; then reload=hypr; else reload=none; fi
     fi
+    [[ $reload == hypr || $reload == none ]] || die "--reload takes hypr or none"
+
+    local rel=${expanded/#$HOME/\~}
+    drop_isolate_path "$expanded"
+    cfg_set --arg p "$rel" --arg id "$plugin" --arg r "$reload" \
+      '.isolate = ((.isolate // []) + [{path: $p, reload: $r} + (if $id == "" then {} else {plugin: $id} end)])' ||
+      die "could not record '$rel'"
+
+    local cur; cur=$(current_profile)
+    # Every other profile gets a copy of the live file first, while it is still
+    # at the path: a required file may never be absent in any profile.
+    [[ $reload == hypr ]] && seed_other_profiles "$expanded" "$cur"
     # Adopt what is live into the profile the user is in, then point at it.
     # Passing the same profile as both sides does exactly that: the real file
     # is filed under it, and the symlink comes back to the copy just made.
-    local cur; cur=$(current_profile)
     [[ -n $cur ]] && swap_isolated "$cur" "$cur"
     echo "isolating $rel" ;;
   remove)
@@ -865,8 +1516,10 @@ cmd_isolate() {
       [[ -e $store ]] && mv "$store" "$expanded"
     fi
     drop_isolate_path "$expanded" || die "could not update the isolate list"
-    echo "no longer isolating ${path/#$HOME/~}" ;;
-  *) die "unknown isolate verb '$verb' (list, add, remove)" ;;
+    # A rollback recorded against this file has nothing left to describe.
+    hypr_errors_drop_path "$expanded"
+    echo "no longer isolating ${expanded/#$HOME/\~}" ;;
+  *) die "unknown isolate verb '$verb' (list, add, remove, candidates, resolve)" ;;
   esac
 }
 
@@ -924,14 +1577,17 @@ cmd_shared() {
       die "the profile picker stays shared — a profile that could hide it would leave no way back"
     cfg_set --arg id "$id" '.pinned_plugins = ((.pinned_plugins // []) | map(select(. != $id)))' ||
       die "could not unpin '$id'"
-    # Anything parked in shared_paths goes back to being isolated.
-    local path rel
+    # Anything parked in shared_paths goes back to being isolated, with the same
+    # reload mode `isolate add` would have given it — a Hyprland file that came
+    # back as tier 2 would swap without telling the compositor.
+    local path rel reload
     while read -r path; do
       [[ -n $path ]] || continue
       rel=$(printf '%s' "${path/#\~/$HOME}" | sed "s|^$HOME/|~/|")
-      cfg_set --arg p "$rel" --arg id "$id" \
+      if [[ ${path/#\~/$HOME} == "$HYPR_DIR"/* ]]; then reload=hypr; else reload=none; fi
+      cfg_set --arg p "$rel" --arg id "$id" --arg r "$reload" \
         '.shared_paths = ((.shared_paths // []) | map(select(.path != $p)))
-         | .isolate = (((.isolate // []) + [{path: $p, plugin: $id}]))' ||
+         | .isolate = (((.isolate // []) + [{path: $p, plugin: $id, reload: $r}]))' ||
         warn "could not isolate $rel again"
     done < <(cfg -c '.shared_paths // []' | jq -r --arg id "$id" '.[] | select(.plugin == $id) | .path')
     local cur; cur=$(current_profile)
@@ -1055,8 +1711,17 @@ write_catalog() {
   state=$(omarchy plugin list --json 2>/dev/null) || state='[]'
   meta=$(omarchy-plugin-catalog 2>/dev/null) || meta='[]'
 
+  # Where each plugin says its own state lives (§5.6). Not in the catalog's
+  # output — it carries no `omarchy` object — so it comes from the manifests,
+  # which is the same walk one level down.
+  local declared
+  declared=$(declared_profile_data |
+    jq -R -s '[ split("\n")[] | select(length > 0) | split("\t")
+                | {id: .[0], path: .[1], source: .[3]} ]') || declared='[]'
+
   tmp=$(mktemp "$STATE_DIR/plugins.json.XXXXXX") || return 1
   jq -nc --argjson state "${state:-[]}" --argjson meta "${meta:-[]}" \
+         --argjson declared "${declared:-[]}" \
          --argjson pinned "${pinned:-[]}" '
     ($meta | map({key: .id, value: .}) | from_entries) as $by_id
     | [ $state[] | . as $p | ($by_id[$p.id] // {}) as $m | {
@@ -1069,6 +1734,9 @@ write_catalog() {
         # $p.id, not .id: after `$pinned |` the input is the array, so `.id`
         # would try to index it with a string.
         pinned: (($pinned | index($p.id)) != null),
+        # State of its own outside shell.json, which is what the config page
+        # offers to give every profile a copy of.
+        profileData: [ $declared[] | select(.id == $p.id) | .path ],
         # The widget blurb first: it is written about the thing in the bar and
         # is shorter than the plugin-level description, which often reads like
         # a README paragraph.
@@ -1547,10 +2215,26 @@ require_no_held_paths() {
 }
 
 # Every tier-3 path must have something to seed an incoming profile from, or
-# the switch would leave a `require`d Hyprland file absent. Tier 3 arrives with
-# the isolate phase; until there are tier-3 entries this cannot fire, and it is
-# wired here so stage 1 has the shape the plan gives it.
-preflight_tier3() { return 0; }
+# the switch would leave a `require`d Hyprland file absent and hyprland.lua
+# would abort at it — taking autostart, the toggles and the workspace keys with
+# it. Checked in stage 1, before anything is captured, swapped or written: a
+# refusal here costs nothing, and there is no good answer half way through.
+preflight_tier3() {
+  local to=${1:-} path reload store
+  [[ -n $to ]] || return 0
+  while IFS=$'\t' read -r path reload; do
+    [[ $reload == hypr ]] || continue
+    is_blocklisted "$path" && continue
+    store=$(store_for "$to" "$path")
+    [[ -e $store || -L $store ]] && continue          # the profile has its own
+    packaged_for_path "$path" >/dev/null && continue  # Omarchy ships one
+    [[ -e $path || -L $path ]] && continue            # what is live can be copied
+    refuse 1 missing_packaged_config \
+      "$to has no copy of ${path/#$HOME/\~}, Omarchy ships none, and there is nothing at the path to copy — switching would leave a file Hyprland requires absent" \
+      "$(jq -nc --arg p "${path/#$HOME/\~}" --arg n "$to" '{path: $p, profile: $n}')"
+  done < <(isolated_rows)
+  return 0
+}
 
 # Stage 2. The only thing that touches profile data, and the only holder of the
 # lock from the moment stage 1 exits.
@@ -1859,11 +2543,36 @@ hl_close_window() {
 
 global_ws_name() { cfg '.global_workspace // ""'; }
 
+# Are the global-workspace bindings in the managed keys file, and is that file
+# actually loaded? Both, because a binding in a file nothing requires is not a
+# binding.
+global_keys_bound() {
+  local name; name=$(global_ws_name)
+  [[ -n $name ]] || return 1
+  [[ -s $KEYS_FILE ]] || return 1
+  [[ -n $(keys_line_no) ]] || return 1
+  grep -qF "toggle_special(\"$name\")" "$KEYS_FILE"
+}
+
 cmd_global() {
-  local verb=${1:-status} arg=${2:-}
+  local verb=${1:-status} arg=${2:-} a
+  for a in "$@"; do [[ $a == --json ]] && JSON=1; done
+  [[ $arg == --json ]] && arg=""
+
   case $verb in
   status)
     local name; name=$(global_ws_name)
+    if [[ -n $JSON ]]; then
+      local windows='[]'
+      [[ -n $name ]] && command -v hyprctl >/dev/null &&
+        windows=$(hyprctl -j clients 2>/dev/null |
+          jq -c --arg w "special:$name" '[.[] | select(.workspace.name == $w)
+                                            | {class: .class, title: .title}]' 2>/dev/null)
+      jq -nc --arg n "$name" --argjson w "${windows:-[]}" \
+             --argjson k "$(global_keys_bound && echo true || echo false)" \
+        '{enabled: ($n != ""), name: $n, windows: $w, keysBound: $k}'
+      return 0
+    fi
     if [[ -z $name ]]; then
       echo "no global workspace (turn one on with: omarchy-profile global enable music)"
     else
@@ -1902,9 +2611,17 @@ EOF
     local name; name=$(global_ws_name)
     [[ -n $name ]] || die "no global workspace; try: omarchy-profile global enable music"
     hyprctl dispatch "hl.dsp.workspace.toggle_special(\"$name\")" >/dev/null ;;
-  # Writing the global-workspace bindings into the managed keys file is the
-  # keybinding phase's; named here so the contract's verb is dispatchable.
-  keys) not_implemented "global keys" ;;
+  keys)
+    # The bindings go into the managed file, never into the user's own
+    # bindings.lua — which they may isolate per profile, and which Setup does
+    # not write to. Without the managed file in place there is nothing to write
+    # into, and the `keys` Setup row is the thing that puts it there.
+    local name; name=$(global_ws_name)
+    [[ -n $name ]] || die "no global workspace; try: omarchy-profile global enable music"
+    [[ -s $KEYS_FILE && -n $(keys_line_no) ]] ||
+      die "the managed workspace keys file is not in place yet — fix the 'Workspace keys' row in Setup first"
+    keys_fix || exit 1
+    echo "SUPER+M toggles special:$name, SUPER+CTRL+M sends the focused window there" ;;
   *) die "unknown global verb '$verb' (status, enable, disable, send, toggle, keys)" ;;
   esac
 }
@@ -2082,6 +2799,51 @@ cmd_close_profile() {
 }
 
 # ------------------------------------------------------------------ commands
+
+# What a profile IS, for the config page's first group: the things that are
+# always its own, whether or not anything is isolated. Display only — every one
+# of them is changed somewhere else, and stating them here is what makes the
+# machine-wide groups below it read as the exception they are.
+cmd_config() {
+  local name=${1:-}
+  [[ -n $name ]] || name=$(current_profile)
+  [[ -n $name ]] && exists "$name" ||
+    refuse 1 no_such_profile "no such profile '${name:-}' (try: omarchy-profile list)"
+
+  local file; file=$(file_for "$name")
+  local catalog="$STATE_DIR/plugins.json" total_plugins=0
+  [[ -s $catalog ]] && total_plugins=$(jq 'length' "$catalog" 2>/dev/null || echo 0)
+
+  local apps_all=0 apps_allowed=0
+  if is_master "$name"; then
+    apps_all=$(apps_list_json "$name" | jq '.all | length' 2>/dev/null || echo 0)
+    apps_allowed=$apps_all
+  else
+    apps_all=$(apps_list_json "$name" | jq '.all | length' 2>/dev/null || echo 0)
+    apps_allowed=$(jq '(.apps.allowed // []) | length' "$file" 2>/dev/null || echo 0)
+  fi
+
+  jq -c --arg name "$name" --argjson plugins "${total_plugins:-0}" \
+        --argjson appsAll "${apps_all:-0}" --argjson appsAllowed "${apps_allowed:-0}" \
+        --argjson master "$(is_master "$name" && echo true || echo false)" \
+        --argjson span "$(cfg .workspace_span)" '
+    (.workspaces.offset // 0) as $off
+    | {profile: $name, master: $master,
+       theme: (.theme // ""),
+       wallpaper: (.wallpaper // ""),
+       # A captured layout, or Omarchy'"'"'s own: the count is what a person can
+       # check against their own bar.
+       bar: {captured: ((.bar // null) != null),
+             widgets: ((.bar // {}) | [.. | objects | select(has("id")) | .id] | length)},
+       plugins: {total: $plugins, disabled: ((.plugins.disabled // []) | length),
+                 enabled: ([$plugins - ((.plugins.disabled // []) | length), 0] | max)},
+       apps: {total: $appsAll, allowed: (if $master then $appsAll else $appsAllowed end)},
+       workspaces: {offset: $off, span: (.workspaces.span // $span),
+                    first: ($off + 1), last: ($off + (.workspaces.span // $span))},
+       dnd: (.dnd // false),
+       idle: (.idle // {}),
+       restore_apps: (.restore_apps // "ask")}' "$file"
+}
 
 cmd_list() {
   local cur master
@@ -2264,6 +3026,16 @@ cmd_create() {
       mkdir -p "$(dirname "$dst")"
       cp -a "$src" "$dst" || warn "could not copy $path into $name"
     done < <(isolated_paths)
+  else
+    # Clean copies nothing — except the tier-3 files, which are required by
+    # hyprland.lua and may never be absent. Those come from the packaged
+    # version, which is exactly what "a stock Omarchy desktop" means.
+    local path reload
+    while IFS=$'\t' read -r path reload; do
+      [[ $reload == hypr ]] || continue
+      is_blocklisted "$path" && continue
+      seed_tier3 "$name" "$path" "$path"
+    done < <(isolated_rows)
   fi
 
   write_index
@@ -2971,7 +3743,15 @@ for w = 1, 10 do
 end
 hl.unbind("SUPER + TAB");         o.bind("SUPER + TAB", "Next workspace in this profile", engine .. " ws next")
 hl.unbind("SUPER + SHIFT + TAB"); o.bind("SUPER + SHIFT + TAB", "Previous workspace in this profile", engine .. " ws prev")
--- global workspace bindings are written here by \`global keys\` when the global workspace is enabled
+EOF
+  # The global workspace, when there is one. Plain SUPER+M and SUPER+CTRL+M:
+  # SUPER+SHIFT+M and SUPER+SHIFT+ALT+M are already Music and Music TUI.
+  local gws; gws=$(global_ws_name)
+  [[ -n $gws ]] || return 0
+  cat <<EOF
+o.bind("SUPER + M", "Toggle the global workspace", hl.dsp.workspace.toggle_special("$gws"))
+o.bind("SUPER + CTRL + M", "Send the window to the global workspace",
+  hl.dsp.window.move({ workspace = "special:$gws", follow = false }))
 EOF
 }
 
@@ -3276,6 +4056,29 @@ file_held_paths() {
   return 0
 }
 
+# ---------------------------------------------- row: the Hyprland reload probe
+
+setup_row_hypr_probe() {
+  local label="Live Hyprland settings" state
+  state=$(hypr_reload_state)
+  case $state in
+  ok)
+    setup_row hypr-reload-probe "$label" ok \
+      "Hyprland re-reads a swapped file when it is told to reload, so a profile can have its own look'n'feel, bindings and input settings." false ;;
+  broken)
+    setup_row hypr-reload-probe "$label" broken \
+      "Hyprland did not pick up a swapped file on this machine, so per-profile Hyprland settings are not offered. Everything else works. Fixing measures it again." true ;;
+  *)
+    if hypr_live; then
+      setup_row hypr-reload-probe "$label" needs_action \
+        "Whether Hyprland re-reads a swapped file has not been measured on this machine. Fixing tries it: one setting is changed and put straight back, which takes about a second." true
+    else
+      setup_row hypr-reload-probe "$label" unknown \
+        "This can only be answered from inside a Hyprland session, and there is none here." false
+    fi ;;
+  esac
+}
+
 # ------------------------------------------------- rows: helpers and polkit
 #
 # `omarchy plugin add --enable` clones files and enables the plugin. It installs
@@ -3546,6 +4349,7 @@ setup_status() {
   setup_row_keys
   setup_row_indicator
   setup_row_switch
+  setup_row_hypr_probe
   setup_row_helpers
   setup_row_polkit
   setup_row_locks
@@ -3569,7 +4373,7 @@ cmd_setup() {
   case $verb in
   status) setup_status ;;
   fix)
-    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch|helpers|polkit|stale-hashes>"
+    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch|hypr-reload-probe|helpers|polkit|stale-hashes>"
     # Every fix takes the state lock: each of them writes something a switch
     # also writes.
     lock_or_busy
@@ -3599,7 +4403,17 @@ cmd_setup() {
     keys) keys_fix || exit 1 ;;
     indicator) indicator_fix ;;
     switch)
+      # Filing a held path leaves it absent at the path, so the active profile's
+      # own copy can be linked in afterwards — seeding a tier-3 one if that
+      # profile never had it. Same call a switch makes, with both sides the
+      # current profile.
+      local had_held=0
+      [[ -s $PENDING_OWNER ]] && had_held=1
       file_held_paths
+      if ((had_held)) && [[ ! -s $PENDING_OWNER ]]; then
+        local held_cur; held_cur=$(current_profile)
+        [[ -n $held_cur ]] && swap_isolated "$held_cur" "$held_cur"
+      fi
       if [[ -e $JOURNAL ]]; then
         # Finishing a switch restarts the shell, which kills whoever asked for
         # the repair — the panel most of all. So the repair detaches exactly
@@ -3614,6 +4428,13 @@ cmd_setup() {
     # One call, one dialog, both rows: the helpers and the actions that make
     # them reachable are installed together or not at all.
     helpers | polkit) system_install ;;
+    hypr-reload-probe)
+      local probed; probed=$(hypr_reload_probe) || exit 1
+      case $probed in
+      ok) echo "Hyprland re-read the swapped file — per-profile Hyprland settings work here" ;;
+      broken) echo "Hyprland did not pick up the swapped file — per-profile Hyprland settings are not offered" ;;
+      *) echo "could not measure it" ;;
+      esac ;;
     stale-hashes)
       local stale n=0
       stale=$(stale_root_names)
@@ -3640,10 +4461,12 @@ cmd_setup() {
 # would have to be guessed is `unknown`, and an optional component that is not
 # installed is `absent` — neither is ever reported as healthy.
 cmd_capabilities() {
-  # The reload probe belongs to the isolate phase; until it exists, whether
-  # `hyprctl reload` re-reads a swapped file on THIS machine is not something
-  # this engine has measured.
-  local reload=unknown face=absent polkit=absent helpers=absent
+  # Read from the cache, never measured here: a status query does not perturb
+  # the compositor's settings, and it does not wait a second to answer. Until
+  # the probe has run — or on a Hyprland this machine has not been measured on
+  # — it is `unknown`, which disables the Hyprland toggles with the reason.
+  local reload face=absent polkit=absent helpers=absent
+  reload=$(hypr_reload_state)
 
   face_installed && face=ok
 
@@ -3690,14 +4513,7 @@ refresh)
   [[ -n $cur ]] && apply_app_visibility "$cur"
   migrate_profiles
   echo "refreshed" ;;
-isolate)
-  shift
-  # Two sub-verbs the isolate phase builds; named here so the panel gets a JSON
-  # answer rather than "unknown command" on stderr.
-  case "${1:-list}" in
-  candidates | resolve) not_implemented "isolate $1" ;;
-  esac
-  cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
+isolate) shift; cmd_isolate "$@" ;;
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 overview) shift; cmd_overview "${1:-}" ;;
 close) shift; cmd_close_profile "${1:-}" ;;
@@ -3707,7 +4523,11 @@ rename) shift; cmd_rename "$@" ;;
 # Everything below is named in the contract and built by a later phase. Each
 # answers in JSON and exits 1, so the panel can call any verb the contract has
 # from the day it freezes and render a real answer.
-meta | config | session | login | purge)
+config)
+  shift
+  for a in "$@"; do [[ $a == --json ]] && JSON=1; done
+  cmd_config "$(for a in "$@"; do [[ $a == --* ]] || { printf '%s' "$a"; break; }; done)" ;;
+meta | session | login | purge)
   not_implemented "$1 ${2:-}" ;;
 setup) shift; cmd_setup "$@" ;;
 capabilities) cmd_capabilities ;;
@@ -3760,6 +4580,13 @@ omarchy-profile — profiles for the Omarchy desktop
 
   isolate [list|add|remove] [path]  give each profile its own copy of a
                                     plugin's own config or state file
+  isolate add <path> [--reload hypr]
+                                   a file under ~/.config/hypr defaults to
+                                   --reload hypr: the compositor is told
+  isolate candidates --json        what could be given per-profile copies
+  isolate resolve <path> --json    what is at a path, and whether it may be
+
+  config <name> --json             what this profile is: theme, bar, counts
 
   overview [--json]                what every profile is holding open
   refresh                          rewrite the files the panel and launcher read

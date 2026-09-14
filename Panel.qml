@@ -116,6 +116,104 @@ Panel {
   // switches it back on is exactly the list it would drop out of.
   property var settingsAllApps: []
 
+  // ------------------------------------------------------------ config view
+  //
+  // Which profile the config page is describing, and the four answers it needs.
+  // Everything below the first group is machine-wide, so only configData is
+  // per-profile; the rest is asked once and is the same on every page.
+  property string configProfile: ""
+  property var configData: null
+  property var isolateRows: []
+  property var isolateCandidates: []
+  property var globalStatus: null
+  // The engine's own refusal, rendered inline under the custom-path field.
+  property string configError: ""
+  property var resolvePreview: null
+  // ok | unknown | broken, from `capabilities`. Never assumed: the toggles it
+  // gates are the ones that can take the desktop with them.
+  property string hyprReload: "unknown"
+  // Tier-3 rollbacks, keyed by profile. An absent file and {} mean the same
+  // thing: nothing outstanding.
+  property var hyprErrors: ({})
+
+  function openConfig(profile) {
+    root.configProfile = profile
+    root.configError = ""
+    root.resolvePreview = null
+    root.pushView("config")
+    root.loadConfig()
+  }
+
+  function loadConfig() {
+    if (root.configProfile === "") return
+    root.ask(["config", root.configProfile, "--json"], "", function (ok, parsed) {
+      if (ok && parsed && !parsed.error) root.configData = parsed
+    })
+    root.ask(["isolate", "list", "--json"], "", function (ok, parsed) {
+      root.isolateRows = (ok && Array.isArray(parsed)) ? parsed : []
+    })
+    root.ask(["isolate", "candidates", "--json"], "", function (ok, parsed) {
+      root.isolateCandidates = (ok && Array.isArray(parsed)) ? parsed : []
+    })
+    root.ask(["global", "status", "--json"], "", function (ok, parsed) {
+      root.globalStatus = (ok && parsed && !parsed.error) ? parsed : null
+    })
+    root.ask(["capabilities", "--json"], "", function (ok, parsed) {
+      root.hyprReload = (ok && parsed && parsed.hyprland_reload)
+        ? String(parsed.hyprland_reload) : "unknown"
+    })
+  }
+
+  // Isolating moves real files between stores, so its answer matters: the
+  // engine refuses a blocklisted path, and that refusal is the only thing the
+  // user can act on.
+  function isolateAdd(path, plugin, reload) {
+    root.configError = ""
+    var args = ["isolate", "add", path, "--json"]
+    if (plugin && plugin !== "") args = args.concat(["--plugin", plugin])
+    if (reload && reload !== "") args = args.concat(["--reload", reload])
+    root.ask(args, "", function (ok, parsed) {
+      if (!ok) {
+        var err = parsed && parsed.error ? String(parsed.error) : "failed"
+        root.configError = err === "blocklisted"
+          ? String(parsed.reason || "that file cannot be isolated")
+          : err === "busy" ? "A switch is running — try again in a moment"
+          : err === "held_paths" || err === "interrupted_switch"
+            ? "Switching is blocked until Setup repairs it"
+            : "Could not isolate that path"
+        return
+      }
+      root.loadConfig()
+    })
+  }
+
+  function isolateRemove(path) {
+    root.configError = ""
+    root.ask(["isolate", "remove", path, "--json"], "", function (ok, parsed) {
+      if (!ok) {
+        root.configError = "Could not stop isolating that path"
+        return
+      }
+      root.loadConfig()
+    })
+  }
+
+  function resolveCustom(path) {
+    if (path === "") { root.resolvePreview = null; return }
+    root.ask(["isolate", "resolve", path, "--json"], "", function (ok, parsed) {
+      root.resolvePreview = (parsed && !parsed.error) ? parsed : null
+    })
+  }
+
+  function runGlobal(args) {
+    root.configError = ""
+    root.ask(["global"].concat(String(args).split(" ").filter(function (a) { return a !== "" })),
+             "", function (ok, parsed) {
+      if (!ok) root.configError = "Could not change the global workspace"
+      root.loadConfig()
+    })
+  }
+
   // Which profile a password is being asked for, and what about. The idle timer
   // watches passwordFor too: a question on screen must never be timed out
   // without somebody deciding anything.
@@ -590,7 +688,8 @@ Panel {
                   hint: "back returns to the list · closes itself if left alone" },
     "overview": { title: "What is open",    meta: "Nothing closes when you switch",
                   hint: "measured from each window's cgroup, not estimated" },
-    "config":   { title: "Configuration",   meta: "", hint: "" },
+    "config":   { title: "Configuration",   meta: "What a desk is, and what every desk shares",
+                  hint: "back returns to the list · the lower groups apply to every profile" },
     "setup":    { title: "Setup",           meta: "What has to be true before this works",
                   hint: "each row is one thing; Fix does it for you" },
     "edit":     { title: "Edit profile",    meta: "", hint: "" }
@@ -789,6 +888,32 @@ Panel {
       }
     }
     onLoadFailed: root.settingsDisabled = []
+  }
+
+  // Tier-3 rollbacks. Watched rather than asked for, because it is written by
+  // a switch — which is to say by a process that has already killed this panel
+  // once and will do so again; the file is what survives that.
+  FileView {
+    id: hyprErrorsFile
+    path: (Quickshell.env("XDG_STATE_HOME") || root.home + "/.local/state")
+          + "/omarchy-profiles/hypr-errors.json"
+    watchChanges: true
+    printErrors: false
+    onFileChanged: reload()
+    property string lastText: ""
+    onLoaded: {
+      try {
+        var t = text()
+        if (t === hyprErrorsFile.lastText) return
+        hyprErrorsFile.lastText = t
+        var parsed = JSON.parse(t)
+        root.hyprErrors = (parsed && typeof parsed === "object") ? parsed : ({})
+      } catch (e) {
+        root.hyprErrors = ({})
+      }
+    }
+    // Absent means nothing is outstanding, exactly like {}.
+    onLoadFailed: root.hyprErrors = ({})
   }
 
   FileView {
@@ -1200,6 +1325,7 @@ Panel {
           onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
           onOpenOverview: { root.keepAlive(); root.openOverview() }
           onOpenSettings: function (profile) { root.keepAlive(); root.openSettings(profile) }
+          onOpenConfig: function (profile) { root.keepAlive(); root.openConfig(profile) }
           createError: root.createError
           onPasswordAction: function (profile, mode) { root.keepAlive(); root.beginManage(profile, mode) }
           onCreateProfile: function (name, fromMaster) { root.keepAlive(); root.createProfile(name, fromMaster) }
@@ -1222,6 +1348,12 @@ Panel {
         SetupView {
           width: parent.width
           visible: root.view === "setup"
+          panel: root
+        }
+
+        ConfigView {
+          width: parent.width
+          visible: root.view === "config"
           panel: root
         }
 

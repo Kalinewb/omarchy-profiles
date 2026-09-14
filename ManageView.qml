@@ -26,6 +26,7 @@ Column {
 
   signal runEngine(string args)
   signal openSettings(string profile)
+  signal openConfig(string profile)
   signal cursorMoved(int index)
   // The panel owns the confirmation dialog; a Column cannot host one.
   signal confirmRemove(string profile)
@@ -406,6 +407,19 @@ Column {
           size: actions.actionSize
           fontFamily: root.fontFamily
           onClicked: root.openSettings(row.name)
+          onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
+        }
+
+        // Master carries this one: the desk facts are its own like any other
+        // profile's, and everything below them on that page is machine-wide, so
+        // there is always something behind it.
+        PanelActionButton {
+          iconText: "󰢻"
+          tooltipText: "What " + row.name + " is, and what every profile shares"
+          foreground: root.foreground
+          size: actions.actionSize
+          fontFamily: root.fontFamily
+          onClicked: root.openConfig(row.name)
           onHovered: function (h) { if (h) root.cursorMoved(row.rowIndex) }
         }
 
