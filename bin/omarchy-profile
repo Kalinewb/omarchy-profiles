@@ -37,6 +37,14 @@ STATE_DIR="$STATE_HOME/omarchy-profiles"
 STATE_FILE="$STATE_DIR/current.json"
 THEME_NAME_FILE="$STATE_HOME/omarchy/current/theme.name"
 
+# A switch outlives the process that started it — it restarts the shell that
+# asked for it — so what it is doing has to be written down somewhere that
+# survives both. These three are that record, and they are read before any
+# switch starts as well as after one dies.
+LOCK_FILE="$STATE_DIR/.lock"
+JOURNAL="$STATE_DIR/switch.json"
+SWITCH_LOG="$STATE_DIR/switch.log"
+
 # Application visibility writes XDG hidden entries here. Deliberately the
 # literal path and not "$DATA_HOME/applications": Omarchy's hidden-entries.sh
 # scans ~/.local/share/applications whatever XDG_DATA_HOME says, so writing
@@ -50,6 +58,38 @@ APP_TAG_MODIFIED="X-OmarchyProfiles-Modified"
 
 die() { echo "omarchy-profile: $*" >&2; exit 1; }
 warn() { echo "omarchy-profile: $*" >&2; }
+
+# A --json verb prints ONE JSON document on stdout and nothing else, and every
+# word meant for a person goes to stderr. Set by the verbs that take the flag,
+# read by refuse() and answer(), so a refusal does not have to be written twice.
+JSON=""
+
+# refuse <exit-code> <error> <message> [<extra JSON object>]
+#
+# The error string is the contract's; the message is the same thing said to a
+# person. Exit codes: 1 error, 2 refused by authentication, 3 busy.
+refuse() {
+  local code=$1 err=$2 msg=$3 extra=${4:-}
+  if [[ -n $JSON ]]; then
+    if [[ -n $extra ]]; then jq -nc --arg e "$err" --argjson x "$extra" '{error: $e} + $x'
+    else jq -nc --arg e "$err" '{error: $e}'; fi
+  fi
+  [[ -n $msg ]] && echo "omarchy-profile: $msg" >&2
+  exit "$code"
+}
+
+# answer <json> <prose> — one verdict, in whichever language was asked for.
+answer() { if [[ -n $JSON ]]; then printf '%s\n' "$1"; else printf '%s\n' "$2"; fi; }
+
+# Verbs the contract names but that a later phase builds. They are dispatchable
+# from the day the contract freezes, so a panel that calls one gets a JSON
+# answer it can render rather than "unknown command" on stderr and exit 1 with
+# nothing on stdout.
+not_implemented() {
+  echo '{"error":"not_implemented"}'
+  echo "omarchy-profile: '$*' is not built yet" >&2
+  exit 1
+}
 
 command -v jq >/dev/null || die "jq is required"
 
@@ -494,6 +534,12 @@ relaunch_in_terminal() {
 # Nothing is ever deleted and no symlink is ever left dangling.
 
 ISOLATE_DIR="$STATE_DIR/isolated"
+# A path a swap could not file under its owner is left exactly where it is and
+# recorded here, `path<TAB>owner`. While a line exists no switch may start, so
+# no later swap ever has to wonder whose data is at that path. Written by the
+# isolate phase; read from here on, which is what makes the refusal real before
+# the thing that writes it exists.
+PENDING_OWNER="$ISOLATE_DIR/.pending-owner"
 
 # ~/.local/state/omarchy-spotify -> local%state%omarchy-spotify
 store_key() { printf '%s' "${1#"$HOME"/}" | tr '/' '%'; }
@@ -608,6 +654,11 @@ swap_isolated() {
 
 cmd_isolate() {
   local verb=${1:-list} path=${2:-}
+  # Adding or removing a path moves real files between stores, which is exactly
+  # what a switch is doing; the two may not interleave. `list` never waits.
+  case $verb in
+  add | remove) require_no_journal; lock_or_busy ;;
+  esac
   case $verb in
   list)
     local any=0
@@ -1220,6 +1271,224 @@ write_state() {
     mv "$ptmp" "$(file_for "$name")" || rm -f "$ptmp"
 }
 
+# -------------------------------------------- the lock and the switch journal
+#
+# A switch restarts the shell, which kills whatever asked for it. That is not a
+# bug to be fixed — the shell has to be restarted for a profile to apply — but
+# it means the work cannot be done by the process the panel is waiting on, and
+# that nothing can report back afterwards. So a switch is two stages:
+#
+#   stage 1  attached. Answers the one question the caller can still hear:
+#            were you allowed to do this. Takes the lock, forks stage 2, exits.
+#   stage 2  detached, and the only thing that touches profile data. Every step
+#            it is about to take is written to the journal first, so a stage 2
+#            that dies can be finished by the next thing that looks.
+#
+# The journal is what stops the worst bug in the design: a switch that dies
+# after the restart leaves B's files live, and the next capture would file them
+# under A. Nothing may capture while a journal exists.
+
+# One flock on the state directory around every verb that changes what a
+# profile owns; a second caller gets exit 3 rather than interleaving with the
+# first. Deliberately fd 8 and deliberately written down: a child that inherits
+# it holds the lock for as long as it lives, so every fork that can outlive the
+# switch has a descriptor number to close.
+take_state_lock() {
+  mkdir -p "$STATE_DIR" || return 1
+  exec 8>"$LOCK_FILE" || return 1
+  flock -n 8
+}
+
+lock_or_busy() {
+  take_state_lock && return 0
+  refuse 3 busy "another switch or profile change is running — try again in a moment"
+}
+
+# Is anyone holding it? Asked on a second descriptor and given straight back:
+# a status query must never be the thing a switch waits on.
+state_lock_free() {
+  mkdir -p "$STATE_DIR" || return 1
+  exec 9>"$LOCK_FILE" || return 1
+  if flock -n 9; then exec 9>&-; return 0; fi
+  exec 9>&-
+  return 1
+}
+
+journal_field() { [[ -s $JOURNAL ]] && jq -r --arg k "$1" '.[$k] // ""' "$JOURNAL" 2>/dev/null; }
+
+# Written before the step it names, never after, and fsynced: the case this
+# exists for is the machine stopping between the two.
+journal_set() {
+  local from=$1 to=$2 stage=$3 tmp
+  mkdir -p "$STATE_DIR"
+  [[ -n ${SWITCH_STARTED:-} ]] || SWITCH_STARTED=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  tmp=$(mktemp "$JOURNAL.XXXXXX") || return 1
+  jq -n --arg from "$from" --arg to "$to" --arg stage "$stage" --arg started "$SWITCH_STARTED" \
+     '{from: $from, to: $to, stage: $stage, started: $started}' >"$tmp" &&
+    mv "$tmp" "$JOURNAL" || { rm -f "$tmp"; warn "could not write the switch journal"; return 1; }
+  sync -f "$JOURNAL" 2>/dev/null
+  # A test hook, and the only one in this file. Recovery has to be provable from
+  # every stage, and timing a kill into the millisecond a step takes is not a
+  # proof. Set OMARCHY_PROFILE_STALL_AT=<stage> to hold a switch just after that
+  # stage is recorded and just before it runs. It changes nothing else.
+  [[ ${OMARCHY_PROFILE_STALL_AT:-} == "$stage" ]] && sleep "${OMARCHY_PROFILE_STALL_SECS:-5}"
+  return 0
+}
+
+journal_clear() {
+  rm -f "$JOURNAL"
+  sync -f "$STATE_DIR" 2>/dev/null
+  return 0
+}
+
+# Nothing that could capture may run while a stale intent exists: capturing
+# then is exactly how one profile's live state gets filed under another's name.
+#
+# A journal beside a HELD lock is not a stale intent — it is a switch happening
+# right now, and the answer to that is `busy` (rule 7), which the caller reaches
+# a line or two later when its own flock fails. Only a journal whose stage 2 is
+# gone is an interrupted switch. The two look identical on disk and mean
+# opposite things, and the lock is what tells them apart.
+require_no_journal() {
+  [[ -e $JOURNAL ]] || return 0
+  state_lock_free || return 0
+  local from to stage
+  from=$(journal_field from); to=$(journal_field to); stage=$(journal_field stage)
+  refuse 1 interrupted_switch \
+    "a switch from ${from:-nothing} to ${to:-?} stopped at ${stage:-?} — repair it in Setup, or run: omarchy-profile setup fix switch" \
+    "$(jq -nc --arg f "$from" --arg t "$to" --arg s "$stage" '{from: $f, to: $t, stage: $s}')"
+}
+
+# A held path shows the outgoing profile's data under the incoming one, which
+# is unavoidable once a move has failed — but it is never *filed* as the wrong
+# profile's, because no further switch runs until it has been put away.
+require_no_held_paths() {
+  [[ -s $PENDING_OWNER ]] || return 0
+  local paths
+  paths=$(cut -f1 "$PENDING_OWNER" | jq -Rsc 'split("\n") | map(select(length > 0))')
+  refuse 1 held_paths \
+    "a file could not be filed into its profile's store and is still in place — repair it in Setup, or run: omarchy-profile setup fix switch" \
+    "$(jq -nc --argjson p "${paths:-[]}" '{paths: $p}')"
+}
+
+# Every tier-3 path must have something to seed an incoming profile from, or
+# the switch would leave a `require`d Hyprland file absent. Tier 3 arrives with
+# the isolate phase; until there are tier-3 entries this cannot fire, and it is
+# wired here so stage 1 has the shape the plan gives it.
+preflight_tier3() { return 0; }
+
+# Stage 2. The only thing that touches profile data, and the only holder of the
+# lock from the moment stage 1 exits.
+switch_stage2() {
+  local from=$1 to=$2
+  # Stage 1's cancellation must not outlive the verdict: from here on, stopping
+  # half way is the thing that leaves a machine in two profiles at once.
+  trap - TERM
+  # And nothing is attached any more. A HUP from the terminal that started this,
+  # or a PIPE from a reader that died with the old shell, is not an instruction.
+  trap '' HUP PIPE
+
+  journal_set "$from" "$to" capture || return 1
+  # The outgoing profile keeps whatever was changed while inside it.
+  [[ -n $from ]] && exists "$from" && capture_into "$from"
+  switch_forward "$from" "$to"
+}
+
+# Steps 3 to 7, without the capture. Recovery re-runs exactly this: from the
+# swap on, every step is an absolute setter and safe to repeat, while a capture
+# would file whatever is live now under whoever the journal happens to name —
+# the same bug the journal exists to prevent, reintroduced by the repair.
+switch_forward() {
+  local from=$1 to=$2
+
+  journal_set "$from" "$to" swap
+  # Plugin state that lives outside shell.json follows the profile too, so a
+  # Spotify session or a dock layout belongs to one profile rather than all.
+  prune_isolated
+  swap_isolated "$from" "$to"
+
+  journal_set "$from" "$to" write
+  apply_profile_files "$to"
+  apply_app_visibility "$to"
+  # BEFORE the restart, not after it. This used to run last, so a switch that
+  # died after `omarchy restart shell` left B's files live while current.json
+  # still said A — and the next switch captured B's desktop into A. Written
+  # here, current.json names the profile whose files are live from the moment
+  # they are written, and the restarted shell reads the right name on start.
+  write_state "$to"
+
+  journal_set "$from" "$to" restart
+  restart_shell
+
+  journal_set "$from" "$to" finish
+  apply_profile_ipc "$to"
+  write_index
+  write_catalog
+
+  # Last, not after write_state: a switch that died after the restart still has
+  # its do-not-disturb, idle, wallpaper and launcher set finished by recovery.
+  journal_clear
+}
+
+# Runs under the state lock, so a journal found here means stage 2 is dead — a
+# live stage 2 holds the lock.
+#
+# Forward, never back. From the swap on, running the swap in reverse would file
+# a real file that had not been moved yet under the wrong owner, which is the
+# same class of bug as capturing into the wrong profile. And the user
+# authenticated for `to` and asked for it, so finishing it is also what they
+# wanted.
+recover_switch() {
+  # It finishes a switch, which means it restarts the shell, which means it is
+  # detached like a switch is — so it needs the same signal hygiene.
+  trap '' HUP PIPE
+  [[ -e $JOURNAL ]] || { echo "no interrupted switch to repair"; return 0; }
+  local from to stage
+  from=$(journal_field from); to=$(journal_field to); stage=$(journal_field stage)
+  SWITCH_STARTED=$(journal_field started)
+
+  if [[ -z $to ]] || ! exists "$to"; then
+    warn "the interrupted switch names a profile that is gone ('${to:-}') — discarding it"
+    journal_clear
+    return 0
+  fi
+
+  case $stage in
+  capture)
+    # Nothing of `to` has been touched: the live files and current.json are
+    # still `from`, and a capture is atomic per file, so a half-done one is
+    # either the old JSON or the new one. The switch simply did not happen.
+    journal_clear
+    echo "discarded an interrupted switch to $to that had not started" ;;
+  *)
+    [[ $stage == swap || $stage == write || $stage == restart || $stage == finish ]] ||
+      warn "the journal names an unknown stage '$stage' — finishing it forward"
+    echo "finishing the switch to $to (it stopped at ${stage:-?})"
+    switch_forward "$from" "$to" ;;
+  esac
+}
+
+# Hand the rest of the work to a forked copy of this already-authenticated
+# shell, and get out of the way.
+detach() {
+  # The verdict has been printed and this process no longer has any business
+  # holding the caller's pipes: it is about to restart the shell that is reading
+  # them, and SIGPIPE from a dead reader would end the switch. Everything the
+  # switch has to say from here goes to the log.
+  local size=0
+  [[ -e $SWITCH_LOG ]] && size=$(stat -c %s "$SWITCH_LOG" 2>/dev/null || echo 0)
+  ((size > 1048576)) && : >"$SWITCH_LOG"
+  exec 0</dev/null 1>>"$SWITCH_LOG" 2>&1
+
+  # Job control, so the job gets its own process group. NOT setsid: that execs
+  # a new program, which would need a callable "already authenticated" entry
+  # point — the bypass this design deliberately does not have. The job is a
+  # forked subshell of this process, with the function already in its memory.
+  set -m
+  "$@" &
+  disown
+}
+
 # ------------------------------------------------------------------ apply
 
 # Block until the shell answers, so the IPC calls after a restart are not fired
@@ -1237,17 +1506,25 @@ wait_for_shell() {
 }
 
 
-apply_profile() {
+# Applying a profile is three steps with a shell restart between the first and
+# the last, and the switch journal has to be able to name each of them — so
+# they are three functions rather than one. The order is what makes it safe:
+# files first, restart second, IPC third. Restarting before the writes would
+# have the new shell read the old files, and setting do-not-disturb over IPC
+# before a restart wastes the call on a process about to exit.
+#
+# Every external call here closes fd 8. Anything started from inside the switch
+# inherits the state lock otherwise, and a process that outlives stage 2 would
+# hold it after the switch is over — which made every later verb `busy` until
+# that process died.
+apply_profile_files() {
   local name=$1 file
   file=$(file_for "$name")
 
-  local theme dnd screensaver lock inhibit bar browser
+  local theme screensaver lock bar
   theme=$(jq -r '.theme // ""' "$file")
-  dnd=$(jq -r 'if .dnd then "true" else "false" end' "$file")
   screensaver=$(jq -r '.idle.screensaver // empty' "$file")
   lock=$(jq -r '.idle.lock // empty' "$file")
-  inhibit=$(jq -r 'if (.idle.inhibit // false) then "true" else "false" end' "$file")
-  browser=$(jq -r '.browser_profile // "default"' "$file")
 
   # Theme, FIRST and synchronously.
   #
@@ -1264,7 +1541,7 @@ apply_profile() {
   local live_theme=""
   [[ -s $THEME_NAME_FILE ]] && live_theme=$(<"$THEME_NAME_FILE")
   if [[ -n $theme && $theme != "$live_theme" ]]; then
-    omarchy theme set "$theme" >/dev/null 2>&1 || warn "could not set theme '$theme'"
+    omarchy theme set "$theme" >/dev/null 2>&1 8>&- || warn "could not set theme '$theme'"
   fi
 
   # Bar layout and plugin enablement, written together in one atomic commit so
@@ -1298,7 +1575,7 @@ apply_profile() {
         --argjson bar "${bar:-null}" --argjson disabled "${disabled:-null}" \
         --argjson pinned_widgets "${pinned_widgets:-[]}" \
         --argjson pinned_all "${pinned_all:-[]}"
-    ) >/dev/null 2>&1 || warn "could not write bar/plugins to shell.json"
+    ) >/dev/null 2>&1 8>&- || warn "could not write bar/plugins to shell.json"
   fi
 
   if [[ -n $screensaver && -n $lock ]]; then
@@ -1307,30 +1584,41 @@ apply_profile() {
       source /usr/share/omarchy/bin/omarchy-shell-config
       commit "$NORMALIZE | .idle.screensaver = \$sec | .idle.lock = \$lock" \
         --argjson sec "$screensaver" --argjson lock "$lock"
-    ) >/dev/null 2>&1 || warn "could not write idle timers"
+    ) >/dev/null 2>&1 8>&- || warn "could not write idle timers"
   fi
+}
 
-  # Restart the shell, now that every file it reads has been written.
-  #
-  # A reload is not enough. Plugins hold their own config and state open, so a
-  # swapped Spotify session or dock file is not noticed; enabling a plugin that
-  # was off needs it instantiated; and Qt keeps compiled QML cached. Each of
-  # those produced a switch that looked half-applied, and "it usually works,
-  # restart if it looks wrong" is not a thing to ship.
-  #
-  # The order is what makes this safe: files first, restart second, IPC third.
-  # Restarting before the writes would have the new shell read the old files,
-  # and setting DND over IPC before a restart wastes the call on a process
-  # about to exit.
-  if command -v omarchy >/dev/null; then
-    omarchy restart shell >/dev/null 2>&1 || warn "could not restart the shell"
-    wait_for_shell
-  fi
+# Restart the shell, now that every file it reads has been written.
+#
+# A reload is not enough. Plugins hold their own config and state open, so a
+# swapped Spotify session or dock file is not noticed; enabling a plugin that
+# was off needs it instantiated; and Qt keeps compiled QML cached. Each of those
+# produced a switch that looked half-applied, and "it usually works, restart if
+# it looks wrong" is not a thing to ship.
+#
+# Its own step in the journal, because it is the step that kills whoever asked
+# for the switch: everything before it must already be on disk, and everything
+# after it has to be done by a process the restart cannot reach.
+restart_shell() {
+  command -v omarchy >/dev/null || return 0
+  omarchy restart shell >/dev/null 2>&1 8>&- || warn "could not restart the shell"
+  wait_for_shell
+}
 
-  # Absolute setters only. A toggle would land on the wrong state whenever the
-  # machine already happened to be in the target state. These go last, against
-  # the shell that will still be running when the switch is done.
-  omarchy-shell notifications setDnd "$dnd" >/dev/null 2>&1 ||
+# The tail of a switch: settings that are told to the shell rather than written
+# for it. Absolute setters only — a toggle would land on the wrong state
+# whenever the machine already happened to be in the target state. These run
+# against the shell that will still be running when the switch is done.
+apply_profile_ipc() {
+  local name=$1 file
+  file=$(file_for "$name")
+
+  local dnd inhibit browser
+  dnd=$(jq -r 'if .dnd then "true" else "false" end' "$file")
+  inhibit=$(jq -r 'if (.idle.inhibit // false) then "true" else "false" end' "$file")
+  browser=$(jq -r '.browser_profile // "default"' "$file")
+
+  omarchy-shell notifications setDnd "$dnd" >/dev/null 2>&1 8>&- ||
     warn "could not set do-not-disturb (shell busy?) — re-run to retry"
 
   # NOT `omarchy-shell idle enable`: that IPC target does not exist while
@@ -1338,9 +1626,9 @@ apply_profile() {
   # using a third-party idle/lock plugin. Note the sense — stay-awake INHIBITS
   # idling, so inhibit=false means allow-idle.
   if [[ $inhibit == true ]]; then
-    omarchy toggle idle stay-awake >/dev/null 2>&1 || warn "could not set stay-awake"
+    omarchy toggle idle stay-awake >/dev/null 2>&1 8>&- || warn "could not set stay-awake"
   else
-    omarchy toggle idle allow-idle >/dev/null 2>&1 || warn "could not allow idling"
+    omarchy toggle idle allow-idle >/dev/null 2>&1 8>&- || warn "could not allow idling"
   fi
 
   [[ $browser != default ]] && mkdir -p "$DATA_HOME/omarchy-profiles/browser/$browser"
@@ -1348,8 +1636,9 @@ apply_profile() {
   local wallpaper
   wallpaper=$(jq -r '.wallpaper // ""' "$file")
   if [[ -n $wallpaper && -f $wallpaper ]]; then
-    omarchy theme bg set "$wallpaper" >/dev/null 2>&1 || warn "could not set wallpaper"
+    omarchy theme bg set "$wallpaper" >/dev/null 2>&1 8>&- || warn "could not set wallpaper"
   fi
+  return 0
 }
 
 # Hyprland on Omarchy is configured in Lua, and hyprctl dispatch takes a Lua
@@ -1438,7 +1727,10 @@ EOF
     local name; name=$(global_ws_name)
     [[ -n $name ]] || die "no global workspace; try: omarchy-profile global enable music"
     hyprctl dispatch "hl.dsp.workspace.toggle_special(\"$name\")" >/dev/null ;;
-  *) die "unknown global verb '$verb' (status, enable, disable, send, toggle)" ;;
+  # Writing the global-workspace bindings into the managed keys file is the
+  # keybinding phase's; named here so the contract's verb is dispatchable.
+  keys) not_implemented "global keys" ;;
+  *) die "unknown global verb '$verb' (status, enable, disable, send, toggle, keys)" ;;
   esac
 }
 
@@ -1635,22 +1927,56 @@ cmd_list() {
 
 cmd_current() { local c; c=$(current_profile); [[ -n $c ]] && echo "$c" || echo "unknown"; }
 
+# Stage 1: the only part of a switch the caller is still alive to hear.
+#
+# It answers one question — were you allowed to do this — and then forks the
+# work and exits, because the work restarts the shell and would otherwise be
+# killed half way through by the thing it is doing.
 cmd_set() {
-  local name=${1:-} as_owner=""
-  [[ ${2:-} == --as-owner ]] && as_owner=1
-  [[ -n $name ]] || die "usage: omarchy-profile set <name> [--as-owner]"
-  exists "$name" || die "no such profile '$name' (try: omarchy-profile list)"
+  # A switch cancelled before its commit point must leave nothing behind, so the
+  # trap goes up before the first thing that could leave something. 143 is the
+  # code the panel drops in silence, having cancelled deliberately.
+  trap 'exit 143' TERM
+
+  local name="" as_owner="" a
+  for a in "$@"; do
+    case $a in
+    --json) JSON=1 ;;
+    --as-owner) as_owner=1 ;;
+    -*) die "unknown option '$a'" ;;
+    *) [[ -n $name ]] || name=$a ;;
+    esac
+  done
+  [[ -n $name ]] || die "usage: omarchy-profile set <name> [--json] [--as-owner]"
+
+  # Preflight, before anything is captured, swapped or written: a stale intent,
+  # a path held by a failed swap, or a tier-3 path with nothing to seed from all
+  # stop the switch here, where stopping costs nothing.
+  require_no_journal
+  require_no_held_paths
+  preflight_tier3 "$name"
+
+  exists "$name" ||
+    refuse 1 no_such_profile "no such profile '$name' (try: omarchy-profile list)"
   if is_master "$name" && [[ $(cfg .master_switchable) != true ]]; then
-    die "master is configured as a template only (master_switchable=false)"
+    refuse 1 master_not_switchable "master is configured as a template only (master_switchable=false)"
+  fi
+
+  # A switch is running and it is going somewhere other than here. The
+  # short-circuit below would answer "already" from a current.json that is about
+  # to be rewritten, and this caller's click would be silently lost on the way.
+  if [[ -e $JOURNAL ]] && ! state_lock_free && [[ $(journal_field to) != "$name" ]]; then
+    refuse 3 busy "a switch to $(journal_field to) is already running — try again in a moment"
   fi
 
   local cur
   cur=$(current_profile)
-  [[ $cur == "$name" ]] && { echo "already in $name"; return 0; }
+  [[ $cur == "$name" ]] && { answer '{"ok":true,"already":true}' "already in $name"; return 0; }
 
-  # Authenticate BEFORE anything is captured, swapped or written. A failed
-  # unlock has to leave the machine exactly where it was, not half-way into a
-  # profile it never opened.
+  # Authenticate BEFORE anything is captured, swapped or written, and before the
+  # lock is taken — a prompt on screen must not make every other verb busy. A
+  # failed unlock has to leave the machine exactly where it was, not half-way
+  # into a profile it never opened.
   if profile_locked "$name"; then
     if [[ -t 0 ]] || ! auth_needs_terminal; then
       # --as-owner skips the bound-identity attempt.
@@ -1669,29 +1995,45 @@ cmd_set() {
       # authenticate() only looks for a bound identity when it is given one.
       local auth_profile="$name"
       [[ -n $as_owner ]] && auth_profile=""
+      # The error code is today's mechanism told truthfully: what answers here
+      # is the machine owner's prompt, and a refusal is the owner declining it.
+      # The per-profile password codes arrive with the password phase.
       authenticate "$name" "$auth_profile" ||
-        die "authentication failed — staying in ${cur:-the current profile}"
+        refuse 2 owner_declined "authentication failed — staying in ${cur:-the current profile}"
     else
       relaunch_in_terminal set "$name"
       return 0
     fi
   fi
-  # The outgoing profile keeps whatever was changed while inside it.
-  [[ -n $cur ]] && exists "$cur" && capture_into "$cur"
-  # Plugin state that lives outside shell.json follows the profile too, so a
-  # Spotify session or a dock layout belongs to one profile rather than all.
-  prune_isolated
-  swap_isolated "$cur" "$name"
 
-  apply_profile "$name"
-  write_index
-  write_catalog
-  apply_app_visibility "$name"
-  write_state "$name"
-  echo "omarchy-profile: $name"
+  if ! take_state_lock; then
+    # Someone else is switching. If they are switching to where we were going,
+    # that is this caller's own earlier attempt having got there first, and the
+    # honest answer is that their switch is under way — not that it is busy.
+    if [[ -e $JOURNAL && $(journal_field to) == "$name" ]]; then
+      answer "$(jq -nc --arg n "$name" '{ok: true, switching: $n}')" "switching to $name"
+      return 0
+    fi
+    refuse 3 busy "another switch or profile change is running — try again in a moment"
+  fi
+
+  # Both of these could have changed while a prompt was on screen.
+  require_no_journal
+  cur=$(current_profile)
+  [[ $cur == "$name" ]] && { answer '{"ok":true,"already":true}' "already in $name"; return 0; }
+
+  # The commit point. Up to here a TERM exits 143 with nothing written, no
+  # journal (only stage 2 writes one) and the lock released by this process
+  # exiting. After it the verdict is on stdout and the switch will finish.
+  trap '' TERM
+  answer "$(jq -nc --arg n "$name" '{ok: true, switching: $n}')" "switching to $name"
+  detach switch_stage2 "$cur" "$name"
+  exit 0
 }
 
 cmd_capture() {
+  require_no_journal
+  lock_or_busy
   local cur
   cur=$(current_profile)
   [[ -n $cur ]] || die "no active profile to capture into"
@@ -1765,6 +2107,10 @@ cmd_create() {
 cmd_remove() {
   local name=${1:-}
   [[ -n $name ]] || die "usage: omarchy-profile remove <name>"
+  # It deletes a profile's stores, so it may not run beside a switch that is
+  # moving files into them, nor while an unfinished switch still names one.
+  require_no_journal
+  lock_or_busy
   exists "$name" || die "no such profile '$name'"
   is_master "$name" && die "refusing to remove the master profile"
   [[ $name == "$(current_profile)" ]] && die "refusing to remove the active profile — switch away first"
@@ -1890,7 +2236,7 @@ cmd_apps() {
   # a price worth one line of documentation.
   local json="" args=() a
   for a in "$@"; do
-    if [[ $a == --json ]]; then json=1; else args+=("$a"); fi
+    if [[ $a == --json ]]; then json=1; JSON=1; else args+=("$a"); fi
   done
   local name verb app
   case ${args[0]:-} in
@@ -1902,6 +2248,12 @@ cmd_apps() {
 
   [[ -n $name ]] || die "usage: omarchy-profile apps <profile> [list|preview|allow|deny] [app-id]"
   exists "$name" || die "no such profile '$name'"
+  # A change to the allow-list of the active profile rewrites entries in
+  # ~/.local/share/applications immediately, which is work a switch is also
+  # doing. Reads never take the lock, so the panel's lists open during a switch.
+  case $verb in
+  allow | deny | allow-all | deny-all) lock_or_busy ;;
+  esac
   local file; file=$(file_for "$name")
   case $verb in
   list)
@@ -1946,7 +2298,18 @@ cmd_apps() {
 }
 
 cmd_plugin() {
-  local name=${1:-} verb=${2:-list} id=${3:-}
+  local name verb id
+  # The contract writes this the other way round — `plugin list --json <name>`,
+  # `plugin enable <name> <id>` — so both orders are accepted, as `apps` does.
+  # The per-profile `--json` shape itself is the config phase's.
+  case ${1:-} in
+  list | enable | disable)
+    verb=$1
+    [[ ${2:-} == --json ]] && not_implemented "plugin $1 --json"
+    name=${2:-}; id=${3:-} ;;
+  *)
+    name=${1:-}; verb=${2:-list}; id=${3:-} ;;
+  esac
   [[ -n $name ]] || die "usage: omarchy-profile plugin <profile> [list|enable|disable] [plugin-id]"
   exists "$name" || die "no such profile '$name'"
   local file; file=$(file_for "$name")
@@ -2149,6 +2512,583 @@ check_polkit_action() {
   warn "Everything else works without it."
 }
 
+# ------------------------------------------------------------------- setup
+#
+# One row per thing that has to be true before profiles work, and a fix for
+# each. `omarchy plugin add --enable` copies files and nothing else — it
+# installs no binary, registers no polkit action and runs no install script —
+# so this is where that gap is closed, from the panel, with no terminal.
+#
+# Three rules the rows keep:
+#   - a status query never raises a dialog and never opens a camera;
+#   - a fact that could not be determined is `unknown`, never `ok`;
+#   - Setup never edits the user's own configuration. Where their file is the
+#     problem it says so and stops.
+#
+# Rows land with the phase that makes them true. These five are this phase's.
+
+SETUP_ROWS=()
+
+# setup_row <id> <label> <state> <detail> <fixable>
+setup_row() {
+  SETUP_ROWS+=("$(jq -nc --arg id "$1" --arg label "$2" --arg state "$3" \
+                        --arg detail "$4" --argjson fixable "$5" \
+                  '{id: $id, label: $label, state: $state, detail: $detail, fixable: $fixable}')")
+}
+
+# Where the engine lives for anything that has to name it in a file that
+# outlives this process. The installed copy wins: a keybinding written from a
+# working tree would break the day that tree moved.
+engine_path() {
+  local installed="$CONFIG_HOME/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
+  if [[ $PLUGIN_DIR == "$CONFIG_HOME/omarchy/plugins/"* ]]; then
+    printf '%s\n' "$PLUGIN_DIR/bin/omarchy-profile"
+  elif [[ -x $installed ]]; then
+    printf '%s\n' "$installed"
+  else
+    printf '%s\n' "$PLUGIN_DIR/bin/omarchy-profile"
+  fi
+}
+
+# --------------------------------------------------------------- row: adopt
+
+setup_row_adopt() {
+  local master; master=$(cfg .master)
+  if exists "$master"; then
+    setup_row adopt "This machine is adopted" ok \
+      "'$master' is the master profile: it sees every application, and new profiles are copied from it." false
+  else
+    setup_row adopt "Adopt this machine" needs_action \
+      "Nothing is adopted yet, so there is no profile to switch to. This reads the desktop as it is right now and saves it as '$master'. It changes nothing." true
+  fi
+}
+
+# ---------------------------------------------------------------- row: apps
+#
+# The hiding rules in app_sources are a copy of Omarchy's own
+# hidden-entries.sh, and a copy that has drifted would hide the wrong
+# applications on every switch. So they are checked against the original rather
+# than trusted.
+#
+# Stated as two containments rather than as set equality, because equality can
+# only be asked on a machine with none of our entries on disk: an entry we have
+# hidden is hidden live and visible at its source, by design. Every id Omarchy
+# hides is either hidden at its source or hidden by us; every id we read as
+# hidden at source is hidden live. With no entries of ours those two reduce to
+# equality, which is the test as the plan states it.
+#
+# Returns 0 match, 1 drifted, 2 could not be determined.
+apps_rules_match() {
+  local script="${OMARCHY_PATH:-/usr/share/omarchy}/shell/services/hidden-entries.sh"
+  [[ -r $script ]] || return 2
+  local tmp rc=0
+  tmp=$(mktemp -d) || return 2
+  # Its exit status is whatever its last scan_dir returned — 1 whenever
+  # ~/.nix-profile/share/applications is absent, which is most machines — so it
+  # says nothing about whether the scan worked. Only its output is a verdict.
+  bash "$script" "$(app_desktop_names)" 2>/dev/null | sort -u >"$tmp/live"
+  app_sources | awk -F'\t' '$4 == "true" { print $1 }' | sort -u >"$tmp/ours"
+  app_sources | awk -F'\t' '$8 != "" { print $1 }' | sort -u >"$tmp/owned"
+
+  # Hidden at source but not hidden live: we would be showing something Omarchy
+  # hides.
+  comm -23 "$tmp/ours" "$tmp/live" >"$tmp/extra"
+  [[ -s $tmp/extra ]] && rc=1
+  # Hidden live, not hidden at source, and not ours: something is hiding it for
+  # a reason our copy of the rules does not know about.
+  comm -13 "$tmp/ours" "$tmp/live" >"$tmp/live-only"
+  comm -23 "$tmp/live-only" "$tmp/owned" >"$tmp/unexplained"
+  [[ -s $tmp/unexplained ]] && rc=1
+  rm -rf "$tmp"
+  return $rc
+}
+
+setup_row_apps() {
+  local label="Application visibility"
+  local cur; cur=$(current_profile)
+  if [[ -z $cur ]] || ! exists "$cur"; then
+    setup_row apps "$label" unknown \
+      "No profile is active yet, so there is nothing to compare the menu against." false
+    return
+  fi
+
+  # A -Modified tag means we edited a file the user already had. Without its
+  # backup there is nothing to put back, and that is the one state here that is
+  # broken rather than merely out of date: the data to undo it is gone.
+  local orphan="" id tag
+  while IFS=$'\t' read -r id tag; do
+    [[ $tag == modified ]] || continue
+    [[ -s $APP_BACKUP_DIR/$id.desktop ]] && continue
+    orphan+="${orphan:+, }$id"
+  done < <(app_sources | awk -F'\t' '$8 != "" { print $1 "\t" $8 }')
+  if [[ -n $orphan ]]; then
+    setup_row apps "$label" broken \
+      "These entries were edited with no backup left to restore: $orphan. Fixing puts every application back and applies '$cur' again from scratch." true
+    return
+  fi
+
+  apps_rules_match
+  case $? in
+  1) setup_row apps "$label" broken \
+       "This plugin's copy of Omarchy's hiding rules no longer agrees with Omarchy's own, so a switch could hide the wrong applications. Fixing restores every entry and applies '$cur' again." true
+     return ;;
+  2) setup_row apps "$label" unknown \
+       "Omarchy's own hidden-entries.sh could not be read, so its rules could not be compared with this plugin's copy." false
+     return ;;
+  esac
+
+  local pending
+  pending=$(apps_preview_json "$cur" | jq -r '(.to_hide | length) + (.to_show | length)' 2>/dev/null)
+  [[ $pending =~ ^[0-9]+$ ]] || pending=0
+  if ((pending > 0)); then
+    setup_row apps "$label" needs_action \
+      "$pending application entr$([[ $pending == 1 ]] && echo y || echo ies) do not match what '$cur' allows. Fixing brings the menu, the launcher and search back in line." true
+  else
+    setup_row apps "$label" ok \
+      "The menu, the launcher and search show exactly what '$cur' allows." false
+  fi
+}
+
+# ---------------------------------------------------------------- row: keys
+#
+# SUPER+1..0 have to address the active profile's block of workspaces, which
+# means a keybinding that calls this engine. bindings.lua stays the user's —
+# they may isolate it per profile, and Setup never writes into it — so the keys
+# live in a file of our own and hyprland.lua gets exactly one line pointing at
+# it.
+
+KEYS_FILE="$CONFIG_HOME/hypr/profiles-keys.lua"
+HYPRLAND_LUA="$CONFIG_HOME/hypr/hyprland.lua"
+KEYS_REQUIRE='pcall(require, "hypr.profiles-keys") -- graveklar.profiles: managed, must stay after require("hypr.bindings")'
+
+# The whole file is generated, every time. `hl` and `o` are globals in Omarchy's
+# Lua state; the guard makes the file inert anywhere they are not, so a copy of
+# it that ends up somewhere else can never break a config.
+keys_file_content() {
+  local engine; engine=$(engine_path)
+  # A Lua string literal: a backslash or a quote in a path would otherwise end
+  # the string, and nothing else in a path needs escaping.
+  engine=${engine//\\/\\\\}
+  engine=${engine//\"/\\\"}
+  cat <<EOF
+-- Managed by Profiles (graveklar.profiles). Setup regenerates this file; edits are overwritten.
+if not (hl and o) then return end
+local engine = "$engine"
+for w = 1, 10 do
+  local key, n = "code:" .. tostring(w + 9), tostring(w)
+  hl.unbind("SUPER + " .. key)
+  o.bind("SUPER + " .. key, "Workspace " .. n, engine .. " ws " .. n)
+  hl.unbind("SUPER + SHIFT + " .. key)
+  o.bind("SUPER + SHIFT + " .. key, "Move window to workspace " .. n, engine .. " move " .. n)
+  hl.unbind("SUPER + SHIFT + ALT + " .. key)
+  o.bind("SUPER + SHIFT + ALT + " .. key, "Move window silently to workspace " .. n, engine .. " move " .. n .. " --silent")
+end
+hl.unbind("SUPER + TAB");         o.bind("SUPER + TAB", "Next workspace in this profile", engine .. " ws next")
+hl.unbind("SUPER + SHIFT + TAB"); o.bind("SUPER + SHIFT + TAB", "Previous workspace in this profile", engine .. " ws prev")
+-- global workspace bindings are written here by \`global keys\` when the global workspace is enabled
+EOF
+}
+
+# Someone's own workspace bindings, which would fight the managed ones.
+#
+# Matched on the binary path rather than on a command, because a block built
+# from a variable — `gk_profile .. " ws " .. n` — contains no literal
+# `omarchy-profile ws` anywhere. Every hypr Lua file except the managed one is
+# searched, and so is every isolated copy of bindings.lua: another profile's
+# copy can hold a block this profile's file does not.
+keys_handwritten() {
+  local f
+  for f in "$CONFIG_HOME"/hypr/*.lua; do
+    [[ -f $f ]] || continue
+    [[ $f == "$KEYS_FILE" ]] && continue
+    grep -nF 'graveklar.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
+      cut -d: -f1 | sed "s|^|$f:|"
+  done
+  for f in "$ISOLATE_DIR"/*/.config%hypr%bindings.lua; do
+    [[ -f $f ]] || continue
+    grep -nF 'graveklar.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
+      cut -d: -f1 | sed "s|^|$f:|"
+  done
+}
+
+# Line numbers of the managed require line, and of the bindings require it must
+# follow. `require("hypr.bindings")` wins over anything loaded before it, so
+# these bindings have to come after it — not last: hyprmoncfg appends a block it
+# wants last too, and the two do not conflict.
+keys_line_no() { [[ -s $HYPRLAND_LUA ]] && grep -nF 'require, "hypr.profiles-keys"' -- "$HYPRLAND_LUA" | head -1 | cut -d: -f1; }
+# Not the managed line itself, which says `require("hypr.bindings")` inside its
+# own comment: matching that made the line look like it was in the right place
+# whatever its position, because it was being compared against itself.
+bindings_line_no() {
+  [[ -s $HYPRLAND_LUA ]] || return 0
+  grep -nF 'require("hypr.bindings")' -- "$HYPRLAND_LUA" |
+    grep -vF 'hypr.profiles-keys' | head -1 | cut -d: -f1
+}
+
+setup_row_keys() {
+  local label="Workspace keys"
+
+  local hand; hand=$(keys_handwritten)
+  if [[ -n $hand ]]; then
+    # Not fixable from here, and deliberately so: the block is in the user's own
+    # configuration, which Setup does not edit. The keys work — theirs call the
+    # same engine — so this is a report, not a breakage.
+    local files
+    files=$(printf '%s\n' "$hand" | awk -F: '{ f[$1] = f[$1] (f[$1] ? ", " : "") $2 } END { for (k in f) printf "%s (lines %s) ", k, f[k] }' |
+      sed "s|$HOME|~|g; s| $||")
+    setup_row keys "$label" broken \
+      "Workspace keys are also bound by hand in $files. Setup does not edit your own configuration — remove that block and this row goes green. Until then those bindings are the ones in force." false
+    return
+  fi
+
+  local want have
+  want=$(keys_file_content)
+  have=$([[ -s $KEYS_FILE ]] && cat "$KEYS_FILE")
+  local kline bline
+  kline=$(keys_line_no); bline=$(bindings_line_no)
+
+  if [[ ! -s $KEYS_FILE || -z $kline ]]; then
+    setup_row keys "$label" needs_action \
+      "SUPER+1..0 are not following the active profile yet, so they address workspaces 1-10 in every profile. Fixing writes ~/.config/hypr/profiles-keys.lua and adds one line to hyprland.lua." true
+    return
+  fi
+  if [[ $have != "$want" ]]; then
+    setup_row keys "$label" broken \
+      "~/.config/hypr/profiles-keys.lua is not the file this plugin generates — it was edited, or written by an older version. Fixing rewrites it." true
+    return
+  fi
+  if [[ -n $bline ]] && ((kline < bline)); then
+    setup_row keys "$label" broken \
+      "The managed line in hyprland.lua sits before require(\"hypr.bindings\"), so your own bindings overwrite the profile keys. Fixing moves it after." true
+    return
+  fi
+
+  # Live confirmation, where there is a compositor to ask. Hyprland reports a
+  # Lua binding's dispatcher as `__lua` with an opaque index, so what can be
+  # confirmed is that a SUPER binding described "Workspace 1" exists, not which
+  # command it runs — with no hand-written block in the tree above, this file is
+  # the only thing that binds it.
+  if ! command -v hyprctl >/dev/null || ! hyprctl binds -j >/dev/null 2>&1; then
+    setup_row keys "$label" unknown \
+      "The file and the line are in place, but there is no Hyprland session to confirm the keys are bound." false
+    return
+  fi
+  if hyprctl binds -j 2>/dev/null |
+     jq -e 'any(.[]; .description == "Workspace 1" and (.modmask % 128) >= 64)' >/dev/null 2>&1; then
+    setup_row keys "$label" ok \
+      "SUPER+1..0 follow the active profile, from a file this plugin owns." false
+  else
+    setup_row keys "$label" broken \
+      "The managed file is in place but Hyprland has no SUPER+1 workspace binding, so the config did not load. Fixing rewrites the file and reloads." true
+  fi
+}
+
+# Write the file, place the line, and prove the compositor still loads the
+# config afterwards. If new errors appear the line comes straight back out: a
+# workspace key is not worth a desktop that will not reload.
+keys_fix() {
+  mkdir -p "$CONFIG_HOME/hypr" || die "could not create ~/.config/hypr"
+  local tmp
+  tmp=$(mktemp "$KEYS_FILE.XXXXXX") || die "could not write beside profiles-keys.lua"
+  keys_file_content >"$tmp" && mv "$tmp" "$KEYS_FILE" || { rm -f "$tmp"; die "could not write profiles-keys.lua"; }
+  echo "wrote ${KEYS_FILE/#$HOME/\~}"
+
+  local baseline=""
+  command -v hyprctl >/dev/null &&
+    baseline=$(hyprctl configerrors -j 2>/dev/null | jq -c 'map(select(. != ""))' 2>/dev/null)
+
+  local kline bline added=0
+  kline=$(keys_line_no); bline=$(bindings_line_no)
+  if [[ -n $kline && -n $bline ]] && ((kline < bline)); then
+    # Out of order: take the old one out before appending a new one, so the
+    # file never ends up with two.
+    local t2; t2=$(mktemp "$HYPRLAND_LUA.XXXXXX") || die "could not write beside hyprland.lua"
+    grep -vF 'require, "hypr.profiles-keys"' -- "$HYPRLAND_LUA" >"$t2" &&
+      mv "$t2" "$HYPRLAND_LUA" || { rm -f "$t2"; die "could not rewrite hyprland.lua"; }
+    kline=""
+  fi
+  if [[ -z $kline ]]; then
+    [[ -s $HYPRLAND_LUA ]] || die "no ~/.config/hypr/hyprland.lua to add the line to"
+    printf '\n%s\n' "$KEYS_REQUIRE" >>"$HYPRLAND_LUA" || die "could not append to hyprland.lua"
+    added=1
+    echo "added one line to ${HYPRLAND_LUA/#$HOME/\~}"
+  fi
+
+  command -v hyprctl >/dev/null || return 0
+  hyprctl reload >/dev/null 2>&1
+  local now new
+  now=$(hyprctl configerrors -j 2>/dev/null | jq -c 'map(select(. != ""))' 2>/dev/null)
+  new=$(jq -nc --argjson a "${baseline:-[]}" --argjson b "${now:-[]}" '$b - $a' 2>/dev/null)
+  if [[ -n $new && $new != "[]" ]]; then
+    warn "Hyprland reported new config errors, so the line was taken out again:"
+    jq -r '.[]' <<<"$new" | while read -r line; do warn "  $line"; done
+    if ((added)); then
+      local t3; t3=$(mktemp "$HYPRLAND_LUA.XXXXXX")
+      grep -vF 'require, "hypr.profiles-keys"' -- "$HYPRLAND_LUA" >"$t3" && mv "$t3" "$HYPRLAND_LUA" || rm -f "$t3"
+    fi
+    hyprctl reload >/dev/null 2>&1
+    return 1
+  fi
+  return 0
+}
+
+# ----------------------------------------------------------- row: indicator
+#
+# The bar's workspace numbers have to be relabelled per profile, and there is no
+# hook for that — the widget has to be replaced. `omarchy plugin clone` makes a
+# copy of the stock one under an id derived from the username, which is why the
+# id is discovered and never written down: it is graveklar.workspaces here and
+# alice.workspaces on someone else's machine.
+STOCK_WORKSPACES="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/bar/widgets/Workspaces.qml"
+
+indicator_id() {
+  local dir manifest
+  for dir in "$CONFIG_HOME"/omarchy/plugins/*/; do
+    manifest="$dir/manifest.json"
+    [[ -s $manifest ]] || continue
+    jq -e '.omarchy.clonedFrom == "omarchy.workspaces"' "$manifest" >/dev/null 2>&1 || continue
+    jq -r '.id // empty' "$manifest"
+    return 0
+  done
+  return 1
+}
+
+# This plugin's patched widget, with the clone's own id in it. The id is
+# substituted rather than shipped, for the same reason it is discovered.
+indicator_content() {
+  sed "s|^\( *moduleName: \)\".*\"|\1\"$1\"|" "$PLUGIN_DIR/extras/Workspaces.qml"
+}
+
+indicator_enabled() {
+  omarchy plugin list --json 2>/dev/null |
+    jq -e --arg id "$1" 'any(.[]; .id == $id and (.enabled // false))' >/dev/null 2>&1
+}
+
+setup_row_indicator() {
+  local label="Workspace indicator"
+  local id; id=$(indicator_id)
+  if [[ -z $id ]]; then
+    setup_row indicator "$label" needs_action \
+      "The bar still shows plain workspace numbers, so every profile looks like it is on workspace 1-10. Fixing clones Omarchy's workspace widget and teaches the copy about profiles." true
+    return
+  fi
+
+  local file="$CONFIG_HOME/omarchy/plugins/$id/Workspaces.qml"
+  if [[ ! -s $file ]] || ! grep -q 'ws_offset' "$file"; then
+    setup_row indicator "$label" broken \
+      "'$id' exists but is not the profile-aware widget. Fixing replaces its Workspaces.qml." true
+    return
+  fi
+  if ! diff -q <(indicator_content "$id") "$file" >/dev/null 2>&1; then
+    setup_row indicator "$label" needs_action \
+      "'$id' is an older copy of this plugin's workspace widget. Fixing re-syncs it." true
+    return
+  fi
+  if ! indicator_enabled "$id"; then
+    setup_row indicator "$label" needs_action \
+      "'$id' is installed but switched off, so the bar is showing real workspace numbers. Fixing enables it." true
+    return
+  fi
+  # A clone is a snapshot. If Omarchy's own widget has moved on since this
+  # plugin's copy was taken, the copy is behind — and no re-clone can fix that,
+  # because re-applying would only put this same copy back.
+  if [[ -f $STOCK_WORKSPACES && $STOCK_WORKSPACES -nt $PLUGIN_DIR/extras/Workspaces.qml ]]; then
+    setup_row indicator "$label" broken \
+      "Omarchy's own workspace widget has changed since this plugin's copy of it was made, so '$id' may be missing what that change added. Updating this plugin is what resolves it." false
+    return
+  fi
+  setup_row indicator "$label" ok \
+    "'$id' relabels the bar so every profile reads 1-0, whichever block of workspaces it actually uses." false
+}
+
+indicator_fix() {
+  local id; id=$(indicator_id)
+  if [[ -z $id ]]; then
+    command -v omarchy >/dev/null || die "omarchy is not available to clone the widget with"
+    omarchy plugin clone omarchy.workspaces >/dev/null 2>&1 || die "could not clone omarchy.workspaces"
+    id=$(indicator_id)
+    [[ -n $id ]] || die "cloned omarchy.workspaces but could not find the clone"
+    echo "cloned the workspace widget as '$id'"
+  fi
+  local file="$CONFIG_HOME/omarchy/plugins/$id/Workspaces.qml"
+  [[ -d ${file%/*} ]] || die "no plugin directory for '$id'"
+  local tmp; tmp=$(mktemp "${file%/*}/.Workspaces.XXXXXX") || die "could not write beside $file"
+  indicator_content "$id" >"$tmp" && mv "$tmp" "$file" || { rm -f "$tmp"; die "could not write $file"; }
+  echo "installed the profile-aware widget into '$id'"
+  if ! indicator_enabled "$id"; then
+    omarchy plugin enable "$id" >/dev/null 2>&1 || warn "could not enable '$id' — enable it from the bar settings"
+  fi
+  # Two workspace widgets in one bar is a duplicate, not a fallback.
+  if indicator_enabled omarchy.workspaces; then
+    omarchy plugin disable omarchy.workspaces >/dev/null 2>&1 ||
+      warn "could not disable the stock omarchy.workspaces widget"
+  fi
+  return 0
+}
+
+# -------------------------------------------------------------- row: switch
+
+setup_row_switch() {
+  local label="Switching"
+  local held=""
+  [[ -s $PENDING_OWNER ]] && held=$(cut -f1 "$PENDING_OWNER" | sed "s|^$HOME|~|" | paste -sd', ')
+
+  if [[ -e $JOURNAL ]]; then
+    if ! state_lock_free; then
+      setup_row switch "$label" unknown "A switch is running right now." false
+      return
+    fi
+    local from to stage
+    from=$(journal_field from); to=$(journal_field to); stage=$(journal_field stage)
+    setup_row switch "$label" broken \
+      "A switch from ${from:-nothing} to ${to:-?} stopped at ${stage:-?} and did not finish. Until it is repaired nothing may be captured, because the desktop and the records disagree about who owns it. Fixing finishes that switch." true
+    return
+  fi
+  if [[ -n $held ]]; then
+    setup_row switch "$label" broken \
+      "These files could not be moved into their profile's store and are still where they were: $held. Switching is blocked until they are filed. Fixing files them under the profile that owned them." true
+    return
+  fi
+  if ! state_lock_free; then
+    setup_row switch "$label" unknown "A switch is running right now." false
+    return
+  fi
+  setup_row switch "$label" ok "No switch is stuck and nothing is waiting to be filed." false
+}
+
+# Put a held path away under the profile that owned it when the move failed.
+# The line is only removed once the file is safely in the store, so a second
+# failure leaves the block in place rather than losing the file.
+file_held_paths() {
+  [[ -s $PENDING_OWNER ]] || return 0
+  local left path owner store
+  left=$(mktemp "$PENDING_OWNER.XXXXXX") || return 1
+  while IFS=$'\t' read -r path owner; do
+    [[ -n $path && -n $owner ]] || continue
+    if [[ ! -e $path && ! -L $path ]]; then
+      echo "nothing left at ${path/#$HOME/\~} — dropping the block"
+      continue
+    fi
+    if ! exists "$owner"; then
+      warn "'${path/#$HOME/\~}' was held for the profile '$owner', which no longer exists — leaving it in place"
+      printf '%s\t%s\n' "$path" "$owner" >>"$left"
+      continue
+    fi
+    store=$(store_for "$owner" "$path")
+    mkdir -p "$(dirname "$store")"
+    rm -rf "$store.prev"
+    [[ -e $store ]] && { mv -T "$store" "$store.prev" || { warn "could not move '$owner''s old store aside for ${path/#$HOME/\~}"; printf '%s\t%s\n' "$path" "$owner" >>"$left"; continue; }; }
+    if mv -T "$path" "$store"; then
+      echo "filed ${path/#$HOME/\~} into $owner"
+    else
+      [[ -e $store.prev ]] && mv -T "$store.prev" "$store"
+      warn "still cannot move ${path/#$HOME/\~} into $owner's store — leaving it in place"
+      printf '%s\t%s\n' "$path" "$owner" >>"$left"
+    fi
+  done <"$PENDING_OWNER"
+  if [[ -s $left ]]; then mv "$left" "$PENDING_OWNER"; else rm -f "$left" "$PENDING_OWNER"; fi
+  return 0
+}
+
+# ------------------------------------------------------------ status and fix
+
+setup_status() {
+  SETUP_ROWS=()
+  setup_row_adopt
+  setup_row_apps
+  setup_row_keys
+  setup_row_indicator
+  setup_row_switch
+
+  if [[ -n $JSON ]]; then
+    printf '%s\n' "${SETUP_ROWS[@]}" | jq -sc .
+    return 0
+  fi
+  local row
+  for row in "${SETUP_ROWS[@]}"; do
+    printf '%-10s %-12s %s\n' "$(jq -r .id <<<"$row")" "$(jq -r .state <<<"$row")" "$(jq -r .detail <<<"$row")"
+  done
+}
+
+cmd_setup() {
+  local verb=${1:-status} id=${2:-} a
+  for a in "$@"; do [[ $a == --json ]] && JSON=1; done
+  [[ $id == --json ]] && id=""
+
+  case $verb in
+  status) setup_status ;;
+  fix)
+    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch>"
+    # Every fix takes the state lock: each of them writes something a switch
+    # also writes.
+    lock_or_busy
+    case $id in
+    adopt) cmd_init ;;
+    apps)
+      local cur; cur=$(current_profile)
+      [[ -n $cur ]] && exists "$cur" || die "no active profile to apply"
+      # Broken means our tags no longer describe what is on disk, and the only
+      # honest way back is to put every application in the menu again and
+      # rebuild this profile's view of it from nothing.
+      local broken=0 tag id2
+      while IFS=$'\t' read -r id2 tag; do
+        [[ $tag == modified ]] || continue
+        [[ -s $APP_BACKUP_DIR/$id2.desktop ]] || broken=1
+      done < <(app_sources | awk -F'\t' '$8 != "" { print $1 "\t" $8 }')
+      # Only a genuine mismatch (1) sweeps; undeterminable (2) is not a reason
+      # to take every application out of the menu and put it back.
+      apps_rules_match
+      [[ $? == 1 ]] && broken=1
+      if ((broken)); then
+        apps_sweep
+        unset APP_SOURCES_CACHE
+      fi
+      apply_app_visibility "$cur"
+      echo "applied '$cur''s applications" ;;
+    keys) keys_fix || exit 1 ;;
+    indicator) indicator_fix ;;
+    switch)
+      file_held_paths
+      if [[ -e $JOURNAL ]]; then
+        # Finishing a switch restarts the shell, which kills whoever asked for
+        # the repair — the panel most of all. So the repair detaches exactly
+        # like a switch does, and the row reads "a switch is running right now"
+        # until it is done.
+        local to; to=$(journal_field to)
+        answer "$(jq -nc --arg n "$to" '{ok: true, switching: $n}')" "finishing the interrupted switch to $to"
+        detach recover_switch
+        exit 0
+      fi
+      echo "nothing to repair" ;;
+    *) die "unknown setup row '$id'" ;;
+    esac ;;
+  *) die "usage: omarchy-profile setup [status|fix <id>]" ;;
+  esac
+}
+
+# What this machine can and cannot do, as state strings. Every fact whose answer
+# would have to be guessed is `unknown`, and an optional component that is not
+# installed is `absent` — neither is ever reported as healthy.
+cmd_capabilities() {
+  # The reload probe belongs to the isolate phase; until it exists, whether
+  # `hyprctl reload` re-reads a swapped file on THIS machine is not something
+  # this engine has measured.
+  local reload=unknown face=absent polkit=absent helpers=absent
+
+  local identity=""
+  command -v omarchy-face-identity >/dev/null && identity=$(command -v omarchy-face-identity)
+  [[ -z $identity && -x /usr/local/bin/omarchy-face-identity ]] && identity=/usr/local/bin/omarchy-face-identity
+  [[ -n $identity ]] && face=ok
+
+  # Both belong to the password phase. They are reported as absent rather than
+  # as needing action because there is nothing installed to act on yet.
+  [[ -x /usr/local/bin/omarchy-profile-auth && -x /usr/local/bin/omarchy-profile-passwd ]] && helpers=unknown
+  [[ -r /usr/share/polkit-1/actions/no.graveklar.profiles.auth.policy ]] && polkit=unknown
+
+  jq -nc --arg r "$reload" --arg f "$face" --arg p "$polkit" --arg h "$helpers" \
+    '{hyprland_reload: $r, face: $f, polkit: $p, helpers: $h}'
+}
+
 ensure_config
 
 case "${1:-}" in
@@ -2158,6 +3098,8 @@ refresh)
   # Rewrite every file the panel and launcher read, without switching. Useful
   # after editing a profile by hand, and after installing over an older version
   # that wrote none of them.
+  require_no_journal
+  lock_or_busy
   cur=$(current_profile)
   write_index; write_catalog
   [[ -n $cur ]] && apply_app_visibility "$cur"
@@ -2165,14 +3107,33 @@ refresh)
   # Also the upgrade path: someone who installed before this check existed, or
   # who installed from the marketplace, finds out here rather than at a lock.
   check_polkit_action ;;
-isolate) shift; cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
+isolate)
+  shift
+  # Two sub-verbs the isolate phase builds; named here so the panel gets a JSON
+  # answer rather than "unknown command" on stderr.
+  case "${1:-list}" in
+  candidates | resolve) not_implemented "isolate $1" ;;
+  esac
+  cmd_isolate "${1:-list}" "${2:-}" "${3:-}" "${4:-}" ;;
 shared) shift; cmd_shared "${1:-list}" "${2:-}" ;;
 overview) shift; cmd_overview "${1:-}" ;;
 close) shift; cmd_close_profile "${1:-}" ;;
 lock) shift; cmd_lock lock "${1:-}" ;;
 unlock) shift; cmd_lock unlock "${1:-}" ;;
-identity) shift; cmd_identity "${1:-}" "${2:-}" "${3:-}" ;;
-set) shift; cmd_set "${1:-}" "${2:-}" ;;
+identity)
+  shift
+  # The contract's `identity list --json` is the password phase's shape, and is
+  # a different thing from today's `identity <profile> [<face>]`.
+  [[ ${1:-} == list ]] && not_implemented "identity list"
+  cmd_identity "${1:-}" "${2:-}" "${3:-}" ;;
+# Everything below is named in the contract and built by a later phase. Each
+# answers in JSON and exits 1, so the panel can call any verb the contract has
+# from the day it freezes and render a real answer.
+password | meta | rename | config | session | login | purge)
+  not_implemented "$1 ${2:-}" ;;
+setup) shift; cmd_setup "$@" ;;
+capabilities) cmd_capabilities ;;
+set) shift; cmd_set "$@" ;;
 capture) cmd_capture ;;
 create) shift; cmd_create "${1:-}" "${2:---from-master}" ;;
 remove) shift; cmd_remove "${1:-}" ;;
@@ -2180,13 +3141,18 @@ show) shift; cmd_visibility show "${1:-}" ;;
 hide) shift; cmd_visibility hide "${1:-}" ;;
 apps) shift; cmd_apps "$@" ;;
 apps-sweep) apps_sweep ;;
-plugin) shift; cmd_plugin "${1:-}" "${2:-list}" "${3:-}" ;;
+plugin) shift; cmd_plugin "${1:-}" "${2:-list}" "${3:-}" "${4:-}" ;;
 ws) shift; cmd_ws "${1:-}" ;;
 move) shift; cmd_move "${1:-}" "${2:-}" ;;
 next) cmd_next ;;
 current) cmd_current ;;
 init) cmd_init ;;
-list | ls | "") cmd_list ;;
+list | ls | "")
+  # The contract's `list --json` carries two fields — hasPassword and identity —
+  # that only the password phase's root store can answer. Rather than print a
+  # shape with invented values in it, the flag says so until that store exists.
+  [[ ${2:-} == --json ]] && not_implemented "list --json"
+  cmd_list ;;
 -h | --help | help)
   cat <<'USAGE'
 omarchy-profile — profiles for the Omarchy desktop
@@ -2208,6 +3174,10 @@ omarchy-profile — profiles for the Omarchy desktop
 
   overview [--json]                what every profile is holding open
   refresh                          rewrite the files the panel and launcher read
+
+  setup status [--json]            what still has to be true for this to work
+  setup fix <id>                   fix one of those things
+  capabilities --json              what this machine can and cannot do
 
   global [status|enable|disable|send|toggle] [name]
                                    a workspace that survives every switch

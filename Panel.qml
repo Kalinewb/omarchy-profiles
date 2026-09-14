@@ -114,12 +114,93 @@ Panel {
   property var settingsAllApps: []
 
   // Which profile a password is being asked for, and which Setup row is waiting
-  // on an answer. Nothing writes them yet — the prompt and the Setup view are
-  // later phases — but the idle timer already has to know that a question is on
-  // screen, and a property that is always "" is a cheaper stub than a timer
-  // condition that changes shape later.
+  // on an answer. The prompt is a later phase; the idle timer already has to
+  // know that a question is on screen, because timing one out would dismiss it
+  // without anybody deciding anything.
   property string passwordFor: ""
   property string pendingSetup: ""
+
+  // What Setup says, as the engine says it.
+  //
+  // null is "not asked yet" and is never healthy: an unanswered question and a
+  // healthy machine must not look the same. setupOutcome tells the view which
+  // of the three it is — pending, answered, or the engine could not answer.
+  property var setupRows: null
+  property string setupOutcome: ""
+  property string setupError: ""
+  property int setupElapsed: 0
+
+  function loadSetup(gate) {
+    root.ask(["setup", "status", "--json"], "", function (ok, parsed, code) {
+      if (ok && Array.isArray(parsed)) {
+        root.setupRows = parsed
+        root.setupOutcome = "ok"
+      } else {
+        root.setupRows = []
+        root.setupOutcome = (parsed && parsed.error) ? String(parsed.error) : ("exit " + code)
+      }
+      if (gate) root.applySetupGate()
+    })
+  }
+
+  function setupRow(id) {
+    if (!root.setupRows) return null
+    for (var i = 0; i < root.setupRows.length; i++)
+      if (root.setupRows[i] && root.setupRows[i].id === id) return root.setupRows[i]
+    return null
+  }
+
+  function rowNeedsWork(row) {
+    return !!row && (row.state === "needs_action" || row.state === "broken")
+  }
+
+  // Two rows are not "something to look at later": without adoption there is no
+  // profile to switch to, and with a switch half done nothing may be captured.
+  // Everything else badges the hero and lets the user carry on.
+  readonly property var blockingRows: ["adopt", "switch"]
+
+  function setupBlocking() {
+    if (!root.setupRows) return false
+    for (var i = 0; i < root.blockingRows.length; i++)
+      if (root.rowNeedsWork(root.setupRow(root.blockingRows[i]))) return true
+    return false
+  }
+
+  readonly property int setupBadge: {
+    if (!setupRows) return 0
+    var n = 0
+    for (var i = 0; i < setupRows.length; i++) {
+      var s = setupRows[i] ? String(setupRows[i].state) : ""
+      if (s !== "ok" && s !== "absent") n++
+    }
+    return n
+  }
+
+  function applySetupGate() {
+    if (root.setupBlocking() || root.switchStalled) root.resetView("setup")
+  }
+
+  function runFix(id) {
+    root.pendingSetup = id
+    root.setupError = ""
+    root.setupElapsed = 0
+    root.ask(["setup", "fix", id], "", function (ok, parsed, code) {
+      root.pendingSetup = ""
+      if (!ok) {
+        var err = parsed && parsed.error ? String(parsed.error) : ("exit " + code)
+        root.setupError = err === "busy" ? "Busy — try again when the switch finishes"
+                        : "That did not work (" + err + ")"
+      }
+      // A fix changes what every other row can see, so the whole set is asked
+      // again rather than the one row patched in place.
+      root.loadSetup(false)
+    })
+  }
+
+  // Set when a switch was authorised and then never arrived. The engine is the
+  // only thing that can say why, so the panel's job is to stop pretending it is
+  // still switching and to send the user where the answer is.
+  property bool switchStalled: false
 
   readonly property string catalogPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/plugins.json"
@@ -258,22 +339,78 @@ Panel {
 
   function tooltip() {
     if (applying !== "") return "Switching to " + label(applying) + "…"
+    if (switchStalled) return "The switch did not finish — open Setup"
+    if (setupBlocking()) return "Profiles — setup needed"
     if (currentProfile === "") return "Machine profile: not set"
     return "Machine profile: " + label(currentProfile)
   }
 
-  // Every row does exactly this: hand the name to the engine and close. No
-  // theme or bar logic in QML.
+  // Switching is two things, and only the first of them can be answered here.
+  //
+  // Stage 1 is an authentication verdict: exit 0 means the engine was allowed
+  // to switch and is now doing it in a detached process that will restart this
+  // shell. Nothing below waits for the switch to finish, because this QML will
+  // not exist when it does — current.json arriving and applyTimeout expiring
+  // are the only two signals there are.
   function apply(id) {
-    if (!root.bar || typeof root.bar.run !== "function") {
-      console.warn("graveklar.profiles", "No bar facade to run the engine through")
+    var e = root.entry(id)
+    if (e && (e.hasPassword || e.locked)) { root.beginUnlock(id); return }
+    root.startSwitch(id, "")
+  }
+
+  // Bumped by every attempt, so a verdict for an attempt that has been
+  // superseded is dropped rather than allowed to overwrite the newer one's
+  // state. The password phase makes that ordinary: a face attempt and a typed
+  // one can be in flight at once.
+  property int switchSerial: 0
+
+  function startSwitch(id, secret) {
+    root.applying = id
+    root.switchStalled = false
+    root.switchError = ""
+    var serial = ++root.switchSerial
+    return root.ask(["set", id, "--json"], secret, function (ok, parsed, code) {
+      // 143 is a face attempt this panel cancelled itself: empty stdout,
+      // nothing written, no lock held. It is not an answer to anything.
+      if (serial !== root.switchSerial || code === 143) return
+      if (ok) {
+        applyTimeout.restart()
+        root.passwordFor = ""
+        root.close()
+        return
+      }
+      root.applying = ""
+      root.handleAuthError(id, parsed, code)
+    })
+  }
+
+  // Which profile is being asked about, and what to say about the last answer.
+  // The prompt itself is the password phase; until it exists, a locked profile
+  // goes through the engine, which draws the owner's prompt the old way.
+  function beginUnlock(id) {
+    root.startSwitch(id, "")
+  }
+
+  // The panel's half of the contract's error codes. The ones with their own UI
+  // — the password field, the countdown — arrive with the prompt; everything
+  // here has to at least say something true rather than fail silently.
+  function handleAuthError(id, parsed, code) {
+    var err = parsed && parsed.error ? String(parsed.error) : "failed"
+    if (code === 3) { root.switchError = "Another switch is still running"; return }
+    if (err === "interrupted_switch" || err === "held_paths") {
+      // Both belong to the `switch` Setup row, and both block every other
+      // switch, so the panel goes there rather than leaving the user to guess.
+      root.switchError = "The last switch did not finish — open Setup"
+      root.loadSetup(true)
       return
     }
-    root.applying = id
-    applyTimeout.restart()
-    root.bar.run(root.engine + " set " + id)
-    root.close()
+    if (code === 2) { root.switchError = "Not authorised"; return }
+    root.switchError = "Could not switch to " + root.label(id)
   }
+
+  // One line under the hero title, cleared by the next attempt or by arriving
+  // somewhere.
+  property string switchError: ""
 
   // Where each view says it is, in one table rather than a ternary chain per
   // piece of chrome. config, setup and edit arrive in later phases; their rows
@@ -288,7 +425,8 @@ Panel {
     "overview": { title: "What is open",    meta: "Nothing closes when you switch",
                   hint: "measured from each window's cgroup, not estimated" },
     "config":   { title: "Configuration",   meta: "", hint: "" },
-    "setup":    { title: "Setup",           meta: "", hint: "" },
+    "setup":    { title: "Setup",           meta: "What has to be true before this works",
+                  hint: "each row is one thing; Fix does it for you" },
     "edit":     { title: "Edit profile",    meta: "", hint: "" }
   })
 
@@ -337,8 +475,12 @@ Panel {
     try {
       var parsed = JSON.parse(String(content || ""))
       if (parsed && typeof parsed === "object" && typeof parsed.profile === "string") {
+        var arrived = parsed.profile !== root.currentProfile
         root.currentProfile = parsed.profile
         root.applying = ""
+        // Arriving somewhere is the only thing that clears a stalled switch:
+        // the file naming the new profile is written by the switch itself.
+        if (arrived) { root.switchStalled = false; root.switchError = "" }
         var i = root.visibleIndexOf(parsed.profile)
         if (i >= 0) root.cursor = i
         return
@@ -363,6 +505,12 @@ Panel {
     // Recomputed on open rather than polled: it reads /proc for every window,
     // which is not something to do on a timer for a panel nobody is looking at.
     root.runEngine("overview")
+    // Asked on every open, and it decides which view this open lands on: a
+    // panel that offers a profile list while nothing can switch is worse than
+    // one that says what is wrong.
+    root.setupError = ""
+    root.loadSetup(true)
+    if (root.switchStalled) root.resetView("setup")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
 
@@ -540,12 +688,29 @@ Panel {
     onTriggered: if (root.opened && !root.touchedSinceOpen) root.close()
   }
 
-  // If the engine dies without writing state, stop showing "switching…".
+  // The switch was authorised and then nothing arrived. Nothing can report back
+  // — the process that was doing it restarts this shell — so the absence of
+  // current.json changing IS the signal, and the answer is in Setup's `switch`
+  // row, which reads the journal the engine left behind.
   Timer {
     id: applyTimeout
     interval: 20000
     repeat: false
-    onTriggered: root.applying = ""
+    onTriggered: {
+      if (root.applying !== "" && root.applying !== root.currentProfile)
+        root.switchStalled = true
+      root.applying = ""
+    }
+  }
+
+  // How long the running fix has been running. A Setup step that installs
+  // something can take seconds, and a button that goes quiet is indistinguishable
+  // from one that did nothing.
+  Timer {
+    interval: 1000
+    repeat: true
+    running: root.pendingSetup !== ""
+    onTriggered: root.setupElapsed = root.setupElapsed + 1
   }
 
   IpcHandler {
@@ -695,7 +860,14 @@ Panel {
           // which only matters while choosing one. Showing "Master" beside the
           // title "test" read as a label on test.
           detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile) : ""
-          meta: root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
+          // In order of what the person most needs to know: an error about the
+          // thing they just did, the switch in progress, a Setup badge, and
+          // only then the view's own strapline.
+          meta: root.switchError !== "" ? root.switchError
+                : root.applying !== "" ? "Switching to " + root.label(root.applying) + "…"
+                : (root.view !== "setup" && root.setupBadge > 0)
+                  ? (root.setupBadge === 1 ? "One thing needs attention in Setup"
+                                           : root.setupBadge + " things need attention in Setup")
                 : root.chrome().meta
           foreground: root.foreground
           fontFamily: root.fontFamily
@@ -758,15 +930,43 @@ Panel {
             }
           }
 
-          Text {
-            textFormat: Text.PlainText
+          // Nothing to switch to. The old text named a command to type, which is
+          // the one thing this plugin is not: Setup adopts the machine.
+          Column {
             width: parent.width
+            spacing: Style.space(8)
             visible: root.visibleProfiles.length === 0
-            wrapMode: Text.WordWrap
-            text: "No profiles yet. Run `omarchy-profile init` to adopt this machine as your master profile."
-            color: root.dim
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.caption
+
+            Text {
+              textFormat: Text.PlainText
+              width: parent.width
+              wrapMode: Text.WordWrap
+              text: "No profiles yet. Setup adopts this machine as your master profile — it reads the desktop as it is now and changes nothing."
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+            }
+
+            Button {
+              text: "Open Setup"
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              fontSize: Style.font.caption
+              onClicked: { root.keepAlive(); root.pushView("setup") }
+            }
+          }
+
+          // The badge on the hero says something needs attention; this is the
+          // way to it. Without it the badge would be a dead end.
+          Button {
+            visible: root.setupBadge > 0 && root.visibleProfiles.length > 0
+            text: "Open Setup"
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: { root.keepAlive(); root.pushView("setup") }
           }
         }
 
@@ -804,6 +1004,12 @@ Panel {
           onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
           onConfirmClose: function (profile) { root.keepAlive(); root.pendingClose = profile }
           onTouched: root.keepAlive()
+        }
+
+        SetupView {
+          width: parent.width
+          visible: root.view === "setup"
+          panel: root
         }
 
         SettingsView {
