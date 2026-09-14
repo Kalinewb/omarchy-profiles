@@ -30,6 +30,19 @@ Column {
   readonly property var candidates: (panel && panel.isolateCandidates) ? panel.isolateCandidates : []
   readonly property var globalStatus: (panel && panel.globalStatus) ? panel.globalStatus : null
 
+  // What this profile remembers having open, and whether it is asked about.
+  // The mode comes from `config --json` and the list from `session show
+  // --json`, which is also where the mode would be — one source is enough, and
+  // the config page already has the first one open.
+  readonly property var session: (panel && panel.configSession) ? panel.configSession : null
+  readonly property string restoreMode: {
+    var m = view.cfg ? String(view.cfg.restore_apps || "ask") : "ask"
+    return (m === "off" || m === "always") ? m : "ask"
+  }
+  readonly property var remembered: (view.session && Array.isArray(view.session.apps)) ? view.session.apps : []
+  readonly property int rememberedCount: view.remembered.length
+  property bool rememberedOpen: false
+
   // ok | unknown | broken. Anything else is treated as unknown: a fact nobody
   // could determine must never look like a healthy one.
   readonly property string reloadState: panel ? panel.hyprReload : "unknown"
@@ -98,6 +111,112 @@ Column {
       value: view.cfg && view.cfg.idle && view.cfg.idle.screensaver !== undefined
              ? ("screen " + view.cfg.idle.screensaver + "s · lock " + (view.cfg.idle.lock || 0) + "s")
              : "—"
+    }
+  }
+
+  // Reopening what was open. Part of "this desk" because it is: the record is
+  // the profile's own, like its theme and its workspaces, and nothing about it
+  // is machine-wide.
+  Text {
+    textFormat: Text.PlainText
+    width: parent.width
+    topPadding: Style.space(6)
+    text: "Reopen apps when entering"
+    color: view.foreground
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.body
+  }
+
+  Row {
+    width: parent.width
+    spacing: Style.space(6)
+
+    Repeater {
+      model: [
+        { value: "off",    label: "Off" },
+        { value: "ask",    label: "Ask" },
+        { value: "always", label: "Always" }
+      ]
+
+      Button {
+        required property var modelData
+        text: String(modelData.label)
+        selected: view.restoreMode === String(modelData.value)
+        foreground: view.restoreMode === String(modelData.value) ? view.accent : view.dim
+        fontFamily: view.fontFamily
+        fontSize: Style.font.caption
+        onClicked: {
+          if (!view.panel || view.restoreMode === String(modelData.value)) return
+          view.panel.keepAlive()
+          view.panel.sessionMode(view.profile, String(modelData.value))
+        }
+      }
+    }
+  }
+
+  Text {
+    textFormat: Text.PlainText
+    width: parent.width
+    wrapMode: Text.WordWrap
+    // Ask promises to be ASKED, not to be guaranteed a notification: a switch
+    // or a shell restart while one is pending destroys it, and the button in
+    // the picker is what the promise actually rests on.
+    text: view.restoreMode === "off"
+          ? "This desk opens empty after a restart."
+          : view.restoreMode === "always"
+            ? "After a restart, what was open reopens by itself."
+            : "After a restart you'll be asked whether to reopen what was open."
+    color: view.dim
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.caption
+  }
+
+  // Collapsed, because it is a list nobody needs until they doubt it. The count
+  // is the part that matters; the names are there to settle the doubt.
+  Button {
+    visible: view.rememberedCount > 0
+    text: (view.rememberedOpen ? "󰅀  " : "󰅂  ") + "Remembered apps (" + view.rememberedCount + ")"
+    foreground: view.foreground
+    fontFamily: view.fontFamily
+    fontSize: Style.font.caption
+    onClicked: {
+      if (view.panel) view.panel.keepAlive()
+      view.rememberedOpen = !view.rememberedOpen
+    }
+  }
+
+  Column {
+    width: parent.width
+    spacing: Style.space(2)
+    visible: view.rememberedOpen && view.rememberedCount > 0
+
+    Repeater {
+      model: view.remembered
+
+      Text {
+        required property var modelData
+        textFormat: Text.PlainText
+        width: parent.width
+        text: "  " + String(modelData.workspace) + " · " + String(modelData.name || modelData.id)
+        color: view.dim
+        font.family: view.fontFamily
+        font.pixelSize: Style.font.caption
+        elide: Text.ElideRight
+      }
+    }
+
+    Button {
+      text: "Forget"
+      bordered: true
+      foreground: view.foreground
+      fontFamily: view.fontFamily
+      fontSize: Style.font.caption
+      onClicked: {
+        if (!view.panel) return
+        view.panel.keepAlive()
+        view.panel.sessionClear(view.profile)
+        view.rememberedOpen = false
+      }
     }
   }
 

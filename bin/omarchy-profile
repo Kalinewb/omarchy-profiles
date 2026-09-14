@@ -2136,10 +2136,19 @@ write_state() {
 # first. Deliberately fd 8 and deliberately written down: a child that inherits
 # it holds the lock for as long as it lives, so every fork that can outlive the
 # switch has a descriptor number to close.
+#
+# Whether THIS process already holds it is written down too. A verb that is
+# also called in-process from inside a switch — `session restore` is the only
+# one — must not take it a second time: `exec 8>` on a descriptor that already
+# holds the lock closes the old open file description, which releases it for an
+# instant, and an instant is all a second caller needs.
+STATE_LOCK_HELD=""
+
 take_state_lock() {
   mkdir -p "$STATE_DIR" || return 1
   exec 8>"$LOCK_FILE" || return 1
-  flock -n 8
+  flock -n 8 || return 1
+  STATE_LOCK_HELD=1
 }
 
 lock_or_busy() {
@@ -2248,8 +2257,16 @@ switch_stage2() {
   trap '' HUP PIPE
 
   journal_set "$from" "$to" capture || return 1
-  # The outgoing profile keeps whatever was changed while inside it.
-  [[ -n $from ]] && exists "$from" && capture_into "$from"
+  # The outgoing profile keeps whatever was changed while inside it — including
+  # what it had open, so that entering it again on an empty block can offer to
+  # put those windows back. Leaving a profile also ends any offer it had
+  # pending: an answer that arrives after the desk has been left is not an
+  # answer to anything.
+  if [[ -n $from ]] && exists "$from"; then
+    capture_into "$from"
+    session_record "$from"
+    rm -f "$(offer_file "$from")"
+  fi
   switch_forward "$from" "$to"
 }
 
@@ -2267,7 +2284,10 @@ switch_forward() {
   swap_isolated "$from" "$to"
 
   journal_set "$from" "$to" write
-  apply_profile_files "$to"
+  # 8>&- at the call site as well as on each command inside it. The commands
+  # are the ones known to start something today; the closed descriptor here is
+  # what makes a theme hook or a helper daemon added tomorrow harmless too.
+  apply_profile_files "$to" 8>&-
   apply_app_visibility "$to"
   # BEFORE the restart, not after it. This used to run last, so a switch that
   # died after `omarchy restart shell` left B's files live while current.json
@@ -2280,9 +2300,16 @@ switch_forward() {
   restart_shell
 
   journal_set "$from" "$to" finish
-  apply_profile_ipc "$to"
+  apply_profile_ipc "$to" 8>&-
   write_index
   write_catalog
+
+  # Only now, after wait_for_shell: the notification server IS the shell that
+  # was just restarted, so an offer raised any earlier would be drawn by a
+  # process about to die. Under `always` this replays in-process and can hold
+  # the lock for up to its own 30 s budget; under `ask` it forks a subshell
+  # that has closed fd 8, so the pending notification holds nothing.
+  maybe_restore "$to"
 
   # Last, not after write_state: a switch that died after the restart still has
   # its do-not-disturb, idle, wallpaper and launcher set finished by recovery.
@@ -2798,6 +2825,626 @@ cmd_close_profile() {
   echo "asked $n window(s) in $name to close"
 }
 
+# ----------------------------------------------------------------- sessions
+#
+# What was open in a profile, so that entering it on a fresh boot can put it
+# back. The user asked for a plain text record replayed on entry and nothing
+# more complex, and the format is exactly that:
+#
+#   ~/.local/state/omarchy-profiles/sessions/<profile>.txt
+#   3<TAB>zen.desktop
+#   1<TAB>foot.desktop
+#
+# The workspace is 1..span, relative to the profile's block, so the record
+# still means the same thing if the profile is later given a different block.
+# The id is a desktop entry id and never a command line — /proc/<pid>/cmdline
+# is not read anywhere here — so this can only reopen things the machine
+# already knows how to launch, and a window whose class maps to no entry is
+# skipped rather than guessed at.
+#
+# Readable, hand-editable, deletable: the reader takes ids with or without
+# .desktop, ignores blank lines and # comments, and accepts spaces where it
+# writes a tab. Everything it reads back is validated again before it is used.
+#
+# Replay is only ever offered into an EMPTY block. Profiles keep their windows
+# across switches, so replaying on every entry would duplicate every window the
+# profile already has open — "empty block" is what makes "after a reboot, or
+# after close all" into a condition the engine can actually test.
+
+SESSION_DIR="$STATE_DIR/sessions"
+# Its own lock, not the state lock. One widget per monitor fires the recorder,
+# and the second one arriving while the first writes has nothing to add — so it
+# does nothing, rather than queueing behind it or making an unrelated verb busy.
+SESSION_LOCK="$SESSION_DIR/.lock"
+# Runtime, not state: an offer is about this boot. tmpfs clears both markers on
+# reboot, which is precisely when they should stop being true.
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/omarchy-profiles"
+OFFER_DIR="$RUNTIME_DIR/offer"
+LOGIN_MARKER="$RUNTIME_DIR/login"
+# This copy of the engine. The notification subshell has to re-enter the engine
+# as a NEW process — the whole point is that it does not inherit the state lock
+# — and it must be the copy that is running, not whichever one is installed, or
+# a working tree would silently hand its work to the installed engine.
+ENGINE_SELF="$PLUGIN_DIR/bin/omarchy-profile"
+
+# A desktop id is spliced into a Lua string handed to `hyprctl dispatch`, so
+# what may be in one is decided here and checked at every boundary. Anything
+# outside this is not launched, and is not recorded either: a line the replay
+# would always drop is not a record of anything.
+SESSION_ID_RE='^[A-Za-z0-9._-]+$'
+
+session_file() { printf '%s/%s.txt\n' "$SESSION_DIR" "$1"; }
+offer_file() { printf '%s/%s\n' "$OFFER_DIR" "$1"; }
+
+# A profile's workspace block, as "<offset> <span>".
+profile_block() {
+  local offset span
+  offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$1")" 2>/dev/null)
+  span=$(jq -r '.workspaces.span // 10' "$(file_for "$1")" 2>/dev/null)
+  [[ $offset =~ ^[0-9]+$ ]] || offset=0
+  [[ $span =~ ^[0-9]+$ ]] || span=10
+  printf '%s %s\n' "$offset" "$span"
+}
+
+# Clients in <profile>'s block, as "<ws-in-block><TAB><class><TAB><initialClass>".
+block_clients() {
+  local offset span
+  read -r offset span < <(profile_block "$1")
+  command -v hyprctl >/dev/null || return 1
+  hyprctl -j clients 2>/dev/null |
+    jq -r --argjson o "$offset" --argjson s "$span" \
+      '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))
+           | "\(.workspace.id - $o)\t\(.class // "")\t\(.initialClass // "")"'
+}
+
+# Is the profile's block empty? A machine with no compositor, or a hyprctl that
+# will not answer, says NO: replay is something done to a running desktop, and
+# a question nobody could answer must never read as permission.
+block_empty() {
+  local offset span n
+  read -r offset span < <(profile_block "$1")
+  command -v hyprctl >/dev/null || return 1
+  n=$(hyprctl -j clients 2>/dev/null |
+    jq --argjson o "$offset" --argjson s "$span" \
+       '[.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))] | length' 2>/dev/null)
+  [[ ${n:-1} == 0 ]]
+}
+
+# Window class -> desktop id, as "<rank><TAB><key><TAB><id>".
+#
+# Built from app_sources, the one enumerator: there is no second scan of
+# desktop files anywhere in this file. NOT cached — building it costs tens of
+# milliseconds here, which is not worth a state file that can go stale behind a
+# package install.
+#
+# Four rules, first match wins at lookup time:
+#
+#   1  StartupWMClass equals the class exactly
+#   2  the id, or the id's last dot-separated part, equals it (case-insensitive)
+#   3  the basename of Exec's first word equals it, lowercased
+#   4  Exec=omarchy-launch-webapp <url>, and the class is the browser's app
+#      window for that URL's host
+#
+# Rule 4 is Chromium's --app= convention, measured here rather than assumed:
+# omarchy-launch-webapp falls back to chromium for any default browser it does
+# not recognise (zen, on this machine), and --app=https://example.com/ opens
+# with the class chrome-example.com__-Default. Only the host is matched — the
+# rest of that string is a URL encoding nobody documents, and two webapps on
+# one host are a tie, resolved like any other.
+class_map() {
+  app_sources | awk -F'\t' '
+    function base(p,   n, a) { n = split(p, a, "/"); return a[n] }
+    function put(rank, key, id, level,   cur) {
+      if (key == "" || id == "") return
+      cur = map[rank, key]
+      if (cur == "") { map[rank, key] = id; lvl[rank, key] = level; return }
+      if (cur == id) return
+      # Two ids answering to one class at the same rule. The user-level entry
+      # wins, then the lexically first id.
+      if (lvl[rank, key] == "system" && level == "user") { map[rank, key] = id; lvl[rank, key] = level }
+      else if (lvl[rank, key] == level && id < cur) map[rank, key] = id
+      # Said once, and only for the two rules where a tie is a surprise. Rule 3
+      # ties by construction — every web app on the machine has the same
+      # launcher as the first word of its Exec — and rule 4 resolves hosts,
+      # where a tie means two entries genuinely point at one site.
+      if (rank <= 2 && !((rank, key) in said)) {
+        said[rank, key] = 1
+        printf "omarchy-profile: two applications answer to the window class %s — using %s\n",
+               key, map[rank, key] > "/dev/stderr"
+      }
+    }
+    {
+      id = $1; level = $2; hidden = $4; cls = $5; ex = $6
+      if (hidden == "true") next          # Omarchy does not show it, so it is not one to reopen
+      if (id == "org.quickshell") next    # the shell itself is not an application
+      put(1, cls, id, level)
+      put(2, tolower(id), id, level)
+      n = split(id, parts, ".")
+      if (n > 1) put(2, tolower(parts[n]), id, level)
+      split(ex, words, " ")
+      first = base(words[1])
+      put(3, tolower(first), id, level)
+      if (first == "omarchy-launch-webapp" && words[2] != "") {
+        host = words[2]
+        sub(/^[a-zA-Z]+:\/\//, "", host)
+        sub(/\/.*$/, "", host)
+        sub(/^www\./, "", host)
+        put(4, tolower(host), id, level)
+      }
+    }
+    END {
+      for (k in map) { split(k, f, SUBSEP); printf "%s\t%s\t%s\n", f[1], f[2], map[k] }
+    }'
+}
+
+declare -A CLASS_R1=() CLASS_R2=() CLASS_R3=() CLASS_R4=()
+CLASS_MAP_LOADED=""
+CLASS_ID=""
+
+# Loaded once per process, deliberately: a lookup happens per window and per
+# poll, and re-enumerating the machine's desktop entries for each one would
+# turn tens of milliseconds into seconds.
+class_map_load() {
+  [[ -n $CLASS_MAP_LOADED ]] && return 0
+  local rank key id
+  while IFS=$'\t' read -r rank key id; do
+    case $rank in
+    1) CLASS_R1["$key"]=$id ;;
+    2) CLASS_R2["$key"]=$id ;;
+    3) CLASS_R3["$key"]=$id ;;
+    4) CLASS_R4["$key"]=$id ;;
+    esac
+  done < <(class_map)
+  CLASS_MAP_LOADED=1
+}
+
+# The desktop id for a window class, in CLASS_ID. A return value and a global
+# rather than an echo: this is called once per window per poll, and a command
+# substitution per call is a fork per call.
+class_to_id() {
+  local cls=${1:-} low host
+  CLASS_ID=""
+  [[ -n $cls ]] || return 1
+  class_map_load
+  if [[ -n ${CLASS_R1[$cls]:-} ]]; then CLASS_ID=${CLASS_R1[$cls]}; return 0; fi
+  low=${cls,,}
+  if [[ -n ${CLASS_R2[$low]:-} ]]; then CLASS_ID=${CLASS_R2[$low]}; return 0; fi
+  if [[ -n ${CLASS_R3[$low]:-} ]]; then CLASS_ID=${CLASS_R3[$low]}; return 0; fi
+  # chrome-<host><encoded-path>-<profile>: the app window a web app entry opens.
+  if [[ $low == chrome-* ]]; then
+    host=${low#chrome-}; host=${host%-*}; host=${host%%_*}
+    if [[ -n ${CLASS_R4[$host]:-} ]]; then CLASS_ID=${CLASS_R4[$host]}; return 0; fi
+  fi
+  return 1
+}
+
+# What the record for <profile> would say about the desktop as it is right now:
+# "<ws><TAB><id>", sorted by workspace then id, one line per id, keeping the
+# lowest workspace. A browser with three windows is one line and reopens its
+# own windows.
+session_lines() {
+  local p=$1 ws cls icls
+  class_map_load
+  while IFS=$'\t' read -r ws cls icls; do
+    class_to_id "$cls" || class_to_id "$icls" || continue
+    # Not recorded if it could never be replayed. The replay validates the id
+    # again before it is interpolated; this is the same rule applied early, so
+    # the file never carries a line whose only future is being dropped.
+    [[ $CLASS_ID =~ $SESSION_ID_RE ]] || continue
+    printf '%s\t%s\n' "$ws" "$CLASS_ID"
+  done < <(block_clients "$p") | sort -k1,1n -k2,2 | awk -F'\t' '!seen[$2]++'
+}
+
+# The record as it is on disk, normalised to "<ws><TAB><id>" with no .desktop
+# suffix. Everything a hand edit can do short of deleting the file is absorbed
+# here: blank lines, comments, spaces instead of a tab, a missing suffix, a
+# workspace that is not a number, the same id twice.
+session_read() {
+  local file; file=$(session_file "$1")
+  [[ -s $file ]] || return 0
+  awk '
+    /^[[:space:]]*(#|$)/ { next }
+    {
+      ws = $1; id = $2
+      if (id == "") next
+      sub(/\.desktop$/, "", id)
+      if (ws !~ /^[0-9]+$/) ws = 1
+      printf "%s\t%s\n", ws, id
+    }' "$file" | sort -k1,1n -k2,2 | awk -F'\t' '!seen[$2]++'
+}
+
+# Write "<ws><TAB><id>" lines from stdin as the record for <profile>. In the
+# record's own directory, like every other write here: a bare mktemp lands on
+# /tmp, and the mv that follows would be a copy rather than an atomic rename.
+session_write() {
+  local p=$1 file tmp
+  file=$(session_file "$p")
+  mkdir -p "$SESSION_DIR" || return 1
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  awk -F'\t' '$2 != "" { printf "%s\t%s.desktop\n", $1, $2 }' >"$tmp" &&
+    mv "$tmp" "$file" || { rm -f "$tmp"; warn "could not write the session record for '$p'"; return 1; }
+}
+
+# Write down what <profile> has open. Called by the widget about ten seconds
+# after the window set changes, and by stage 2 for the profile being left.
+session_record() {
+  local p=${1:-}
+  [[ -n $p ]] || p=$(current_profile)
+  [[ -n $p ]] && exists "$p" || { warn "cannot record a session for '${p:-}'"; return 1; }
+
+  # A journal means current.json may be about to name a different profile, so
+  # a record written now could be filed under the wrong one — the same mistake
+  # as capturing into the wrong profile, in a smaller file. The one caller that
+  # is allowed through is stage 2 itself, which is not guessing: it names the
+  # profile it is leaving, and the journal says the same name.
+  if [[ -e $JOURNAL && $p != "$(journal_field from)" ]]; then return 0; fi
+
+  mkdir -p "$SESSION_DIR" || return 1
+  exec 7>"$SESSION_LOCK" || return 1
+  # Two seconds, and a failure does nothing at all rather than waiting: the
+  # other recorder is writing the same desktop this one would.
+  flock -w 2 7 || { exec 7>&-; return 0; }
+
+  local lines
+  lines=$(session_lines "$p")
+
+  if [[ -z $lines ]]; then
+    # AN EMPTY BLOCK NEVER OVERWRITES. Closing the last window by hand, or
+    # `close all`, leaves the record intact — replay after exactly that is what
+    # the whole feature is for. `session clear` is the only way to empty it.
+    :
+  elif [[ -e $(offer_file "$p") ]]; then
+    # MERGE WHILE AN OFFER IS PENDING. After a reboot the block is empty and
+    # the notification may be unanswered; the first app opened by hand fires
+    # this, and a replace would shrink the record to that one app before the
+    # user had chosen. Existing lines keep their workspaces.
+    { session_read "$p"; printf '%s\n' "$lines"; } |
+      awk -F'\t' '!seen[$2]++' | sort -k1,1n -k2,2 | session_write "$p"
+  else
+    printf '%s\n' "$lines" | session_write "$p"
+  fi
+
+  # Released here rather than at exit: stage 2 calls this, and stage 2 lives
+  # for the rest of the switch.
+  exec 7>&-
+  return 0
+}
+
+# Wait for the window a launch was supposed to produce: the first client that
+# was not there before and whose class maps to <id>. Its address, or nothing.
+session_wait_for() {
+  local id=$1 before=$2 deadline=$3 stop=$((SECONDS + 10)) addr cls
+  ((stop > deadline)) && stop=$deadline
+  while ((SECONDS < stop)); do
+    sleep 0.2
+    while IFS=$'\t' read -r addr cls; do
+      [[ -n $addr ]] || continue
+      grep -qxF -- "$addr" <<<"$before" && continue
+      class_to_id "$cls" || continue
+      [[ $CLASS_ID == "$id" ]] && { printf '%s\n' "$addr"; return 0; }
+    done < <(hyprctl -j clients 2>/dev/null | jq -r '.[] | "\(.address)\t\(.class // "")"')
+  done
+  return 1
+}
+
+# Replay the record into the profile's empty block, now.
+#
+# Sequential, with a poll after each launch, so every move attaches to its own
+# launch — and so the move catches a single-instance application that forwarded
+# the launch to a process already running in another profile, which is the one
+# case where the [workspace N silent] rule cannot work on its own.
+session_restore() {
+  local p=${1:-}
+  [[ -n $p ]] && exists "$p" || refuse 1 no_such_profile "no such profile '${p:-}'"
+
+  # In-process from stage 2 or from login_body the lock is already this
+  # process's; anywhere else it is taken here, and a second caller is busy
+  # rather than interleaved with the first.
+  [[ $STATE_LOCK_HELD == 1 ]] || lock_or_busy
+
+  [[ $p == "$(current_profile)" ]] ||
+    refuse 1 not_active "windows can only be reopened in the profile you are in"
+  block_empty "$p" ||
+    refuse 1 not_empty "$p already has windows open — reopening would put a second copy of each beside them"
+  command -v hyprctl >/dev/null ||
+    refuse 1 no_compositor "there is no compositor to open windows on"
+
+  local offset span
+  read -r offset span < <(profile_block "$p")
+  class_map_load
+
+  # Every id the machine has an entry for, and every id this profile shows.
+  # Two different answers: an id that no longer exists is dropped from the
+  # record, an id this profile hides is kept and skipped — hiding an app is a
+  # decision about the menu, not an instruction to forget it was ever open.
+  local known visible
+  known=$(app_sources | cut -f1)
+  visible=$(apps_list_json "$p" | jq -r '.visible[].id' 2>/dev/null)
+
+  local before
+  before=$(hyprctl -j clients 2>/dev/null | jq -r '.[].address')
+
+  # One budget for the whole replay, because it bounds how long the state lock
+  # is held: a switch asked for meanwhile gets exit 3 until this is done.
+  local deadline=$((SECONDS + 30))
+  local total=0 launched=0 moved=0 ws id target addr at
+  local kept=() missing=()
+
+  while IFS=$'\t' read -r ws id; do
+    ((total++))
+    # VALIDATED BEFORE IT IS INTERPOLATED. The record is a file the user is
+    # invited to edit, and the id below goes inside a Lua string inside a
+    # dispatcher argument: an unchecked line is arbitrary code, not a typo.
+    if [[ ! $id =~ $SESSION_ID_RE ]]; then
+      warn "dropping a session line for '$p': '$id' is not a desktop id"
+      continue
+    fi
+    if ! grep -qxF -- "$id" <<<"$known"; then
+      warn "dropping '$id' from the session record for '$p': there is no such application any more"
+      continue
+    fi
+    kept+=("$ws"$'\t'"$id")
+
+    ((SECONDS >= deadline)) && continue            # budget spent; the line stays
+    grep -qxF -- "$id" <<<"$visible" || continue   # hidden in this profile; the line stays
+
+    ((ws < 1)) && ws=1
+    ((ws > span)) && ws=span
+    target=$((offset + ws))
+
+    hyprctl dispatch "hl.dsp.exec_cmd(\"[workspace $target silent] uwsm app -- $id.desktop\")" >/dev/null ||
+      { warn "could not launch $id"; missing+=("$id"); continue; }
+    ((launched++))
+
+    addr=$(session_wait_for "$id" "$before" "$deadline")
+    if [[ -z $addr ]]; then missing+=("$id"); continue; fi
+    before+=$'\n'$addr
+    at=$(hyprctl -j clients 2>/dev/null | jq -r --arg a "$addr" '.[] | select(.address == $a) | .workspace.id')
+    if [[ -n $at && $at != "$target" ]]; then
+      hl_move_window "$target" "$addr" false && ((moved++))
+    fi
+  done < <(session_read "$p")
+
+  # Only if something was actually dropped: a rewrite that changes nothing
+  # still replaces the file the user may be looking at.
+  if ((${#kept[@]} != total)); then
+    printf '%s\n' ${kept[@]+"${kept[@]}"} | session_write "$p"
+  fi
+  rm -f "$(offer_file "$p")"
+
+  answer "$(jq -nc --argjson l "$launched" --argjson m "$moved" \
+              --argjson miss "$(printf '%s\n' ${missing[@]+"${missing[@]}"} |
+                                jq -R -s 'split("\n") | map(select(length > 0))')" \
+              '{ok: true, launched: $l, moved: $m, missing: $miss}')" \
+         "reopened $launched application(s) in $p"
+  return 0
+}
+
+# Ask, or do it, or do nothing — on entry, with the profile's block empty.
+#
+# Called from the end of stage 2 and from login_body, both of which hold the
+# state lock; nothing else calls it.
+maybe_restore() {
+  local p=$1 mode
+  mode=$(jq -r '.restore_apps // "ask"' "$(file_for "$p")" 2>/dev/null)
+  [[ $mode == off || $mode == ask || $mode == always ]] || mode=ask
+  [[ $mode == off ]] && return 0
+
+  [[ -n $(session_read "$p") ]] || return 0
+  block_empty "$p" || return 0
+
+  mkdir -p "$OFFER_DIR" 2>/dev/null
+  : >"$(offer_file "$p")" 2>/dev/null
+
+  if [[ $mode == always ]]; then
+    # In a subshell, for one reason: session_restore answers a refusal by
+    # exiting, and a race that made the block non-empty between the check above
+    # and the check inside it would otherwise take stage 2 down with it — before
+    # journal_clear, leaving a finished switch looking interrupted.
+    ( session_restore "$p" ) || true
+    return 0
+  fi
+
+  # THE FORK CLOSES THE STATE LOCK. notify-send -A blocks until the
+  # notification is answered or dies, which can be minutes after the switch is
+  # over, and a child inherits fd 8 unless it is told not to — that is how the
+  # first version of this made its own Restore, the panel's Restore button,
+  # `apps allow` and every `set` return busy for as long as the notification
+  # was on screen. `exec 8>&- 7>&-` as the subshell's FIRST statement closes
+  # them in that process for good; a per-command redirection would be saved and
+  # restored around the command and would not.
+  ( exec 8>&- 7>&-; notify_offer "$p" ) </dev/null >/dev/null 2>&1 &
+  disown
+  return 0
+}
+
+# The Ask path. Runs detached, with no lock, in a process that may outlive the
+# switch by as long as the user takes to answer.
+notify_offer() {
+  local p=$1 n names label action
+  n=$(session_read "$p" | wc -l)
+  ((n > 0)) || return 0
+  label=$(jq -r '.label // ""' "$(file_for "$p")" 2>/dev/null)
+  [[ -n $label && $label != null ]] || label=$p
+  # The first three, by name rather than by id: "3 apps were open" says nothing
+  # about whether they are the three you want back.
+  names=$(session_read "$p" | head -3 | cut -f2 | while read -r id; do
+    app_sources | awk -F'\t' -v i="$id" '$1 == i { print ($7 == "" ? $1 : $7); exit }'
+  done | paste -sd, - | sed 's/,/, /g')
+  [[ -n $names ]] || names=$(session_read "$p" | head -3 | cut -f2 | paste -sd, - | sed 's/,/, /g')
+  ((n > 3)) && names="$names…"
+
+  # -t 30000: the longest this notification server will hold a question.
+  #
+  # Measured here rather than assumed. Omarchy's server does not take the
+  # client's expiry as given — it clamps it (notifications/Service.qml:102-110):
+  # a normal-urgency popup lives between 8 s and 30 s whatever is asked for,
+  # including 0, which elsewhere means "never expire". Only urgency=critical
+  # waits indefinitely, and this is a question about windows, not an emergency;
+  # claiming otherwise would also put it through do-not-disturb.
+  #
+  # So an Ask offer is a timed offer on this machine. That is consistent with
+  # what the design already says — no answer is not a restore, and a switch or
+  # a shell restart kills it just as dead — and the panel's Restore windows
+  # button is what the promise actually rests on.
+  action=$(notify-send -a Profiles -t 30000 -A restore=Restore -A skip="Not now" \
+             "Restore windows?" "$n apps were open in $label: $names" 2>/dev/null)
+  # Anything else — Not now, a dismissal, or the server dying with a shell
+  # restart — does nothing. No answer is never a restore, and the panel's
+  # Restore windows button is what remains.
+  [[ $action == restore ]] && "$ENGINE_SELF" session restore "$p"
+  return 0
+}
+
+# Everything the panel and the keybindings can ask about a session record.
+cmd_session() {
+  local args=() a
+  for a in "$@"; do
+    if [[ $a == --json ]]; then JSON=1; else args+=("$a"); fi
+  done
+  local verb=${args[0]:-} name=${args[1]:-} value=${args[2]:-}
+  [[ -n $name ]] || name=$(current_profile)
+
+  case $verb in
+  record)
+    session_record "${args[1]:-}" ;;
+  restore)
+    session_restore "$name" ;;
+  show)
+    [[ -n $name ]] && exists "$name" ||
+      refuse 1 no_such_profile "no such profile '${name:-}'"
+    session_show_json "$name" ;;
+  clear)
+    [[ -n $name ]] && exists "$name" ||
+      refuse 1 no_such_profile "no such profile '${name:-}'"
+    rm -f "$(session_file "$name")" "$(offer_file "$name")"
+    answer '{"ok":true}' "forgot what was open in $name" ;;
+  mode)
+    [[ -n $name ]] && exists "$name" ||
+      refuse 1 no_such_profile "no such profile '${name:-}'"
+    session_mode "$name" "$value" ;;
+  *)
+    die "usage: omarchy-profile session <record|restore|show|clear|mode> [name] [value]" ;;
+  esac
+}
+
+session_show_json() {
+  local p=$1 mode names empty
+  mode=$(jq -r '.restore_apps // "ask"' "$(file_for "$p")" 2>/dev/null)
+  [[ $mode == off || $mode == ask || $mode == always ]] || mode=ask
+  # The entry's own Name=, from the enumerator, so the panel does not have to
+  # read a single desktop file to render the list.
+  names=$(app_sources | awk -F'\t' '{ printf "%s\t%s\n", $1, ($7 == "" ? $1 : $7) }')
+  empty=$(block_empty "$p" && echo true || echo false)
+
+  session_read "$p" | jq -R -s --arg mode "$mode" --argjson empty "$empty" --arg names "$names" '
+    ($names | split("\n") | map(select(length > 0) | split("\t"))
+            | map({key: .[0], value: .[1]}) | from_entries) as $n
+    | { restore_apps: $mode,
+        apps: [ split("\n")[] | select(length > 0) | split("\t")
+                | {workspace: (.[0] | tonumber), id: .[1], name: ($n[.[1]] // .[1])} ],
+        blockEmpty: $empty }'
+}
+
+session_mode() {
+  local p=$1 value=${2:-} file tmp
+  [[ $value == off || $value == ask || $value == always ]] &&
+    exists "$p" || refuse 1 bad_mode "reopening apps is off, ask or always"
+  file=$(file_for "$p")
+  tmp=$(mktemp "$file.XXXXXX") || return 1
+  jq --arg v "$value" '.restore_apps = $v' "$file" >"$tmp" && mv "$tmp" "$file" ||
+    { rm -f "$tmp"; refuse 1 write_failed "could not update '$p'"; }
+  answer "$(jq -nc --arg v "$value" '{ok: true, restore_apps: $v}')" "reopen apps in $p: $value"
+}
+
+# ------------------------------------------------------------------- login
+#
+# The first thing to happen after a boot, and nothing else in the design knows
+# when that is. There is no autostart line and no systemd unit: the widget
+# calls `login` on every Component.onCompleted and the marker below decides
+# whether this one is the boot.
+#
+# It has to be a marker rather than the widget's own judgement, because the
+# shell restarts on every switch — including the switch login itself may make —
+# so Component.onCompleted runs many times per boot and only the engine can
+# tell which of them was the first.
+
+cmd_login() {
+  mkdir -p "$RUNTIME_DIR" 2>/dev/null
+  # mkdir is the whole guard: it either creates the directory or fails, in one
+  # atomic step, so two shells starting at once cannot both be the first. Taken
+  # BEFORE any work, so the shell restart inside login's own switch re-runs the
+  # widget, finds the marker and stops. A login that crashes is not retried
+  # until the next boot, which is better than one that retries into a loop.
+  mkdir "$LOGIN_MARKER" 2>/dev/null || exit 0
+
+  # Detached exactly like `set`, and for the same reason: this may restart the
+  # shell that called it.
+  detach login_body
+  exit 0
+}
+
+login_body() {
+  trap '' HUP PIPE
+  exec 8>"$LOCK_FILE" || return 0
+  # Ten seconds, not none: at boot the widget may call this while something
+  # else is still finishing, and giving up instantly would lose the only
+  # chance this boot has.
+  flock -w 10 8 || return 0
+  STATE_LOCK_HELD=1
+
+  # A switch that was cut off by the shutdown. Rolling it forward here is the
+  # same repair Setup offers, done before anything reads current.json.
+  [[ -e $JOURNAL ]] && recover_switch
+
+  local cur; cur=$(current_profile)
+  [[ -n $cur ]] && exists "$cur" || return 0
+
+  if ! asks_auth "$cur"; then
+    maybe_restore "$cur"
+    return 0
+  fi
+
+  # The current profile is protected. Its theme, bar, launcher set, isolated
+  # stores and workspace keys are already live — they are files, and they were
+  # written when it was entered — so the only thing being withheld is its
+  # windows, which is what the password is actually for.
+  local u="" master n
+  master=$(cfg .master)
+  if exists "$master" && ! asks_auth "$master"; then
+    u=$master
+  else
+    while read -r n; do
+      [[ -n $n ]] || continue
+      asks_auth "$n" && continue
+      u=$n; break
+    done < <(profile_names)
+  fi
+
+  if [[ -n $u && $u != "$cur" ]]; then
+    # Capturing cur into itself is correct: its files ARE the live ones.
+    switch_stage2 "$cur" "$u"
+  fi
+  # Either way the machine ends up asking for the password of the desk it was
+  # left in. Its windows come back only through the ordinary `set`.
+  prompt_unlock "$cur"
+  return 0
+}
+
+# The panel has a field; a detached shell script does not. Retried for as long
+# as wait_for_shell would wait, because a cold start registers the widget's IPC
+# handler some time after the shell answers at all.
+prompt_unlock() {
+  local name=$1 i
+  command -v omarchy-shell >/dev/null || return 0
+  for i in $(seq 1 10); do
+    omarchy-shell graveklar.profiles promptUnlock "$name" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  warn "'$name' asks for a password and no panel answered the prompt"
+  return 1
+}
+
 # ------------------------------------------------------------------ commands
 
 # What a profile IS, for the config page's first group: the things that are
@@ -3141,7 +3788,7 @@ cmd_remove() {
     answer '{"ok":true}' "removed $name"
   fi
   # The session record goes with it, and so does anything it was owed.
-  rm -f "$STATE_DIR/sessions/$name.txt" 2>/dev/null
+  rm -f "$STATE_DIR/sessions/$name.txt" "$OFFER_DIR/$name" 2>/dev/null
   write_index
   return 0
 }
@@ -3200,6 +3847,10 @@ cmd_rename() {
 
   [[ -d $ISOLATE_DIR/$old ]] && mv -n "$ISOLATE_DIR/$old" "$ISOLATE_DIR/$new"
   [[ -f $STATE_DIR/sessions/$old.txt ]] && mv -n "$STATE_DIR/sessions/$old.txt" "$STATE_DIR/sessions/$new.txt"
+  # And the offer marker, so a rename in the middle of an unanswered "Restore
+  # windows?" leaves the offer standing rather than stranding it under a name
+  # nothing will ever look up again.
+  [[ -e $OFFER_DIR/$old ]] && mv -n "$OFFER_DIR/$old" "$OFFER_DIR/$new"
 
   # The master is named in config.json, not in the profile file: a renamed
   # master that was not followed here would leave the machine with no master at
@@ -4605,10 +5256,12 @@ config)
   for a in "$@"; do [[ $a == --json ]] && JSON=1; done
   cmd_config "$(for a in "$@"; do [[ $a == --* ]] || { printf '%s' "$a"; break; }; done)" ;;
 meta) shift; cmd_meta "$@" ;;
-# Named in the contract and built by a later phase. Each answers in JSON and
+session) shift; cmd_session "$@" ;;
+login) cmd_login ;;
+# Named in the contract and built by a later phase. It answers in JSON and
 # exits 1, so the panel can call any verb the contract has from the day it
 # freezes and render a real answer.
-session | login | purge)
+purge)
   not_implemented "$1 ${2:-}" ;;
 setup) shift; cmd_setup "$@" ;;
 capabilities) cmd_capabilities ;;

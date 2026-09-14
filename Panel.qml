@@ -2,6 +2,10 @@ import QtQuick
 import QtQuick.Controls
 import Quickshell
 import Quickshell.Io
+// For ToplevelManager alone: the window set is what the session recorder is
+// debounced off, and there is no other way to be told a window opened without
+// polling the compositor.
+import Quickshell.Wayland
 import qs.Commons
 import qs.Ui
 
@@ -154,6 +158,7 @@ Panel {
 
   function loadConfig() {
     if (root.configProfile === "") return
+    root.loadConfigSession()
     root.ask(["config", root.configProfile, "--json"], "", function (ok, parsed) {
       if (ok && parsed && !parsed.error) root.configData = parsed
     })
@@ -833,6 +838,81 @@ Panel {
     })
   }
 
+  // ---------------------------------------------------------- reopen apps
+  //
+  // Two answers from the same verb, kept apart because they are about two
+  // different profiles: `sessionData` is the ACTIVE profile's, and decides
+  // whether the Restore windows button is on the picker; `configSession` is
+  // whichever profile the config page is describing.
+  //
+  // The button is the guarantee, not the notification. The engine raises
+  // "Restore windows?" only once the shell is up, and a switch or a restart
+  // while it is pending destroys it with no answer and so no replay — at which
+  // point this is the only way back to those windows.
+  property var sessionData: null
+  property var configSession: null
+  property string sessionError: ""
+
+  function loadSession() {
+    if (root.currentProfile === "") { root.sessionData = null; return }
+    root.ask(["session", "show", "--json", root.currentProfile], "", function (ok, parsed) {
+      root.sessionData = (ok && parsed && !parsed.error) ? parsed : null
+    })
+  }
+
+  function loadConfigSession() {
+    if (root.configProfile === "") { root.configSession = null; return }
+    root.ask(["session", "show", "--json", root.configProfile], "", function (ok, parsed) {
+      root.configSession = (ok && parsed && !parsed.error) ? parsed : null
+    })
+  }
+
+  // Whether the picker offers it at all: a record with something in it, an
+  // empty block, and a profile that has not been told never to ask.
+  readonly property bool canRestore: {
+    var s = root.sessionData
+    if (!s || root.currentProfile === "") return false
+    if (String(s.restore_apps || "ask") === "off") return false
+    if (!Array.isArray(s.apps) || s.apps.length === 0) return false
+    return !!s.blockEmpty
+  }
+
+  function restoreWindows() {
+    if (root.currentProfile === "") return
+    root.sessionError = ""
+    root.ask(["session", "restore", root.currentProfile], "", function (ok, parsed, code) {
+      if (ok) {
+        // The windows are what the answer looks like; nothing here needs to
+        // render a count. Hiding the button is just refusing to offer it twice.
+        root.sessionData = null
+        root.close()
+        return
+      }
+      var err = parsed && parsed.error ? String(parsed.error) : ""
+      root.sessionError = (code === 3 || err === "busy") ? "Another switch is still running"
+                        : err === "not_empty" ? "This desk already has windows open"
+                        : err === "not_active" ? "Switch to that profile first"
+                        : "Could not reopen those windows"
+      root.loadSession()
+    })
+  }
+
+  function sessionMode(profile, value) {
+    root.ask(["session", "mode", profile, String(value), "--json"], "", function (ok) {
+      if (!ok) return
+      root.loadConfig()
+      if (profile === root.currentProfile) root.loadSession()
+    })
+  }
+
+  function sessionClear(profile) {
+    root.ask(["session", "clear", profile, "--json"], "", function (ok) {
+      if (!ok) return
+      root.loadConfigSession()
+      if (profile === root.currentProfile) root.loadSession()
+    })
+  }
+
   function openSettings(profile) {
     root.settingsProfile = profile
     root.pushView("settings")
@@ -862,6 +942,9 @@ Panel {
         if (arrived) { root.switchStalled = false; root.switchError = "" }
         var i = root.visibleIndexOf(parsed.profile)
         if (i >= 0) root.cursor = i
+        // A different profile has a different record and a different block, and
+        // this file changing is the only announcement a switch ever makes.
+        if (arrived) { root.sessionError = ""; root.loadSession() }
         return
       }
       console.warn("graveklar.profiles", "State file has no profile field", root.statePath)
@@ -893,6 +976,11 @@ Panel {
     // guessed from the index: a profile can name an identity on a machine
     // where the face plugin has since been removed.
     root.loadFaces()
+    // Asked on every open rather than cached: the block empties and fills while
+    // the panel is shut, and a stale answer here either offers to reopen
+    // windows that are already there or hides the offer when it is wanted.
+    root.sessionError = ""
+    root.loadSession()
     if (root.switchStalled) root.resetView("setup")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
@@ -1132,6 +1220,38 @@ Panel {
     onTriggered: root.setupElapsed = root.setupElapsed + 1
   }
 
+  // What was open, written down about ten seconds after it stops changing.
+  //
+  // Debounced, because the interesting moment is not the window opening but
+  // the set settling: opening a terminal, a browser and an editor in a row is
+  // one record, not three. Ten seconds is also short enough that a desk shut
+  // down normally has been written before the last window goes.
+  //
+  // Quickshell.execDetached with an argv, NOT bar.run: that facade starts a
+  // login shell per call, which is a whole bash profile every ten seconds for
+  // a command that has no output anybody reads. The engine's own lock makes
+  // one widget per monitor harmless.
+  Connections {
+    target: ToplevelManager.toplevels
+    function onValuesChanged() { recordDebounce.restart() }
+  }
+
+  Timer {
+    id: recordDebounce
+    interval: 10000
+    repeat: false
+    onTriggered: Quickshell.execDetached([root.engine, "session", "record"])
+  }
+
+  // Once per boot, decided entirely by the engine.
+  //
+  // This runs on every shell start, which is every switch — the widget checks
+  // nothing and knows nothing about markers. The engine's
+  // $XDG_RUNTIME_DIR/omarchy-profiles/login directory is the only guard there
+  // is, which is what makes it correct: a marker the GUI also consulted would
+  // be two answers to one question.
+  Component.onCompleted: Quickshell.execDetached([root.engine, "login"])
+
   IpcHandler {
     target: root.ipcTarget
 
@@ -1365,6 +1485,43 @@ Panel {
         PanelSeparator { foreground: root.foreground }
 
         // ---------------------------------------------------------- picker
+
+        // Under the hero and above the list: it is about the desk you are
+        // standing in, not one you might switch to, and putting it beside the
+        // rows would read as a per-row control.
+        Column {
+          width: parent.width
+          spacing: Style.space(4)
+          visible: root.view === "picker" && (root.canRestore || root.sessionError !== "")
+
+          Button {
+            visible: root.canRestore
+            width: parent.width
+            leftAlign: true
+            bordered: true
+            iconText: "󰑓"
+            text: {
+              var n = (root.sessionData && root.sessionData.apps) ? root.sessionData.apps.length : 0
+              return "Restore windows — " + n + (n === 1 ? " app was" : " apps were") + " open here"
+            }
+            foreground: root.foreground
+            accent: root.accent
+            fontFamily: root.fontFamily
+            fontSize: Style.font.caption
+            onClicked: { root.keepAlive(); root.restoreWindows() }
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            visible: root.sessionError !== ""
+            text: root.sessionError
+            color: Color.urgent
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+          }
+        }
 
         Column {
           width: parent.width
