@@ -3133,15 +3133,16 @@ cmd_remove() {
     if exists "$master"; then
       local tmp; tmp=$(mktemp "$(file_for "$master").XXXXXX")
       jq '.hidden = false' "$(file_for "$master")" >"$tmp" && mv "$tmp" "$(file_for "$master")"
-      echo "removed $name — $master is visible again, since nothing else was"
+      answer '{"ok":true}' "removed $name — $master is visible again, since nothing else was"
+    else
+      answer '{"ok":true}' "removed $name"
     fi
   else
-    echo "removed $name"
+    answer '{"ok":true}' "removed $name"
   fi
   # The session record goes with it, and so does anything it was owed.
   rm -f "$STATE_DIR/sessions/$name.txt" 2>/dev/null
   write_index
-  [[ -n $JSON ]] && printf '{"ok":true}\n'
   return 0
 }
 
@@ -3261,6 +3262,85 @@ cmd_visibility() {
   jq --argjson h "$hidden" '.hidden = $h' "$(file_for "$name")" >"$tmp" && mv "$tmp" "$(file_for "$name")"
   write_index
   [[ $verb == show ]] && echo "$name now shows in the picker" || echo "$name is now hidden from the picker"
+}
+
+# What a profile is called on screen: its icon and the line under its name.
+#
+# The name itself is deliberately not here. Renaming moves a password hash and a
+# face binding with it, so it authenticates and holds the state lock; this
+# writes two cosmetic fields and nothing else. The one writer it can race is a
+# capture, which rewrites the desk facts around these two — the same exposure
+# `show`/`hide` has always had, and the cost of losing is a retyped line.
+#
+# Field names are the ones already in every profile JSON: `_description` (the
+# underscore is the original schema's, and index_json reads it) and `icon`.
+cmd_meta() {
+  local name="" icon="" desc="" have_icon="" have_desc=""
+  while (($#)); do
+    case $1 in
+    --json) JSON=1 ;;
+    --icon) shift; have_icon=1; icon=${1:-} ;;
+    --icon=*) have_icon=1; icon=${1#--icon=} ;;
+    --description) shift; have_desc=1; desc=${1:-} ;;
+    --description=*) have_desc=1; desc=${1#--description=} ;;
+    -*) die "unknown option '$1'" ;;
+    *) [[ -n $name ]] || name=$1 ;;
+    esac
+    shift
+  done
+  [[ -n $name ]] || die "usage: omarchy-profile meta <name> [--icon X] [--description Y]"
+  exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
+  [[ -n $have_icon || -n $have_desc ]] ||
+    die "nothing to change: pass --icon, --description, or both"
+
+  # A codepoint typed instead of a glyph. Nerd Font tables are published as hex,
+  # so "f0493", "U+F0493" and "0xf0493" are what a person copying one out of a
+  # cheat sheet actually has in hand. Converted here rather than in the panel so
+  # every caller writes the same thing into the file. Bare hex is only taken as
+  # a codepoint at four digits or more: a two-letter icon could be meant.
+  if [[ -n $have_icon && -n $icon ]]; then
+    local hex=""
+    case $icon in
+    [Uu]+[0-9a-fA-F]*) hex=${icon:2} ;;
+    0[xX][0-9a-fA-F]*) hex=${icon:2} ;;
+    *) [[ $icon =~ ^[0-9a-fA-F]{4,6}$ ]] && hex=$icon ;;
+    esac
+    if [[ -n $hex && $hex =~ ^[0-9a-fA-F]{1,6}$ ]]; then
+      # shellcheck disable=SC2059
+      icon=$(printf "\\U$(printf '%08x' "0x$hex")")
+    fi
+  fi
+
+  # Guards, not validation: an icon is whatever renders in one cell, and a
+  # description is one line. Both are rendered in a fixed-width row, so a
+  # paragraph pasted into either would simply be elided away — refusing says so
+  # instead of silently keeping something nothing can show.
+  if [[ -n $have_icon ]]; then
+    ((${#icon} <= 8)) || refuse 1 bad_icon "an icon is one glyph, not ${#icon} characters"
+  fi
+  if [[ -n $have_desc ]]; then
+    desc=${desc//$'\n'/ }
+    ((${#desc} <= 160)) || refuse 1 bad_description "a description is one line — that one is ${#desc} characters"
+  fi
+
+  local file tmp
+  file=$(file_for "$name")
+  tmp=$(mktemp "$file.XXXXXX") || refuse 1 write_failed "could not write '$name'"
+  jq --arg i "$icon" --arg d "$desc" \
+     --argjson si "$([[ -n $have_icon ]] && echo true || echo false)" \
+     --argjson sd "$([[ -n $have_desc ]] && echo true || echo false)" \
+     'if $si then .icon = $i else . end | if $sd then ._description = $d else . end' \
+     "$file" >"$tmp" && mv "$tmp" "$file" ||
+    { rm -f "$tmp"; refuse 1 write_failed "could not write '$name'"; }
+
+  write_index
+  answer "$(jq -nc --arg n "$name" --arg i "$icon" --arg d "$desc" \
+              --argjson si "$([[ -n $have_icon ]] && echo true || echo false)" \
+              --argjson sd "$([[ -n $have_desc ]] && echo true || echo false)" \
+              '{ok: true, name: $n}
+               + (if $si then {icon: $i} else {} end)
+               + (if $sd then {description: $d} else {} end)')" \
+         "updated $name"
 }
 
 # What this profile may launch, as the panel reads it. `all` is every entry
@@ -4520,14 +4600,15 @@ close) shift; cmd_close_profile "${1:-}" ;;
 identity) shift; cmd_identity "$@" ;;
 password) shift; cmd_password "$@" ;;
 rename) shift; cmd_rename "$@" ;;
-# Everything below is named in the contract and built by a later phase. Each
-# answers in JSON and exits 1, so the panel can call any verb the contract has
-# from the day it freezes and render a real answer.
 config)
   shift
   for a in "$@"; do [[ $a == --json ]] && JSON=1; done
   cmd_config "$(for a in "$@"; do [[ $a == --* ]] || { printf '%s' "$a"; break; }; done)" ;;
-meta | session | login | purge)
+meta) shift; cmd_meta "$@" ;;
+# Named in the contract and built by a later phase. Each answers in JSON and
+# exits 1, so the panel can call any verb the contract has from the day it
+# freezes and render a real answer.
+session | login | purge)
   not_implemented "$1 ${2:-}" ;;
 setup) shift; cmd_setup "$@" ;;
 capabilities) cmd_capabilities ;;
@@ -4550,71 +4631,26 @@ list | ls | "")
   # index's, built by one function both this and profiles.json go through.
   if [[ ${2:-} == --json ]]; then index_json | jq -c .; else cmd_list; fi ;;
 -h | --help | help)
+  # Not a command-line tool any more. It is the implementation behind the panel
+  # and the keybindings, and its verbs move with the plugin rather than with
+  # anybody's muscle memory — so enumerating them here would advertise a surface
+  # nothing promises to keep. One line is documented, and it is the one that
+  # matters when the shell will not start.
   cat <<'USAGE'
-omarchy-profile — profiles for the Omarchy desktop
+omarchy-profile — the engine behind the Profiles plugin
 
-  init                             adopt the current machine as the master profile
-  list                             profiles; * is active, (master) is the master
-  current                          print the active profile
-  set <name>                       switch (captures the outgoing profile first)
-  next                             cycle to the next profile
-  capture                          save live state into the active profile now
+This is not a supported command-line interface. It is what the panel and the
+keybindings call, and its verbs can change with any release. Everything it does
+is in the panel: click the Profiles icon on the bar, then Manage.
 
-  create <name> [--from-master|--clean]
-  remove <name>                    authenticates, then moves its windows to master
-  rename <old> <new>               the password and the face binding follow it
-  show <name> | hide <name>        whether it appears in the picker
+If the shell will not start, this switches profiles from a TTY:
 
-  password status <name>           none | set | locked_no_password
-  password set <name>              the owner authorises; the new password is typed
-  password change <name>           current password, then the new one, one per line
-  password clear <name>            the current password, or empty to ask the owner
-  password reset <name>            the owner authorises; forgotten passwords
+  ~/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile set <name>
 
-  identity list [--json]           faces enrolled in Face Unlock
-  identity bind <name> <identity>  that face opens this profile too
-  identity clear <name>            it no longer does
+A profile with a password asks for it on the terminal, with nothing echoed.
 
-  Passwords are read from stdin, never from an argument: anything typed on a
-  command line is readable by every process on the machine.
-
-  isolate [list|add|remove] [path]  give each profile its own copy of a
-                                    plugin's own config or state file
-  isolate add <path> [--reload hypr]
-                                   a file under ~/.config/hypr defaults to
-                                   --reload hypr: the compositor is told
-  isolate candidates --json        what could be given per-profile copies
-  isolate resolve <path> --json    what is at a path, and whether it may be
-
-  config <name> --json             what this profile is: theme, bar, counts
-
-  overview [--json]                what every profile is holding open
-  refresh                          rewrite the files the panel and launcher read
-
-  setup status [--json]            what still has to be true for this to work
-  setup fix <id>                   fix one of those things
-  capabilities --json              what this machine can and cannot do
-
-  global [status|enable|disable|send|toggle] [name]
-                                   a workspace that survives every switch
-
-  close <name>                     ask every window in a profile to close
-
-  apps <profile> [list|allow|deny|allow-all|deny-all] [app-id]
-                                   which applications the profile may launch;
-                                   the others are hidden from the menu, the
-                                   launcher and search while it is active
-  apps preview --json <profile>    what switching into it would hide or show
-  apps-sweep                       put every application back, whatever profile
-                                   hid it — the way out if something went wrong
-
-  plugin <profile> [list|enable|disable] [plugin-id]
-
-  ws <1-10|next|prev>            focus a workspace inside this profile
-  move <1-10> [--silent]           move the window inside this profile
-
-A profile is a saved desk, not a template: switching away captures whatever you
-changed, so nothing resets when you come back.
+The verbs, their arguments and what each returns are specified in the plugin's
+documentation.
 USAGE
   ;;
 *) die "unknown command '$1' (try: omarchy-profile --help)" ;;

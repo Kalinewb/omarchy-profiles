@@ -102,6 +102,14 @@ Panel {
 
   // Which profile the settings view is editing.
   property string settingsProfile: ""
+  // Which profile the edit form is renaming or relabelling, and what the engine
+  // said about the last save.
+  property string editProfile: ""
+  property string metaError: ""
+  // What `capture` last answered. Cleared by its own timer: it is a receipt,
+  // not a state.
+  property string captureNote: ""
+  property bool captureFailed: false
   property var pluginCatalog: []
   property var overviewRows: []
   property string pendingClose: ""
@@ -231,7 +239,18 @@ Panel {
   property string passwordArg: ""
   // Whether a face can be tried at all. Asked once per open; `absent` means the
   // face plugin is not installed and there is nothing to try.
-  property bool faceInstalled: false
+  //
+  // The state string itself, not a boolean, because the Manage view renders
+  // three different things from it: the face row (only on `ok`), the dim
+  // "face plugin not installed" caption on a profile that still names an
+  // identity, and nothing at all.
+  property string faceState: "unknown"
+  readonly property bool faceInstalled: root.faceState === "ok"
+  // Enrolled faces, from `identity list --json`. Only asked for when the plugin
+  // is there: on a machine without it the answer is always the empty list.
+  property var identityNames: []
+  // What the last bind or clear said, rendered under the face row.
+  property string faceError: ""
   property string createError: ""
   property string pendingSetup: ""
 
@@ -557,6 +576,10 @@ Panel {
     root.passwordError = ""
     root.ask(args, secret, function (ok, parsed, code) {
       if (ok) {
+        // The edit form is looking at a profile that no longer has that name.
+        // Following it here rather than closing the page keeps the icon and
+        // description fields on what the user is editing.
+        if (mode === "rename" && root.editProfile === id) root.editProfile = root.passwordArg
         root.passwordFor = ""
         root.passwordMode = ""
         root.passwordArg = ""
@@ -581,12 +604,57 @@ Panel {
     root.faceProc = null
   }
 
-  // Phase 6's edit form calls this; the prompt does the rest.
+  // The edit form calls this; the prompt does the rest.
   function beginRename(id, to) {
     root.passwordArg = to
     var e = root.entry(id)
     if (e && (e.hasPassword || e.locked)) { root.beginManage(id, "rename"); return }
     root.submitManage("rename", id, "")
+  }
+
+  // ------------------------------------------------------------- the face
+  //
+  // Asked on every open rather than remembered: the face plugin can be
+  // installed or removed between two openings of this panel, and a profile that
+  // names an identity on a machine where it is gone must not offer to try one.
+  function loadFaces() {
+    root.faceError = ""
+    root.ask(["capabilities", "--json"], "", function (ok, parsed) {
+      root.faceState = (ok && parsed && parsed.face) ? String(parsed.face) : "unknown"
+      if (!root.faceInstalled) { root.identityNames = []; return }
+      root.ask(["identity", "list", "--json"], "", function (ok2, parsed2) {
+        root.identityNames = (ok2 && parsed2 && Array.isArray(parsed2.names)) ? parsed2.names : []
+      })
+    })
+  }
+
+  // Both of these are the owner's to decide, and polkit's agent draws that
+  // prompt for itself: nothing here collects it, and nothing here can proceed
+  // without it. The engine rewrites the index, so the binding arrives back the
+  // same way every other change does.
+  function bindIdentity(profile, identity) {
+    root.faceError = ""
+    root.ask(["identity", "bind", profile, identity, "--json"], "", function (ok, parsed) {
+      if (ok) return
+      root.faceError = root.faceRefusal(parsed)
+    })
+  }
+
+  function clearIdentity(profile) {
+    root.faceError = ""
+    root.ask(["identity", "clear", profile, "--json"], "", function (ok, parsed) {
+      if (ok) return
+      root.faceError = root.faceRefusal(parsed)
+    })
+  }
+
+  function faceRefusal(parsed) {
+    var err = parsed && parsed.error ? String(parsed.error) : "failed"
+    if (err === "owner_declined") return "Not authorised"
+    if (err === "face_absent") return "The face plugin is not installed"
+    if (err === "no_such_identity") return "No face is enrolled under that name"
+    if (err === "helper_unavailable") return "The helpers are not installed — open Setup"
+    return "That did not work"
   }
 
   function cancelPassword() {
@@ -677,8 +745,8 @@ Panel {
   property string switchError: ""
 
   // Where each view says it is, in one table rather than a ternary chain per
-  // piece of chrome. config, setup and edit arrive in later phases; their rows
-  // are here now so a lookup for a view that is not built yet still answers.
+  // piece of chrome. Every view has a row; a lookup that misses still answers,
+  // so a view added later is never chrome-less.
   readonly property var viewChrome: ({
     "picker":   { title: "Profiles",        meta: "Same files, a different desk",
                   hint: "j/k move · enter apply · middle-click the bar to cycle" },
@@ -692,7 +760,8 @@ Panel {
                   hint: "back returns to the list · the lower groups apply to every profile" },
     "setup":    { title: "Setup",           meta: "What has to be true before this works",
                   hint: "each row is one thing; Fix does it for you" },
-    "edit":     { title: "Edit profile",    meta: "", hint: "" }
+    "edit":     { title: "Edit profile",    meta: "Its name, its icon, and the line under it",
+                  hint: "a protected profile asks for its password before the name changes" }
   })
 
   function chrome() {
@@ -711,12 +780,57 @@ Panel {
     // From the picker the arrow goes the other way: it is the only way in.
     if (root.view === "picker") { root.pushView("manage"); return }
     if (root.view === "settings") root.settingsProfile = ""
+    if (root.view === "edit") root.editProfile = ""
     root.popView()
   }
 
   function openOverview() {
     root.runEngine("overview")
     root.pushView("overview")
+  }
+
+  // ------------------------------------------------------------- edit view
+  //
+  // A page of its own rather than a row that unfolds: the icon grid alone is
+  // sixteen cells, and an expansion that tall under one profile pushes every
+  // other one off the panel.
+  function openEdit(profile) {
+    root.editProfile = profile
+    root.metaError = ""
+    root.pushView("edit")
+  }
+
+  // Icon and description only. The name goes through `rename`, which moves a
+  // password hash and a face binding with it and has to authenticate first.
+  function submitMeta(profile, icon, description) {
+    root.metaError = ""
+    var args = ["meta", profile, "--icon", String(icon), "--description", String(description), "--json"]
+    root.ask(args, "", function (ok, parsed) {
+      if (ok) { root.popView(); return }
+      var err = parsed && parsed.error ? String(parsed.error) : "failed"
+      root.metaError = err === "bad_icon" ? "That is more than one glyph"
+                     : err === "bad_description" ? "That is longer than one line"
+                     : "Could not save that"
+    })
+  }
+
+  // Capture is a write with no watched file to land in — `capture` rewrites the
+  // active profile's own JSON and nothing the panel reads — so it goes through
+  // ask() and reports for itself. It can also come back busy, which is exactly
+  // what the button must not swallow.
+  function captureNow() {
+    root.captureNote = "Saving…"
+    root.captureFailed = false
+    root.ask(["capture"], "", function (ok, parsed, code) {
+      if (ok) { root.captureNote = "Saved this desk as it is now"; captureNoteTimer.restart(); return }
+      root.captureFailed = true
+      var err = parsed && parsed.error ? String(parsed.error) : ""
+      root.captureNote = (code === 3 || err === "busy") ? "A switch is running — try again in a moment"
+                       : (err === "interrupted_switch" || err === "held_paths")
+                         ? "The last switch did not finish — open Setup"
+                       : "Could not save this desk"
+      captureNoteTimer.restart()
+    })
   }
 
   function openSettings(profile) {
@@ -778,9 +892,7 @@ Panel {
     // Whether a bound face is worth trying at all. Asked here rather than
     // guessed from the index: a profile can name an identity on a machine
     // where the face plugin has since been removed.
-    root.ask(["capabilities", "--json"], "", function (ok, parsed) {
-      root.faceInstalled = !!(ok && parsed && parsed.face === "ok")
-    })
+    root.loadFaces()
     if (root.switchStalled) root.resetView("setup")
     Qt.callLater(function () { keyCatcher.forceActiveFocus() })
   }
@@ -1000,6 +1112,16 @@ Panel {
     }
   }
 
+  // A capture leaves nothing on screen to show it happened — the desk it saved
+  // is the desk already there — so the button says so for a few seconds and
+  // then stops saying it.
+  Timer {
+    id: captureNoteTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.captureNote = ""
+  }
+
   // How long the running fix has been running. A Setup step that installs
   // something can take seconds, and a button that goes quiet is indistinguishable
   // from one that did nothing.
@@ -1194,7 +1316,8 @@ Panel {
           // Empty outside the picker: the pill names the profile you are IN,
           // which only matters while choosing one. Showing "Master" beside the
           // title "test" read as a label on test.
-          detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile) : ""
+          detail: root.view === "picker" && root.currentProfile !== "" ? root.label(root.currentProfile)
+                  : root.view === "edit" && root.editProfile !== "" ? root.label(root.editProfile) : ""
           // In order of what the person most needs to know: an error about the
           // thing they just did, the switch in progress, a Setup badge, and
           // only then the view's own strapline.
@@ -1210,8 +1333,12 @@ Panel {
           iconComponent: Component {
             Text {
               textFormat: Text.PlainText
-              text: root.icon(root.view === "settings" && root.settingsProfile !== ""
-                              ? root.settingsProfile : root.currentProfile)
+              // On a page about one profile the hero wears that profile's icon,
+              // not the active profile's — which is also how the edit form
+              // shows what it just changed.
+              text: root.icon(root.view === "settings" && root.settingsProfile !== "" ? root.settingsProfile
+                              : root.view === "edit" && root.editProfile !== "" ? root.editProfile
+                              : root.currentProfile)
               color: root.foreground
               font.family: root.fontFamily
               font.pixelSize: Style.font.display
@@ -1320,6 +1447,11 @@ Panel {
           cursorActive: root.cursorActive
           cursor: root.cursor
           visibleCount: root.visibleProfiles.length
+          faceState: root.faceState
+          identityNames: root.identityNames
+          faceError: root.faceError
+          captureNote: root.captureNote
+          captureFailed: root.captureFailed
           onRunEngine: function (args) { root.keepAlive(); root.runEngine(args) }
           onCursorMoved: function (index) { root.keepAlive(); root.cursorActive = true; root.cursor = index }
           onConfirmRemove: function (profile) { root.keepAlive(); root.pendingRemoval = profile }
@@ -1329,6 +1461,16 @@ Panel {
           createError: root.createError
           onPasswordAction: function (profile, mode) { root.keepAlive(); root.beginManage(profile, mode) }
           onCreateProfile: function (name, fromMaster) { root.keepAlive(); root.createProfile(name, fromMaster) }
+          onOpenEdit: function (profile) { root.keepAlive(); root.openEdit(profile) }
+          onBindIdentity: function (profile, identity) { root.keepAlive(); root.bindIdentity(profile, identity) }
+          onClearIdentity: function (profile) { root.keepAlive(); root.clearIdentity(profile) }
+          onCaptureNow: { root.keepAlive(); root.captureNow() }
+        }
+
+        ProfileMetaForm {
+          width: parent.width
+          visible: root.view === "edit"
+          panel: root
         }
 
         OverviewView {
