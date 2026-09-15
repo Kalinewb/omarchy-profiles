@@ -155,8 +155,8 @@ made (`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish
 the job properly.
 
 The right way: Manage → **Uninstall Profiles from this machine**. One toggle,
-**Keep a copy of my profiles** (on by default — it saves everything to
-`~/omarchy-profiles-export` before anything is removed), and one button,
+**Keep a copy of my profiles** (off by default — turn it on to save everything
+to `~/omarchy-profiles-export` before anything is removed), and one button,
 **Uninstall everything**. That one click hands the machine back as your master
 profile has it: windows on other desks move onto master's workspaces, every
 isolated file becomes a real file again, every hidden application comes back,

@@ -998,9 +998,7 @@ Panel {
   property string purgeError: ""
   property string purgeNote: ""
   property bool purgeBusy: false
-  // Yes by default — the safer default for an irreversible action, and the
-  // one most people mean the first time they see this screen.
-  property bool purgeKeepData: true
+  property bool purgeKeepData: false
   property string purgeExportDir: ""
 
   // Set when `purge --yes` itself came back `not_master` — the profile changed
@@ -1024,7 +1022,7 @@ Panel {
     root.purgeNote = ""
     root.purgeBusy = false
     root.purgeRaced = false
-    root.purgeKeepData = true
+    root.purgeKeepData = false
     if (root.purgeExportDir === "") root.purgeExportDir = root.home + "/omarchy-profiles-export"
     root.pushView("purge")
     root.ask(["purge", "--dry-run", "--json"], "", function (ok, parsed, code) {
