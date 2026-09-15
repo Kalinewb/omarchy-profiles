@@ -1598,14 +1598,20 @@ Panel {
       // engages only when there is genuinely more than fits, so short views
       // still behave like a static panel rather than a scroll area.
       // The hero (title, gear/back) and its rule, fixed above the scroll
-      // area rather than the Column's first two children. They used to
-      // scroll with everything else, which put them inside the Flickable's
-      // own bounds — the same bounds its ScrollBar overlay spans top to
-      // bottom, so the track sat across the gear and back-arrow at every
-      // scroll position. Outside the Flickable entirely, that overlap is
-      // not possible regardless of how tall either one measures out to be.
+      // area rather than the Column's first two children — they used to
+      // scroll with everything else, inside the same bounds the Flickable's
+      // ScrollBar overlay spans, so the track sat across the gear and
+      // back-arrow at every scroll position. Anchoring the Flickable to
+      // start below this Column was not enough on its own: this control's
+      // ScrollBar overlay is painted by the style as a window-level overlay
+      // item, not clipped to the Flickable's own anchored geometry, so it
+      // can still extend above where the Flickable logically begins. `z`
+      // makes the outcome not depend on figuring out exactly why — nothing
+      // is allowed to paint over the header, regardless of where the
+      // scrollbar or anything else thinks its own bounds are.
       Column {
         id: headerColumn
+        z: 100
         anchors.top: parent.top
         anchors.left: parent.left
         anchors.right: parent.right
