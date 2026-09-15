@@ -369,13 +369,26 @@ Panel {
   // queue built at the first click would never learn about them.
   property bool fixingAll: false
 
+  // indicator is the one row whose fix can itself reload the shell (cloning
+  // or enabling a plugin ends in omarchy-shell's rescanPlugins) — every
+  // other fix is a quiet file or IPC change. Picked in the middle of "fix
+  // everything" it would still land correctly (indicator_fix survives its
+  // own reload, detached), but the reload itself would interrupt whatever
+  // this screen was in the middle of showing for no reason: nothing after
+  // it in the row order depends on it. So it is the last resort, never the
+  // first fixable row found, and the reload it causes — if it causes one at
+  // all — is the last thing "fix everything" does, not something in the
+  // middle of it.
   function nextFixableRow() {
     if (!root.setupRows) return ""
-    for (var i = 0; i < root.setupRows.length; i++) {
-      var r = root.setupRows[i]
-      if (r && r.fixable && (r.state === "needs_action" || r.state === "broken")) return r.id
+    var i, r, fallback = ""
+    for (i = 0; i < root.setupRows.length; i++) {
+      r = root.setupRows[i]
+      if (!r || !r.fixable || (r.state !== "needs_action" && r.state !== "broken")) continue
+      if (r.id === "indicator") { fallback = r.id; continue }
+      return r.id
     }
-    return ""
+    return fallback
   }
 
   function runFixAll() {
