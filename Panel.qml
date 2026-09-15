@@ -813,8 +813,8 @@ Panel {
                   hint: "each row is one thing; Fix does it for you" },
     "edit":     { title: "Edit profile",    meta: "Its name, its icon, and the line under it",
                   hint: "a protected profile asks for its password before the name changes" },
-    "purge":    { title: "Remove Profiles", meta: "What goes, and what is handed back",
-                  hint: "nothing is removed until Remove is pressed" }
+    "purge":    { title: "Remove Profiles", meta: "One button — keep a copy first if you want one",
+                  hint: "nothing is removed until Remove everything is pressed" }
   })
 
   function chrome() {
@@ -963,25 +963,23 @@ Panel {
 
   // ----------------------------------------------------------------- purge
   //
-  // Taking the plugin off the machine. Everything on the screen comes from
-  // `purge --dry-run --json`, which writes nothing: what is listed is what the
-  // engine would delete, from the engine, rather than a second description of
-  // it maintained here.
-  //
-  // Two buttons and one rule — nothing is removed until Remove is pressed. The
-  // export is a separate invocation for the same reason: it has to have
-  // succeeded, visibly, before the irreversible one is worth offering.
+  // Taking the plugin off the machine. One question, one button: keep a copy
+  // of your profile data first, then everything is removed in the one
+  // engine call that already does it all, root parts included — the owner's
+  // polkit prompt for those arrives as part of this same click, not a
+  // separate step. `purge --dry-run --json` still runs first, silently, only
+  // to answer "are we on master" and give a rough sense of size; nobody has
+  // to read an itemised list to press one button.
   property var purgeManifest: null
   // "" not asked yet · "ok" · anything else is what went wrong. Never healthy
   // by default: an unanswered dry run and an empty machine must not look alike.
   property string purgeState: ""
   property string purgeError: ""
   property string purgeNote: ""
-  property bool purgeExported: false
   property bool purgeBusy: false
-  // The clone is the user's plugin, listed in the manifest and asked about
-  // rather than assumed: it is a bar widget they may want to keep.
-  property bool purgeKeepIndicator: false
+  // Yes by default — the safer default for an irreversible action, and the
+  // one most people mean the first time they see this screen.
+  property bool purgeKeepData: true
   property string purgeExportDir: ""
 
   // Set when `purge --yes` itself came back `not_master` — the profile changed
@@ -1003,9 +1001,9 @@ Panel {
     root.purgeState = ""
     root.purgeError = ""
     root.purgeNote = ""
-    root.purgeExported = false
     root.purgeBusy = false
     root.purgeRaced = false
+    root.purgeKeepData = true
     if (root.purgeExportDir === "") root.purgeExportDir = root.home + "/omarchy-profiles-export"
     root.pushView("purge")
     root.ask(["purge", "--dry-run", "--json"], "", function (ok, parsed, code) {
@@ -1019,39 +1017,34 @@ Panel {
     })
   }
 
-  function purgeExport(dir) {
-    var d = String(dir || "").trim()
-    if (d === "") return
-    root.purgeExportDir = d
+  // The one button. Saves a copy first if asked to, then removes everything —
+  // engine, root store, helpers, polkit action, the plugin itself. The engine
+  // prints its result and only then removes the plugin, which reloads every
+  // panel in the shell, so the final callback may simply never run — that is
+  // success, not a hang.
+  function purgeGo() {
     root.purgeError = ""
-    root.purgeNote = "Copying…"
     root.purgeBusy = true
-    root.ask(["purge", "--export", d, "--json"], "", function (ok, parsed, code) {
-      root.purgeBusy = false
-      if (ok && parsed && parsed.ok) {
-        root.purgeExported = true
-        root.purgeNote = "Copied " + (parsed.files || 0) + " file(s) to " + d + ". Nothing has been removed."
+    if (!root.purgeKeepData) { root.purgeRemove(); return }
+    root.purgeNote = "Saving a copy of your profiles…"
+    root.ask(["purge", "--export", root.purgeExportDir, "--json"], "", function (ok, parsed, code) {
+      if (!ok) {
+        root.purgeBusy = false
+        root.purgeNote = ""
+        var err = parsed && parsed.error ? String(parsed.error) : "failed"
+        root.purgeError = (err === "busy" || code === 3) ? "A switch is running — try again in a moment"
+                        : "Could not save a copy — nothing has been removed"
         return
       }
-      root.purgeNote = ""
-      var err = parsed && parsed.error ? String(parsed.error) : "failed"
-      root.purgeError = err === "busy" || code === 3 ? "A switch is running — try again in a moment"
-                      : err === "not_a_directory" ? "That path is a file, not a directory"
-                      : err === "no_directory" ? "Type where the copy should go"
-                      : "Could not copy them there"
+      root.purgeRemove()
     })
   }
 
-  // The last thing this panel ever does. The engine prints its result and only
-  // then removes the plugin, which reloads every panel in the shell — so this
-  // callback may simply never run, and that is success, not a hang.
   function purgeRemove() {
     root.purgeError = ""
     root.purgeNote = "Removing…"
     root.purgeBusy = true
-    var args = ["purge", "--yes", "--json"]
-    if (root.purgeKeepIndicator) args = args.concat(["--keep-indicator"])
-    root.ask(args, "", function (ok, parsed, code) {
+    root.ask(["purge", "--yes", "--json"], "", function (ok, parsed, code) {
       root.purgeBusy = false
       if (ok) {
         root.purgeNote = "Removed. The shell is restarting."
