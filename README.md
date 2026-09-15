@@ -144,17 +144,26 @@ anything. Setup warns you when this is the case.
 
 ## Removing it
 
-Manage → **Remove Profiles from this machine**. It shows what would go before
-anything happens, by profile and by name — including each desk's own Hyprland
-files, which exist nowhere else on the machine — and offers **Export first**,
-which copies every one of them somewhere you choose and removes nothing.
+**Use this plugin's own screen, not Omarchy's Plugin Manager.** Plugin Manager's
+"Remove" only knows how to move a plugin's own folder aside — it has no way to
+know this plugin also has a root-owned password store, a polkit action and two
+helpers under `/usr/local/bin`, and it will not touch any of that. Removed that
+way, every profile, its saved theme and Hyprland files, and the whole root store
+are left behind. If you have already done this: everything is still exactly
+where it was, run `./uninstall.sh --yes` from the backed-up copy Plugin Manager
+made (`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish
+the job properly.
 
-Then **Remove** hands the machine back as your master profile has it: windows on
-other desks move onto master's workspaces, every isolated file becomes a real
-file again, every hidden application comes back, the workspace keys and the
-widget go, the stored passwords and the two helpers go, and the plugin uninstalls
-itself. It has to be run from the master profile; from anywhere else the button
-is **Switch to master first**.
+The right way: Manage → **Uninstall Profiles from this machine**. One toggle,
+**Keep a copy of my profiles** (on by default — it saves everything to
+`~/omarchy-profiles-export` before anything is removed), and one button,
+**Uninstall everything**. That one click hands the machine back as your master
+profile has it: windows on other desks move onto master's workspaces, every
+isolated file becomes a real file again, every hidden application comes back,
+the workspace keys and the widget go, the stored passwords and the two helpers
+go (the owner prompt for that arrives as part of the same click), and the
+plugin uninstalls itself. It has to run from the master profile; from anywhere
+else the button is **Switch to master first**.
 
 From a checkout, the same thing without a panel:
 
