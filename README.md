@@ -1,26 +1,34 @@
 # Profiles
 
-Separate desktops on one Omarchy machine. Each profile has its own theme,
-wallpaper, bar layout, plugins, visible applications and block of workspaces —
-same files, same user, different desk.
+Several desks on one machine. Each one keeps its own apps, theme, bar,
+plugins and workspaces — and hands the machine back exactly as you left it.
 
-Switching is not "apply a template". The profile you are leaving is **captured
-on the way out**, so anything you changed while inside it is still there when
-you come back. Change the theme in `work`, switch to `dev`, switch back: `work`
-is how you left it.
+## What it is for
 
-One profile is the **master**. It sees every application, new profiles are
-copied from it, and an application installed anywhere is registered to it.
-Other profiles start without it and opt in — the way a second user on a phone
-does not automatically get everything the owner installs.
+**The family PC.** The kid's desk has the browser, Minecraft and the homework
+folder. Not "your things are in a folder they were told not to open" — your
+applications are not in their launcher, not in their search, not there. Your
+own desk asks for a password.
 
-## Why workspaces
+**Work and not-work.** Slack, the editor and three terminals live in `work`.
+At six o'clock you switch to `home` and they are gone from the launcher, which
+is the part that actually stops you opening them. Monday morning they are
+still open, on the same workspaces, where you left them.
 
-Hyprland has no app grouping, so workspaces are the only layer available: five
-fullscreen apps means five workspaces. Each profile therefore owns a block of
-ten real workspaces — master 1–10, the next profile 11–20, and so on — while
-`SUPER+1..0` keeps meaning "this profile's first through tenth". The bar shows
-1–10 in every profile; only the workspace ids underneath move.
+**Lending the laptop.** A `guest` desk with a browser and nothing else, made
+in about four seconds. Hand it over without narrating what not to click.
+
+**Getting something done.** A desk where Discord is not installed, as far as
+anything on screen can tell. The apps you took out are the feature.
+
+## A desk, not a preset
+
+Switching does not apply a template — it **captures the desk you are leaving
+first**. Change the theme in `work`, switch to `home`, switch back: `work` is
+how you left it, down to the wallpaper and which plugins were running.
+
+Nothing closes when you switch. And after a restart, a desk can offer to reopen
+what it had open.
 
 ## Install
 
@@ -28,518 +36,152 @@ ten real workspaces — master 1–10, the next profile 11–20, and so on — w
 omarchy plugin add https://github.com/Kalinewb/omarchy-profiles.git --enable
 ```
 
-Then adopt the machine as it stands as your master profile:
+Then click the Profiles icon on the bar. It opens on **Setup**, which is a list
+of everything that has to be true before profiles work — adopting this machine
+as your first desk, the workspace keys, the bar's workspace indicator, the two
+small programs that check a password. Each row says what it is for, and most
+carry a **Fix** that does it — the ones that do not are the ones about your own
+configuration, which this plugin does not edit. One Fix asks for your password
+once, because it installs outside your home directory; nothing else here needs
+anything typed. Adopting reads your desktop as it already is and changes nothing.
 
-```bash
-~/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile init
-```
+## The panel, view by view
 
-`init` only reads state — it never imposes any — so it is safe to run on a
-desktop you have already set up.
+Everything is in the panel. There is a command-line engine underneath it — the
+keybindings and the panel both call it — but it is not a supported interface and
+its verbs move with the plugin.
 
-### One more command, if you want profile locks
+### Switch
 
-Locking a profile asks polkit whether you are allowed in, and polkit only
-answers for actions declared under `/usr/share/polkit-1/actions`. A plugin
-install cannot write there, so that one file needs a hand:
+The list of desks, and a padlock beside any that asks for something. Click one:
+the outgoing desk is captured, the incoming one is applied, and the shell
+restarts, which is why the panel closes and the bar blinks.
 
-```bash
-sudo install -m 0644 \
-  ~/.config/omarchy/plugins/graveklar.profiles/polkit/no.graveklar.profiles.policy \
-  /usr/share/polkit-1/actions/
-```
+When a desk starts empty and remembers windows from last time, **Restore
+windows — 4 apps were open here** is at the top. The button is the guarantee;
+the notification that offers the same thing after a reboot is the convenience.
 
-`init` tells you if it is missing, and so does `omarchy-profile refresh`.
-Everything except locks works without it — and a lock without it fails safe:
-the profile refuses to open and says why, rather than opening anyway.
+### Manage
 
-## Dependencies
+Every profile with its actions: what it may use, its name and icon, its
+configuration, a password, hiding it from the switcher, removing it. **Capture
+now** saves the desk as it is this second — switching already does this for you.
 
-Everything below `jq` ships with Omarchy already. Nothing here is installed for
-you, and nothing except `jq` is needed to run the plugin.
+**What is open** lists every profile's windows, with the memory each one is
+holding, and can ask a whole desk to close.
 
-| | | |
-|---|---|---|
-| `jq` | required | every profile is a JSON file |
-| `hyprctl` | required | focusing and moving windows between workspaces |
-| `pkcheck` (polkit) | for locks | asks whether you may enter a locked profile |
-| `gocryptfs`, `fusermount3` | for vaults | `omarchy pkg add gocryptfs` |
-| `fuser` (psmisc) | for vaults | names what is still holding an open vault |
-| `omarchy-face-identity` | for bound faces | from [omarchy-face]; entirely optional |
+**New profile** is either a copy of your master — same apps, same plugins,
+already signed in where the master is — or clean, which starts with nothing and
+makes fresh state for every plugin.
 
-[omarchy-face]: https://github.com/Kalinewb/omarchy-face
+At the foot: **Remove Profiles from this machine**.
 
-The dependency on `omarchy-face` is one-way and optional: without it a profile
-can still be locked, and a profile bound to a face says so rather than becoming
-unopenable. Licensed MIT, see `LICENSE`.
+### A profile's apps and plugins
+
+The gear on a profile's row. Two lists: which plugins run in that desk, and
+which applications exist in it. An application that is not allowed is not
+hidden behind anything — it is not in the launcher, not in the menu, not in
+search, for as long as that desk is the one you are in. The master sees
+everything by definition, so it has no list.
+
+### Configuration
+
+The wrench. The top is what that desk *is* — theme, wallpaper, bar, how many
+plugins and apps, its block of workspaces, do-not-disturb, idle timers — and
+whether it reopens apps when you enter it: **Off**, **Ask** or **Always**.
+
+Everything below that is machine-wide, because it is one decision for the whole
+machine rather than a setting per desk:
+
+- **Plugin data.** Whether a plugin's own state follows the profile. On: each
+  desk has its own Spotify account and its own dock layout. Off: it is the same
+  in every desk.
+- **Hyprland.** Per-profile `looknfeel.lua`, `bindings.lua` and `input.lua`.
+  Offered only where Hyprland has been measured to re-read a swapped file, and
+  a copy that breaks the config is rolled back on the spot, with a line saying
+  where the broken one was kept.
+- **A workspace outside every desk**, for music, a download, a long build.
+
+## Workspaces
+
+Hyprland has no app grouping, so workspaces are the layer available: five
+fullscreen apps is five workspaces. Each desk owns a block of ten — master
+1–10, the next 11–20 — while `SUPER+1..0` always means "this desk's first
+through tenth", and the bar always reads 1–0. Setup writes the file that does
+that and adds one line to `hyprland.lua`; it never edits bindings you wrote
+yourself, and says so if it finds some that fight it.
+
+## What the password does, and what it does not
+
+It gates **entering** a profile from the desktop. It stops the person sitting at
+the keyboard, which is the threat it was built for: a family laptop, a lent
+machine, a desk left unattended for a minute.
+
+**Editing settings cannot take it off.** The password is stored hashed, in a place
+only the system can write, so changing a profile's configuration does not remove
+it. Changing or removing it needs that password or the machine's owner. The same
+goes for a face bound to a profile: only the owner can bind or change one.
+
+**It is not a security boundary**, and no setting here makes it one:
+
+- Every profile runs as the same Linux user, so another profile's files can be
+  **read** without entering it.
+- The check is made by this plugin, which lives in your home directory. Someone
+  comfortable editing its files, or copying a profile's settings into place by
+  hand, can switch without being asked.
+
+If you need contents another person genuinely cannot read, you need encryption
+and a separate login, and this is not that.
+
+A bound face is a **shortcut**, not a second lock. It saves typing the password;
+the password always works.
+
+**If face unlock answers system prompts.** Setting, resetting or clearing a password
+as the machine's owner goes through the system authentication prompt. If that prompt
+accepts your face, it accepts it for any program you run — so while you sit in front
+of the camera, a program could reset a profile's password without you typing
+anything. Setup warns you when this is the case.
 
 ## Removing it
 
-**Un-isolate first.** `isolate` replaces a real config file with a symlink into
-the plugin's state directory, so deleting that directory first would leave a
-dangling symlink where a plugin's config used to be:
+Manage → **Remove Profiles from this machine**. It shows what would go before
+anything happens, by profile and by name — including each desk's own Hyprland
+files, which exist nowhere else on the machine — and offers **Export first**,
+which copies every one of them somewhere you choose and removes nothing.
+
+Then **Remove** hands the machine back as your master profile has it: windows on
+other desks move onto master's workspaces, every isolated file becomes a real
+file again, every hidden application comes back, the workspace keys and the
+widget go, the stored passwords and the two helpers go, and the plugin uninstalls
+itself. It has to be run from the master profile; from anywhere else the button
+is **Switch to master first**.
+
+From a checkout, the same thing without a panel:
 
 ```bash
-omarchy-profile isolate list                     # * means it is a live symlink
-omarchy-profile isolate remove <each path>       # puts the real file back
+./uninstall.sh --dry-run --json      # what would go
+./uninstall.sh --export ~/backup     # copy it out first
+./uninstall.sh --yes                 # do it
 ```
 
-Then close anything encrypted, and keep the ciphertext if you still want it —
-removing the plugin does not decrypt it, and the passphrase is the only way in:
+One thing it will not do for you: if you bind workspace keys by hand in your own
+Hyprland config, that block calls this plugin and will stop working. It is
+listed on the confirmation screen, and taking it out is yours — nothing here
+edits your configuration.
 
-```bash
-omarchy-profile vault close <profile>
-cp -r ~/.local/state/omarchy-profiles/vaults ~/vaults-backup   # if you have any
-```
+## Dependencies
 
-Then the plugin itself, and what it wrote:
+`jq` and `hyprctl`, both of which Omarchy already has. `pkexec` for anything
+involving a password. [omarchy-face] is optional and the dependency is one way:
+without it a profile can still have a password, and one bound to a face says so
+rather than becoming unopenable.
 
-```bash
-omarchy plugin remove graveklar.profiles
-rm -rf ~/.config/omarchy/profiles          # the profiles themselves
-rm -rf ~/.local/state/omarchy-profiles     # state, and the vault ciphertext
-sudo rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.policy
-rmdir ~/Vaults/* ~/Vaults 2>/dev/null   # the empty mount points
-```
+[omarchy-face]: https://github.com/Kalinewb/omarchy-face
 
-Nothing in `~/.config/omarchy/shell.json` needs undoing: profiles write your
-real bar and plugin configuration, so whatever the last active profile left
-there is a working desktop on its own.
-
-Two things to do by hand, if you set them up: remove the `omarchy-profile ws`
-bindings from `~/.config/hypr/bindings.lua` — with the plugin gone they point at
-nothing, and leaving them there makes workspaces unreachable — and re-enable any
-plugin a profile had disabled, with `omarchy plugin enable <id>`.
-
-## Use
-
-The bar widget shows the active profile; click it to switch or to open the
-manager. Everything it does is also a command:
-
-```bash
-omarchy-profile list                  # * is active, (master) is the master
-omarchy-profile set work              # captures the outgoing profile first
-omarchy-profile create work --clean   # or --from-master
-omarchy-profile remove work           # its windows move to the master first
-omarchy-profile capture               # save live state into the active profile now
-
-omarchy-profile apps work allow hey            # which applications it can see
-omarchy-profile plugin work disable quickshell.spotify
-omarchy-profile ws 3                  # focus this profile's third workspace
-```
-
-## Workspace keys
-
-To make `SUPER+1..0` follow the active profile, point them at the engine in
-`~/.config/hypr/bindings.lua`:
-
-```lua
-local gk_profile = os.getenv("HOME") .. "/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
-
-for w = 1, 10 do
-  local key = "code:" .. tostring(w + 9)
-  local n = tostring(w)
-  hl.unbind("SUPER + " .. key)
-  o.bind("SUPER + " .. key, "Workspace " .. n, gk_profile .. " ws " .. n)
-  hl.unbind("SUPER + SHIFT + " .. key)
-  o.bind("SUPER + SHIFT + " .. key, "Move window to workspace " .. n, gk_profile .. " move " .. n)
-  hl.unbind("SUPER + SHIFT + ALT + " .. key)
-  o.bind("SUPER + SHIFT + ALT + " .. key, "Move window silently to workspace " .. n,
-    gk_profile .. " move " .. n .. " --silent")
-end
-
--- Hyprland's e+1 skips EMPTY workspaces, which is what makes it useful: two
--- occupied workspaces are one keypress apart however far their numbers are. Its
--- only flaw is not knowing where a block ends, so after the tenth it carries you
--- into the next profile. `ws next` keeps the skipping and adds the boundary.
-hl.unbind("SUPER + TAB")
-o.bind("SUPER + TAB", "Next workspace in this profile", gk_profile .. " ws next")
-hl.unbind("SUPER + SHIFT + TAB")
-o.bind("SUPER + SHIFT + TAB", "Previous workspace in this profile", gk_profile .. " ws prev")
-```
-
-Leave the mouse-scroll bindings on Hyprland's own `e+1` / `e-1`. They walk into
-other profiles' blocks, which is the leak these keys exist to close — and that
-makes them the escape hatch: a way to reach another desk on purpose, and a way
-to navigate at all if the plugin is removed with these bindings left behind.
-
-Without any of this the keys still work; they just always address workspaces
-1–10, so every profile shares one block.
-
-### One trap if you write your own dispatches
-
-Hyprland on Omarchy is configured in Lua, and `hyprctl dispatch` takes a Lua
-expression, not a dispatcher name:
-
-```bash
-hyprctl dispatch workspace 3
-# error: [string "return hl.dispatch(workspace 3)"]:1: ')' expected near '3'
-
-hyprctl dispatch 'hl.dsp.focus({ workspace = "3" })'   # ok
-```
-
-Every dispatch here goes through one small set of helpers for that reason. All
-four call sites had the plain form and silently did nothing — including the
-window migration on removing a profile — because the exit code was dropped.
-
-
-### The bar's workspace indicator
-
-Omarchy's own workspace widget hardcodes the range it will consider:
-
-```qml
-if (id > 0 && id <= 10 && ids.indexOf(id) === -1) ids.push(id)
-```
-
-In a profile whose block starts at 11 that filter excludes every workspace you
-are actually using, so the indicator shows 1–10 with nothing highlighted. The
-profiles themselves work fine; it is the indicator that is looking in the wrong
-place.
-
-`extras/Workspaces.qml` in this repository is the stock widget with that fixed.
-It reads the offset from the engine's state file, so the buttons stay labelled
-1–0 in every profile and only the id they target moves:
-
-```bash
-omarchy plugin clone omarchy.workspaces --edit      # makes your own copy
-cp ~/.config/omarchy/plugins/graveklar.profiles/extras/Workspaces.qml \
-   ~/.config/omarchy/plugins/<your-clone-id>/Workspaces.qml
-```
-
-Then set `moduleName` in it to your clone's id, and `omarchy restart shell`.
-Optional: skip it and the indicator is simply wrong outside the first profile.
-
-## Files
-
-| Path | What |
-|---|---|
-| `~/.config/omarchy/profiles/config.json` | master name, pinned plugins, workspace span |
-| `~/.config/omarchy/profiles/<name>.json` | one profile |
-| `~/.local/state/omarchy-profiles/current.json` | which profile is active |
-
-## Pinned plugins
-
-A profile may not disable anything listed in `pinned_plugins`. This plugin is
-pinned by default: a profile that could switch off its own picker would leave
-no way back except a terminal. Add your background, lock or bar plugins there
-too if losing them mid-session would look like a broken desktop.
-
-## Notes
-
-- Every state change is an **absolute** setter, never a toggle, so applying a
-  profile twice does nothing the second time and an interrupted switch is fixed
-  by running it again.
-- Theme changes are skipped when the theme is already current — retinting every
-  terminal takes seconds and there is no reason to pay it to stay put.
-- `omarchy.idle`'s IPC target does not exist while that plugin is disabled (the
-  normal state when a third-party lock/idle plugin has replaced it), so idling
-  is set through `omarchy toggle idle allow-idle|stay-awake` instead. Note the
-  sense: stay-awake *inhibits* idling.
+Licensed MIT, see `LICENSE`.
 
 ## Why a switch restarts the shell
 
-Because a reload is not enough, and "it usually works, restart if it looks
-wrong" is not a thing to ship. Plugins hold their own config and state files
-open, so a swapped Spotify session or dock file goes unnoticed; enabling a
-plugin that was off needs it instantiated; and Qt keeps compiled QML cached.
-Each of those produced a switch that looked half-applied.
-
-The order is what makes it safe: **files first, restart second, IPC third.**
-Restarting before the writes would have the new shell read the old files, and
-setting do-not-disturb over IPC before a restart wastes the call on a process
-about to exit. Do-not-disturb and the idle flag are persisted under
-`XDG_STATE_HOME`, so they survive the restart either way.
-
-The cost is a visible blip and about five seconds, most of it the theme retint.
-A profile switch is already a visual event, so the blip reads as part of it.
-
-## License
-
-MIT
-
-## Per-profile plugin data
-
-A plugin's settings are already per-profile when it keeps them inline in
-`shell.json`, because a profile captures that whole object. Plugins with their
-own files outside it are global — the Spotify plugin's session lives in
-`~/.local/state/omarchy-spotify`, so every profile is signed in as the same
-person, and the dock keeps one `arc-dock.json`, so every profile gets the same
-dock.
-
-Isolate those paths and each profile gets its own copy:
-
-```bash
-omarchy-profile isolate add ~/.local/state/omarchy-spotify
-omarchy-profile isolate add ~/.config/omarchy/arc-dock.json
-omarchy-profile isolate list          # * marks the one in use now
-omarchy-profile isolate remove <path> # puts the active copy back as a real file
-```
-
-It works the way browsers do for their own profiles: one copy per profile, with
-the path the plugin knows pointed at the active profile's copy. The plugin is
-unchanged and unaware.
-
-Swapping is lossless and self-healing. Leaving profile F for T, for each
-isolated path: a symlink is removed, a real file is moved into F's store since
-the live data is F's, and T is linked to its own store — or, if T has none, the
-path is left absent so the plugin makes a fresh one, which the next switch away
-adopts into T's store. Nothing is deleted and no symlink is left dangling.
-
-New profiles follow the same choice as everything else: **copy of master**
-inherits the stores (already signed in, same dock), **clean** inherits none
-(signed out, default dock). Removing a profile deletes its store with it.
-
-No caveat about reloading: a switch restarts the shell, so every plugin reads
-its new copy. See *Why a switch restarts the shell*.
-
-## Password-protected profiles
-
-```bash
-omarchy-profile lock work      # entering it now asks
-omarchy-profile unlock work    # stops asking — and asks first, to prove you could
-```
-
-Authentication goes through **PAM**, not a passphrase of this plugin's own,
-because PAM is already where your identity is decided. Whatever you have set up
-works with nothing added here — a face (`pam_exec` with a verifier, as
-`omarchy-face` installs), a fingerprint (`pam_fprintd`), or your password as the
-fallback. Adding a method later needs no change to this plugin.
-
-The default `unlock.method` is `polkit`. `pkcheck` asks for an authorisation
-decision on the action `no.graveklar.profiles.unlock` without running anything
-as root, because that is what this is — a decision, not a privileged action, and
-it should not have to become one to be asked. The agent runs the `polkit-1` PAM
-stack, so a face is tried first where one is configured, then the password.
-
-The policy is `auth_self` deliberately **without** `_keep`. A cached
-authorisation is precisely the hole this gate exists to close: the threat is a
-person at an unattended machine, and "you authorised something five minutes ago"
-is no evidence that you are the one standing here now.
-
-Because polkit draws its own dialog through the session agent, a locked switch
-started from the panel no longer relaunches itself in a floating terminal.
-Authentication still happens **before** anything is captured or written, so a
-failed unlock leaves the machine exactly where it was.
-
-`unlock.method` may also be `sudo` (the previous behaviour: `sudo -k` then
-`sudo -v`, which works but clobbers your real sudo timestamp as a side effect)
-or `none`.
-
-### A face other than yours
-
-A profile can also answer to a named face that is not the account owner's:
-
-```bash
-omarchy-profile identity work partner   # bind
-omarchy-profile identity work           # read
-omarchy-profile identity work none      # clear
-```
-
-The face is enrolled by `omarchy-face` and verified through
-`omarchy-face-identity`, which needs no authorisation prompt — the point is that
-the other person cannot authorise as you. Binding one is gated exactly like
-unlocking, because choosing who else may enter a profile is at least as
-consequential as entering it.
-
-The check is **additive**. If the named face is not recognised, the owner check
-still runs, so a camera that cannot see is never the reason somebody is locked
-out of their own machine.
-
-### What this is, and what it is not
-
-It gates **entering** a profile. It stops a person at the keyboard.
-
-It is **not** a security boundary. Every profile runs as the same Unix user, so
-a process running as you can read any profile's files whether or not this
-prompt exists. Real isolation would need a separate Unix user and a separate
-login session, which is not a profile switch.
-
-**The same is true of a bound identity.** A profile can name whose face opens
-it — a partner's, say — and `--only` stops your own password opening it:
-
-```bash
-omarchy-profile identity partner anna --only
-```
-
-That does what it says: the face is the only thing the prompt accepts. But the
-binding lives in `~/.config`, writable by whoever owns the machine, so anyone
-who can edit that file can switch the rule back off, clear the binding, or read
-the profile's files directly without entering it at all. As a courtesy between
-people sharing a laptop it holds. As a boundary it does not, and nothing kept
-in `~/.config` could.
-
-### If it has to actually hold
-
-Use a vault. The distinction is not a detail:
-
-|  | a lock, or a bound face | a vault |
-|---|---|---|
-| What decides | a rule in a file | a key derived from a passphrase |
-| Owner with root | can edit the rule | cannot read it while closed |
-| Forgotten secret | recoverable | only via the master key |
-
-A face cannot open a vault, and that is not an omission — a biometric check
-returns yes or no, it does not produce a key. So the person whose profile it is
-types their passphrase for the vault, and their face is what saves them typing
-it to *enter the profile*. Two different things, on purpose.
-
-```bash
-omarchy-profile identity partner alice --only   # locks the profile too
-omarchy-profile vault init partner              # their passphrase, not yours
-```
-
-Binding a face turns the lock on as part of the same change. An identity is only
-ever consulted when a profile asks for authentication, so a bound face on an
-unlocked profile would be inert while the message said otherwise.
-
-With `--only` there is no password to fall back to, so a camera that simply did
-not see anyone gets one retry before the profile refuses.
-
-Without that passphrase the contents are ciphertext to every account on the
-machine, root included. That is the only part of this plugin that a password
-cannot talk its way past.
-
-## What is open
-
-Profiles persist. Switching away kills nothing, which is what makes "I am
-working, now I want to game" safe to do without thinking. The cost is that
-several profiles can quietly hold several browsers, so there is a view of it:
-
-```bash
-omarchy-profile overview
-omarchy-profile overview --json    # what the panel reads
-omarchy-profile close work         # ask every window in a profile to close
-```
-
-```
-PROFILE         WINS   WS   MEMORY  LAST USED  APPS
-* master           2    2     1.6G        now  foot, org.omarchy.agent
-  gaming           3    2     4.1G     2d ago  steam, gamescope
-  (unassigned)     1    1      91M      never  Bitwarden
-```
-
-Two things make the numbers worth trusting:
-
-**Attribution is by workspace.** A window belongs to a profile if its workspace
-falls in that profile's block, so a terminal you opened by hand counts exactly
-like one a profile switch opened. Launching apps into per-profile systemd
-slices was the obvious alternative and is worse: it only sees what went through
-its own launcher, so the total looks authoritative while silently missing
-things.
-
-**Memory comes from each window's cgroup**, which uwsm already gives every app,
-summed over *unique* cgroups. Chromium keeps every window in one scope, so
-summing per window would count a browser once per window and overstate a
-profile several times over.
-
-`(unassigned)` collects anything outside every profile's block — the scratchpad,
-and any workspace past the last profile's range — so nothing is invisible.
-
-`close` asks each window to close rather than killing its cgroup, so an editor
-with unsaved work still gets to stop you. Anything that ignores the request
-survives, which is the right failure: a profile holding 6 GB is housekeeping,
-not an emergency worth losing work over.
-
-## Per-profile app visibility
-
-A profile hides an application by writing an XDG hidden entry for it into
-`~/.local/share/applications`. Omarchy's menu, launcher and search all filter
-through one script, `hidden-entries.sh`, so an entry marked `NoDisplay=true`
-there is gone from all three at once, live, with no shell restart and no fork of
-the menu to maintain.
-
-```bash
-omarchy-profile apps work allow hey
-omarchy-profile apps work deny discord
-omarchy-profile apps work allow-all | deny-all
-omarchy-profile apps preview --json work   # what switching in would hide
-omarchy-profile apps-sweep                 # put everything back
-```
-
-The master sees everything, so switching into it unhides whatever the profile
-you left had hidden.
-
-**This writes into your real application directory, so every file it touches
-says so.** An entry it created from a system one carries
-`X-OmarchyProfiles-Hidden=1` and is deleted again on unhide. One of your own
-files that it edited in place carries `X-OmarchyProfiles-Modified=1`, and the
-original is kept in `~/.local/state/omarchy-profiles/desktop-backups` with a
-hash of the file as it was left. On unhide, a file that still matches that hash
-is replaced by its backup; one that does not — because you, or the application's
-own updater, changed it while it was hidden — keeps your version, with only the
-two lines this plugin added taken back out. Nothing untagged is ever deleted,
-and nothing untagged is edited before a backup of it has been compared byte for
-byte against the original.
-
-`apps-sweep` undoes all of it, whichever profile did it. It is the way out if a
-switch is interrupted, and uninstalling runs it first.
-
-## The global workspace
-
-Some windows are not part of any desk: music, a download, a long build. A
-Hyprland *special* workspace has a negative id, so it falls outside every
-profile's block and survives every switch.
-
-```bash
-omarchy-profile global enable music   # prints the keybindings to add
-omarchy-profile global status         # what is parked there
-```
-
-Off by default: it costs a keybinding and a concept, and someone who keeps their
-music in the master profile needs neither.
-
-## Vaults
-
-An encrypted folder per profile, sealed when you leave it.
-
-```bash
-omarchy pkg add gocryptfs             # optional dependency
-omarchy-profile vault init work
-omarchy-profile vault open work
-omarchy-profile vault status
-```
-
-```
-~/.local/state/omarchy-profiles/vaults/<profile>   ciphertext, always there
-~/Vaults/<profile>                                 plaintext, only while open
-```
-
-gocryptfs rather than LUKS or fscrypt: no root needed, it works on btrfs
-(fscrypt wants ext4 or f2fs), and a cipherdir is an ordinary directory that a
-normal backup picks up.
-
-Opening is manual. Auto-opening on every switch would mean a passphrase prompt
-on every switch, and the protection that matters — a profile you are *not* in
-being unreadable — is bought by the automatic close, not by the open.
-
-### What a vault protects
-
-While **closed**: everything. From another profile, from a file manager, from
-`grep -r ~`, from a lost laptop.
-
-While **open**: nothing beyond the filesystem. Every profile runs as the same
-Unix user, so any process running as you can read the mount while it is mounted.
-It is a closed safe, not a sandbox.
-
-Two edges worth knowing before you trust one:
-
-**The master key is the recovery path.** `vault init` prints one, once. The
-passphrase unlocks the vault day to day; the master key is what gets you back in
-if you forget the passphrase. Write it down somewhere that is not the laptop.
-
-**A program already inside the vault keeps reading it.** Closing detaches the
-mount, so nothing new can get in and the folder is gone from the filesystem —
-but a process that had a file open before the close keeps reading *that file*
-through the descriptor it already holds, until it exits. This is how unmounting
-works, not a bug, and the tool says so rather than reporting a clean seal:
-
-```
-$ omarchy-profile vault close work
-closed — nothing new can reach it.
-omarchy-profile: tail still had a file open, and keeps reading that file until it exits
-```
-
-The same warning appears when leaving a profile seals its vault. If you want a
-guaranteed seal, close what is using the vault first — the journal
-(`journalctl -t omarchy-profile`) records which closes were clean and which were
-not.
+Plugins hold their own configuration and state open, so a reload does not notice
+a swapped dock file or a plugin that was off a moment ago. The restart is one
+visible blip and is always right, which the alternative was not.

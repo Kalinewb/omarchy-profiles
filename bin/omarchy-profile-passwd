@@ -212,10 +212,30 @@ remove)
   ;;
 
 purge)
-  # Uninstall. Named explicitly rather than taking a path, so there is no
-  # argument anybody could point at another directory.
+  # Uninstall, root side. Every path is named literally rather than taken as an
+  # argument, so there is nothing anybody could point at another directory.
+  #
+  # The order is the whole of it, and it runs from the outside in:
+  #
+  #   1. the no-prompt verifier, which is the only thing that can check a hash.
+  #      Gone first, so nothing can authenticate against a store that is about
+  #      to disappear underneath it.
+  #   2. the policy, and the legacy .unlock action an older version registered.
+  #      After the binaries, because an action pointing at a missing exec.path
+  #      is inert, while a binary with no action would fall back to pkexec's
+  #      generic admin prompt.
+  #   3. the store itself: the hashes, the identities, the counters and the log.
+  #   4. this file, last. Bash keeps reading a script whose file has been
+  #      deleted — the open descriptor keeps the inode — so deleting itself
+  #      here is safe, and doing it any earlier would leave the machine with a
+  #      helper that could still be invoked while the store was half gone.
+  rm -f /usr/local/bin/omarchy-profile-auth
+  rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.policy
+  rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
   rm -rf /var/lib/omarchy-profiles
   printf '{"ok":true}\n'
+  # Not through log(): the log went with the store two lines ago.
+  rm -f /usr/local/bin/omarchy-profile-passwd
   exit 0
   ;;
 

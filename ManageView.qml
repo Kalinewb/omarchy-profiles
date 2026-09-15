@@ -41,6 +41,9 @@ Column {
   signal bindIdentity(string profile, string identity)
   signal clearIdentity(string profile)
   signal captureNow()
+  // Uninstalling is a housekeeping action about the whole plugin, not about a
+  // profile, so it sits at the foot of this list rather than on a row.
+  signal openPurge()
 
   // ok | needs_action | broken | unknown | absent, from `capabilities`. Only
   // `ok` puts a face row on screen: anything else means there is either no
@@ -311,6 +314,68 @@ Column {
         onClicked: { root.creating = false; nameField.text = "" }
       }
     }
+  }
+
+  PanelSeparator { foreground: root.foreground }
+
+  // The way out of the plugin altogether.
+  //
+  // At the very bottom, dim, and it opens a page rather than a confirmation:
+  // what it would delete is a list the user has to be able to read before
+  // anything happens, and some of it exists nowhere else on the machine.
+  CursorSurface {
+    id: purgeRow
+    width: parent.width
+    property bool hovered: false
+    foreground: root.foreground
+    accent: root.accent
+    hasCursor: purgeRow.hovered
+    implicitHeight: purgeBody.implicitHeight + Style.space(14)
+
+    Row {
+      id: purgeBody
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(10)
+      anchors.rightMargin: Style.space(10)
+      spacing: Style.space(10)
+
+      Text {
+        textFormat: Text.PlainText
+        text: "󰩹"
+        color: root.dim
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.body
+        anchors.verticalCenter: parent.verticalCenter
+      }
+
+      Column {
+        width: purgeBody.width - purgeBody.spacing * 2 - 2 * Style.space(10)
+        spacing: 0
+
+        Text {
+          textFormat: Text.PlainText
+          text: "Remove Profiles from this machine"
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.body
+        }
+
+        Text {
+          textFormat: Text.PlainText
+          width: parent.width
+          wrapMode: Text.WordWrap
+          text: "Shows everything that would go first. Nothing is removed until you say so."
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+      }
+    }
+
+    HoverHandler { onHoveredChanged: purgeRow.hovered = hovered }
+    TapHandler { onTapped: root.openPurge() }
   }
 
   function submitCreate() {

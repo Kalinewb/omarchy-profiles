@@ -766,7 +766,9 @@ Panel {
     "setup":    { title: "Setup",           meta: "What has to be true before this works",
                   hint: "each row is one thing; Fix does it for you" },
     "edit":     { title: "Edit profile",    meta: "Its name, its icon, and the line under it",
-                  hint: "a protected profile asks for its password before the name changes" }
+                  hint: "a protected profile asks for its password before the name changes" },
+    "purge":    { title: "Remove Profiles", meta: "What goes, and what is handed back",
+                  hint: "nothing is removed until Remove is pressed" }
   })
 
   function chrome() {
@@ -911,6 +913,127 @@ Panel {
       root.loadConfigSession()
       if (profile === root.currentProfile) root.loadSession()
     })
+  }
+
+  // ----------------------------------------------------------------- purge
+  //
+  // Taking the plugin off the machine. Everything on the screen comes from
+  // `purge --dry-run --json`, which writes nothing: what is listed is what the
+  // engine would delete, from the engine, rather than a second description of
+  // it maintained here.
+  //
+  // Two buttons and one rule — nothing is removed until Remove is pressed. The
+  // export is a separate invocation for the same reason: it has to have
+  // succeeded, visibly, before the irreversible one is worth offering.
+  property var purgeManifest: null
+  // "" not asked yet · "ok" · anything else is what went wrong. Never healthy
+  // by default: an unanswered dry run and an empty machine must not look alike.
+  property string purgeState: ""
+  property string purgeError: ""
+  property string purgeNote: ""
+  property bool purgeExported: false
+  property bool purgeBusy: false
+  // The clone is the user's plugin, listed in the manifest and asked about
+  // rather than assumed: it is a bar widget they may want to keep.
+  property bool purgeKeepIndicator: false
+  property string purgeExportDir: ""
+
+  // Set when `purge --yes` itself came back `not_master` — the profile changed
+  // between this screen opening and Remove being pressed. The engine's refusal
+  // wins over the manifest's answer, and renders as the same screen.
+  property bool purgeRaced: false
+
+  // From the manifest, not from the panel's own idea of the active profile: the
+  // engine is the one that will refuse, and it answers both questions at once.
+  readonly property bool purgeOnMaster: {
+    if (root.purgeRaced) return false
+    var m = root.purgeManifest
+    if (m && m.master) return String(m.current || "") === String(m.master)
+    return root.currentProfile !== "" && root.currentProfile === root.masterName
+  }
+
+  function openPurge() {
+    root.purgeManifest = null
+    root.purgeState = ""
+    root.purgeError = ""
+    root.purgeNote = ""
+    root.purgeExported = false
+    root.purgeBusy = false
+    root.purgeRaced = false
+    if (root.purgeExportDir === "") root.purgeExportDir = root.home + "/omarchy-profiles-export"
+    root.pushView("purge")
+    root.ask(["purge", "--dry-run", "--json"], "", function (ok, parsed, code) {
+      if (ok && parsed && !parsed.error) {
+        root.purgeManifest = parsed
+        root.purgeState = "ok"
+        return
+      }
+      root.purgeManifest = null
+      root.purgeState = (parsed && parsed.error) ? String(parsed.error) : ("exit " + code)
+    })
+  }
+
+  function purgeExport(dir) {
+    var d = String(dir || "").trim()
+    if (d === "") return
+    root.purgeExportDir = d
+    root.purgeError = ""
+    root.purgeNote = "Copying…"
+    root.purgeBusy = true
+    root.ask(["purge", "--export", d, "--json"], "", function (ok, parsed, code) {
+      root.purgeBusy = false
+      if (ok && parsed && parsed.ok) {
+        root.purgeExported = true
+        root.purgeNote = "Copied " + (parsed.files || 0) + " file(s) to " + d + ". Nothing has been removed."
+        return
+      }
+      root.purgeNote = ""
+      var err = parsed && parsed.error ? String(parsed.error) : "failed"
+      root.purgeError = err === "busy" || code === 3 ? "A switch is running — try again in a moment"
+                      : err === "not_a_directory" ? "That path is a file, not a directory"
+                      : err === "no_directory" ? "Type where the copy should go"
+                      : "Could not copy them there"
+    })
+  }
+
+  // The last thing this panel ever does. The engine prints its result and only
+  // then removes the plugin, which reloads every panel in the shell — so this
+  // callback may simply never run, and that is success, not a hang.
+  function purgeRemove() {
+    root.purgeError = ""
+    root.purgeNote = "Removing…"
+    root.purgeBusy = true
+    var args = ["purge", "--yes", "--json"]
+    if (root.purgeKeepIndicator) args = args.concat(["--keep-indicator"])
+    root.ask(args, "", function (ok, parsed, code) {
+      root.purgeBusy = false
+      if (ok) {
+        root.purgeNote = "Removed. The shell is restarting."
+        return
+      }
+      root.purgeNote = ""
+      var err = parsed && parsed.error ? String(parsed.error) : "failed"
+      if (err === "not_master") {
+        // A race: the profile changed between this screen opening and Remove
+        // being pressed. The screen becomes the off-master one, which is the
+        // same thing said the same way.
+        root.purgeRaced = true
+        root.purgeError = ""
+        return
+      }
+      root.purgeError = (err === "busy" || code === 3) ? "A switch is running — try again in a moment"
+                      : err === "interrupted_switch" || err === "held_paths"
+                        ? "The last switch did not finish — open Setup"
+                      : "Could not remove it"
+    })
+  }
+
+  // Off master the flow cannot continue by itself: a switch restarts the shell,
+  // which takes this panel with it. So this switches, and the user opens the
+  // screen again — which is what the button says.
+  function purgeSwitchToMaster() {
+    if (root.masterName === "") return
+    root.apply(root.masterName)
   }
 
   function openSettings(profile) {
@@ -1182,6 +1305,7 @@ Panel {
     running: root.opened && !root.touchedSinceOpen
              && root.pendingRemoval === "" && root.pendingClose === ""
              && root.passwordFor === "" && root.pendingSetup === ""
+             && root.view !== "purge"
     onTriggered: if (root.opened && !root.touchedSinceOpen) root.close()
   }
 
@@ -1622,6 +1746,7 @@ Panel {
           onBindIdentity: function (profile, identity) { root.keepAlive(); root.bindIdentity(profile, identity) }
           onClearIdentity: function (profile) { root.keepAlive(); root.clearIdentity(profile) }
           onCaptureNow: { root.keepAlive(); root.captureNow() }
+          onOpenPurge: { root.keepAlive(); root.openPurge() }
         }
 
         ProfileMetaForm {
@@ -1653,6 +1778,12 @@ Panel {
         ConfigView {
           width: parent.width
           visible: root.view === "config"
+          panel: root
+        }
+
+        PurgeView {
+          width: parent.width
+          visible: root.view === "purge"
           panel: root
         }
 
