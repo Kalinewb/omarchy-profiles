@@ -53,25 +53,31 @@ Column {
   readonly property bool waitingOnPrompt: !!panel
     && (panel.pendingSetup === "helpers" || panel.pendingSetup === "polkit")
 
-  // One button for "do everything a button can do here" — clicking each
-  // row's own Fix in turn is the same three or four polkit-free calls,
-  // just slower to ask for. It runs them one at a time, same as a person
-  // clicking down the list, and stops at the first failure rather than
-  // guessing whether the rest are still worth trying.
+  // One button, two jobs depending on where the machine is: something left
+  // to set up shows Install and does them one at a time (clicking each
+  // row's own Fix in turn is the same calls, just slower to ask for, and
+  // stops at the first failure rather than guessing whether the rest are
+  // worth trying); nothing left shows Uninstall, opening the same
+  // confirmation the Manage row does rather than removing anything from a
+  // single click here. A lone remaining row relies on its own Fix — this
+  // slot is for "everything" in either direction, not "the one thing".
   Button {
     width: parent.width
-    visible: view.fixableCount > 1
+    visible: view.fixableCount !== 1
     enabled: !view.queueRunning
-    text: !view.queueRunning ? ("Fix everything (" + view.fixableCount + ")")
-          : view.waitingOnPrompt ? "Waiting for your password… (check behind this window)"
-          : ("Fixing… " + view.fixableCount + " left")
+    text: view.fixableCount > 1
+          ? (!view.queueRunning ? ("Install (" + view.fixableCount + ")")
+             : view.waitingOnPrompt ? "Waiting for your password… (check behind this window)"
+             : ("Installing… " + view.fixableCount + " left"))
+          : "Uninstall"
     bordered: true
     foreground: view.waitingOnPrompt ? Color.accent : view.foreground
     fontFamily: view.fontFamily
     onClicked: {
       if (!view.panel) return
       view.panel.keepAlive()
-      view.panel.runFixAll()
+      if (view.fixableCount > 1) view.panel.runFixAll()
+      else view.panel.openPurge()
     }
   }
 
