@@ -309,8 +309,17 @@ Panel {
     if (!setupRows) return 0
     var n = 0
     for (var i = 0; i < setupRows.length; i++) {
-      var s = setupRows[i] ? String(setupRows[i].state) : ""
-      if (s !== "ok" && s !== "absent") n++
+      var r = setupRows[i]
+      if (!r) continue
+      var s = String(r.state)
+      if (s === "ok" || s === "absent") continue
+      // A row nobody can act on from here, and that is not one of the two
+      // that block switching, is not "something to look at" — it is a fact
+      // about the machine Setup already states once. Counting it left the
+      // hero permanently badged over a hand-written keybinding block Setup
+      // deliberately never touches, with no way to ever clear it.
+      if (!r.fixable && root.blockingRows.indexOf(r.id) < 0) continue
+      n++
     }
     return n
   }
@@ -329,11 +338,48 @@ Panel {
         var err = parsed && parsed.error ? String(parsed.error) : ("exit " + code)
         root.setupError = err === "busy" ? "Busy — try again when the switch finishes"
                         : "That did not work (" + err + ")"
+        // A failure stops the queue rather than plowing through the rest
+        // blind — the error is exactly the thing to read before trying
+        // whatever comes next.
+        root.fixQueue = []
+      } else {
+        // The row's own colour changing is not a loud enough "done" — the
+        // button that said "Fixing…" just goes quiet, which reads the same
+        // as nothing having happened. Same fix as captureNote (:1372).
+        root.lastFixedRow = id
+        fixedRowTimer.restart()
       }
       // A fix changes what every other row can see, so the whole set is asked
       // again rather than the one row patched in place.
       root.loadSetup(false)
+      if (root.fixQueue.length > 0) root.runNextQueued()
     })
+  }
+
+  property string lastFixedRow: ""
+
+  // "Fix everything" queues every row that is both fixable and not already ok,
+  // and runs them one at a time through the same runFix a single row's button
+  // calls — there is still exactly one fix in flight ever, just chosen from a
+  // list instead of a click each time.
+  property var fixQueue: []
+
+  function runFixAll() {
+    if (!root.setupRows) return
+    var ids = []
+    for (var i = 0; i < root.setupRows.length; i++) {
+      var r = root.setupRows[i]
+      if (r && r.fixable && (r.state === "needs_action" || r.state === "broken")) ids.push(r.id)
+    }
+    root.fixQueue = ids
+    root.runNextQueued()
+  }
+
+  function runNextQueued() {
+    if (root.fixQueue.length === 0) return
+    var id = root.fixQueue[0]
+    root.fixQueue = root.fixQueue.slice(1)
+    root.runFix(id)
   }
 
   // Set when a switch was authorised and then never arrived. The engine is the
@@ -1334,6 +1380,13 @@ Panel {
     onTriggered: root.captureNote = ""
   }
 
+  Timer {
+    id: fixedRowTimer
+    interval: 5000
+    repeat: false
+    onTriggered: root.lastFixedRow = ""
+  }
+
   // How long the running fix has been running. A Setup step that installs
   // something can take seconds, and a button that goes quiet is indistinguishable
   // from one that did nothing.
@@ -1544,7 +1597,15 @@ Panel {
         boundsBehavior: Flickable.StopAtBounds
         flickableDirection: Flickable.VerticalFlick
         interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        ScrollBar.vertical: ScrollBar {
+          policy: ScrollBar.AsNeeded
+          // The default overlay spans the whole Flickable top to bottom, so its
+          // track sat across the hero's gear and back-arrow buttons at every
+          // scroll position — that is the "scrolling line" over the corner
+          // controls. Starting it below the hero (+ its separator + the
+          // Column's own spacing) keeps those two controls clear of it.
+          anchors.topMargin: hero.height + heroSeparator.height + Style.space(12)
+        }
         // Scrolling a sixty-row list is the clearest possible sign this was
         // not a misclick, and it was the main thing closing the panel mid-read.
         onMovementStarted: root.keepAlive()
@@ -1555,6 +1616,7 @@ Panel {
         spacing: Style.space(12)
 
         PanelHero {
+          id: hero
           width: parent.width
           title: root.viewTitle()
           // Empty outside the picker: the pill names the profile you are IN,
@@ -1606,7 +1668,7 @@ Panel {
           }
         }
 
-        PanelSeparator { foreground: root.foreground }
+        PanelSeparator { id: heroSeparator; foreground: root.foreground }
 
         // ---------------------------------------------------------- picker
 

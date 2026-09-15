@@ -25,6 +25,16 @@ Column {
   readonly property var rows: (panel && panel.setupRows) ? panel.setupRows : []
   readonly property string outcome: panel ? panel.setupOutcome : ""
 
+  readonly property int fixableCount: {
+    var n = 0
+    for (var i = 0; i < view.rows.length; i++) {
+      var r = view.rows[i]
+      if (r && r.fixable && (r.state === "needs_action" || r.state === "broken")) n++
+    }
+    return n
+  }
+  readonly property bool queueRunning: !!panel && (panel.fixQueue.length > 0 || panel.pendingSetup !== "")
+
   width: parent ? parent.width : implicitWidth
   spacing: Style.space(8)
 
@@ -33,6 +43,28 @@ Column {
     if (state === "needs_action" || state === "broken") return "bad"
     if (state === "absent") return "dim"
     return "unknown"
+  }
+
+  // One button for "do everything a button can do here" — clicking each
+  // row's own Fix in turn is the same three or four polkit-free calls,
+  // just slower to ask for. It runs them one at a time, same as a person
+  // clicking down the list, and stops at the first failure rather than
+  // guessing whether the rest are still worth trying.
+  Button {
+    width: parent.width
+    visible: view.fixableCount > 1
+    enabled: !view.queueRunning
+    text: view.queueRunning
+          ? ("Fixing… " + (panel ? panel.fixQueue.length + (panel.pendingSetup !== "" ? 1 : 0) : 0) + " left")
+          : ("Fix everything (" + view.fixableCount + ")")
+    bordered: true
+    foreground: view.foreground
+    fontFamily: view.fontFamily
+    onClicked: {
+      if (!view.panel) return
+      view.panel.keepAlive()
+      view.panel.runFixAll()
+    }
   }
 
   // Three things this can be showing, and they must never be confused: an
@@ -132,7 +164,7 @@ Column {
           id: fixButton
           anchors.verticalCenter: parent.verticalCenter
           visible: row.fixable && (row.state === "needs_action" || row.state === "broken")
-          enabled: !!view.panel && view.panel.pendingSetup === ""
+          enabled: !!view.panel && view.panel.pendingSetup === "" && !view.queueRunning
           text: row.running
                 ? ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
                 : "Fix"
@@ -145,6 +177,19 @@ Column {
             view.panel.keepAlive()
             view.panel.runFix(row.rowId)
           }
+        }
+
+        // Fix's own result is a colour change on a row someone may already
+        // have scrolled past — say it plainly for a few seconds instead.
+        Text {
+          textFormat: Text.PlainText
+          visible: !!view.panel && view.panel.lastFixedRow === row.rowId
+          anchors.verticalCenter: parent.verticalCenter
+          text: "✓ Fixed"
+          color: Color.good
+          font.family: view.fontFamily
+          font.pixelSize: Style.font.caption
+          font.bold: true
         }
       }
     }
