@@ -5744,13 +5744,24 @@ cmd_purge() {
   # ----------------------------------------------------------------- step 10
   [[ $plugin == pending ]] || return 0
   command -v omarchy >/dev/null || return 0
-  # Nothing is attached any more, and the reload this triggers kills whoever
-  # was. Bash keeps reading a script whose file has been deleted — the open
-  # descriptor keeps the inode — so removing the directory this is running from
-  # is safe.
-  exec >/dev/null 2>&1
-  omarchy plugin remove "$pid" --yes
+  # `omarchy plugin remove` starts by telling the running shell to disable
+  # this exact plugin over IPC (setPluginEnabled false) before it moves a
+  # single file — which tears down this plugin's own QML, including the
+  # `ask()` Process that is this script's parent. A plain child dies with
+  # its parent's process group when that happens, landing mid-removal: the
+  # directory not yet moved to its backup name, still present under its own
+  # name, needing a second `remove` run by hand to actually finish. detach
+  # (§4.9) exists for exactly this shape of problem — forked into its own
+  # process group and disowned, it outlives whatever happens to the process
+  # that started it, the same guarantee switch_stage2 relies on to survive
+  # the shell restart a switch itself causes.
+  detach purge_remove_self "$pid"
   return 0
+}
+
+purge_remove_self() {
+  local pid=$1
+  omarchy plugin remove "$pid" --yes
 }
 
 # What this machine can and cannot do, as state strings. Every fact whose answer
