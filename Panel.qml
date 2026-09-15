@@ -269,7 +269,7 @@ Panel {
   property string setupError: ""
   property int setupElapsed: 0
 
-  function loadSetup(gate) {
+  function loadSetup(gate, then) {
     root.ask(["setup", "status", "--json"], "", function (ok, parsed, code) {
       if (ok && Array.isArray(parsed)) {
         root.setupRows = parsed
@@ -279,6 +279,7 @@ Panel {
         root.setupOutcome = (parsed && parsed.error) ? String(parsed.error) : ("exit " + code)
       }
       if (gate) root.applySetupGate()
+      if (then) then()
     })
   }
 
@@ -338,10 +339,10 @@ Panel {
         var err = parsed && parsed.error ? String(parsed.error) : ("exit " + code)
         root.setupError = err === "busy" ? "Busy — try again when the switch finishes"
                         : "That did not work (" + err + ")"
-        // A failure stops the queue rather than plowing through the rest
-        // blind — the error is exactly the thing to read before trying
+        // A failure stops "fix everything" rather than plowing through the
+        // rest blind — the error is exactly the thing to read before trying
         // whatever comes next.
-        root.fixQueue = []
+        root.fixingAll = false
       } else {
         // The row's own colour changing is not a loud enough "done" — the
         // button that said "Fixing…" just goes quiet, which reads the same
@@ -349,36 +350,43 @@ Panel {
         root.lastFixedRow = id
         fixedRowTimer.restart()
       }
-      // A fix changes what every other row can see, so the whole set is asked
-      // again rather than the one row patched in place.
-      root.loadSetup(false)
-      if (root.fixQueue.length > 0) root.runNextQueued()
+      // A fix changes what every other row can see — including which rows
+      // are now fixable that were not a moment ago, e.g. adopting the
+      // machine is what makes apps/keys/indicator answerable at all — so the
+      // whole set is asked again rather than the one row patched in place,
+      // and "fix everything" picks its next target only once that answer is
+      // back, never from a list decided before this fix ran.
+      root.loadSetup(false, function () { if (root.fixingAll) root.continueFixAll() })
     })
   }
 
   property string lastFixedRow: ""
 
-  // "Fix everything" queues every row that is both fixable and not already ok,
-  // and runs them one at a time through the same runFix a single row's button
-  // calls — there is still exactly one fix in flight ever, just chosen from a
-  // list instead of a click each time.
-  property var fixQueue: []
+  // "Fix everything": keep asking "what, right now, is fixable and not ok"
+  // and fixing the first answer, until nothing is left or one fails. Never a
+  // list decided up front — on a fresh machine most rows only become
+  // fixable once an earlier one (chiefly adopt) has actually finished, and a
+  // queue built at the first click would never learn about them.
+  property bool fixingAll: false
 
-  function runFixAll() {
-    if (!root.setupRows) return
-    var ids = []
+  function nextFixableRow() {
+    if (!root.setupRows) return ""
     for (var i = 0; i < root.setupRows.length; i++) {
       var r = root.setupRows[i]
-      if (r && r.fixable && (r.state === "needs_action" || r.state === "broken")) ids.push(r.id)
+      if (r && r.fixable && (r.state === "needs_action" || r.state === "broken")) return r.id
     }
-    root.fixQueue = ids
-    root.runNextQueued()
+    return ""
   }
 
-  function runNextQueued() {
-    if (root.fixQueue.length === 0) return
-    var id = root.fixQueue[0]
-    root.fixQueue = root.fixQueue.slice(1)
+  function runFixAll() {
+    root.fixingAll = true
+    root.continueFixAll()
+  }
+
+  function continueFixAll() {
+    if (!root.fixingAll) return
+    var id = root.nextFixableRow()
+    if (id === "") { root.fixingAll = false; return }
     root.runFix(id)
   }
 
@@ -1121,6 +1129,13 @@ Panel {
   implicitHeight: button.implicitHeight
 
   onOpenedChanged: if (opened) {
+    // Every open starts at the picker, not wherever it was left — closing
+    // the panel mid-errand (Settings, Config, an edit form) used to leave
+    // the view stack exactly as it was, so the next open landed back on
+    // that same page every time, no matter how long it had been shut.
+    // applySetupGate (below, once loadSetup answers) still overrides this
+    // to Setup when adoption or a switch is genuinely unresolved.
+    root.resetView("picker")
     // Fresh arm: this open might be the misclick.
     touchedSinceOpen = false
     cursorActive = false
@@ -1477,7 +1492,8 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(300))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(520))
+    contentHeight: panel.fittedContentHeight(
+      headerColumn.implicitHeight + Style.space(12) + column.implicitHeight, Style.space(520))
 
     // Anchored over the whole panel, and deliberately NOT a Column child: QML
     // refuses anchors inside a Column, and without them the dialog was laid
@@ -1581,31 +1597,18 @@ Panel {
       // over the desktop. clip + StopAtBounds keeps it inside; `interactive`
       // engages only when there is genuinely more than fits, so short views
       // still behave like a static panel rather than a scroll area.
-      Flickable {
-        id: flick
-        anchors.fill: parent
-        contentWidth: width
-        contentHeight: column.implicitHeight
-        clip: true
-        boundsBehavior: Flickable.StopAtBounds
-        flickableDirection: Flickable.VerticalFlick
-        interactive: contentHeight > height
-        ScrollBar.vertical: ScrollBar {
-          policy: ScrollBar.AsNeeded
-          // The default overlay spans the whole Flickable top to bottom, so its
-          // track sat across the hero's gear and back-arrow buttons at every
-          // scroll position — that is the "scrolling line" over the corner
-          // controls. Starting it below the hero (+ its separator + the
-          // Column's own spacing) keeps those two controls clear of it.
-          anchors.topMargin: hero.height + heroSeparator.height + Style.space(12)
-        }
-        // Scrolling a sixty-row list is the clearest possible sign this was
-        // not a misclick, and it was the main thing closing the panel mid-read.
-        onMovementStarted: root.keepAlive()
-
+      // The hero (title, gear/back) and its rule, fixed above the scroll
+      // area rather than the Column's first two children. They used to
+      // scroll with everything else, which put them inside the Flickable's
+      // own bounds — the same bounds its ScrollBar overlay spans top to
+      // bottom, so the track sat across the gear and back-arrow at every
+      // scroll position. Outside the Flickable entirely, that overlap is
+      // not possible regardless of how tall either one measures out to be.
       Column {
-        id: column
-        width: flick.width
+        id: headerColumn
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
         spacing: Style.space(12)
 
         PanelHero {
@@ -1662,6 +1665,30 @@ Panel {
         }
 
         PanelSeparator { id: heroSeparator; foreground: root.foreground }
+      }
+
+      Flickable {
+        id: flick
+        anchors.top: headerColumn.bottom
+        anchors.topMargin: Style.space(12)
+        anchors.left: parent.left
+        anchors.right: parent.right
+        anchors.bottom: parent.bottom
+        contentWidth: width
+        contentHeight: column.implicitHeight
+        clip: true
+        boundsBehavior: Flickable.StopAtBounds
+        flickableDirection: Flickable.VerticalFlick
+        interactive: contentHeight > height
+        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+        // Scrolling a sixty-row list is the clearest possible sign this was
+        // not a misclick, and it was the main thing closing the panel mid-read.
+        onMovementStarted: root.keepAlive()
+
+      Column {
+        id: column
+        width: flick.width
+        spacing: Style.space(12)
 
         // ---------------------------------------------------------- picker
 

@@ -149,12 +149,15 @@ Column {
       font.pixelSize: Style.font.caption
     }
 
+    // Red and named for what it does — the one button on this screen that
+    // cannot be undone (short of the copy this same click can also make).
     Button {
       width: parent.width
       enabled: !view.busy
-      text: view.busy ? "Working…" : "Remove everything"
+      text: view.busy ? "Working…" : "Uninstall everything"
       bordered: true
-      foreground: view.foreground
+      foreground: Color.urgent
+      accent: Color.urgent
       fontFamily: view.fontFamily
       onClicked: {
         if (!view.panel) return

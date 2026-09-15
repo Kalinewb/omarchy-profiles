@@ -98,6 +98,7 @@ Column {
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
       text: "Capture now"
+      tooltipText: "Saves this desk as it is right now. A switch does this for you."
       bordered: true
       foreground: root.foreground
       fontFamily: root.fontFamily
@@ -106,16 +107,15 @@ Column {
     }
   }
 
+  // Only the receipt, and only while it is up — the explanation itself now
+  // lives on the button's own hover tooltip instead of sitting here always.
   Text {
     textFormat: Text.PlainText
     width: parent.width
     wrapMode: Text.WordWrap
-    // The receipt replaces the explanation while it is up: a capture leaves
-    // nothing else on screen to show it happened.
-    text: root.captureNote !== "" ? root.captureNote
-          : "Saves this desk as it is right now. A switch does this for you."
-    color: root.captureNote === "" ? root.dim
-           : root.captureFailed ? Color.urgent : root.accent
+    visible: root.captureNote !== ""
+    text: root.captureNote
+    color: root.captureFailed ? Color.urgent : root.accent
     font.family: root.fontFamily
     font.pixelSize: Style.font.caption
   }
@@ -356,7 +356,7 @@ Column {
 
         Text {
           textFormat: Text.PlainText
-          text: "Remove Profiles from this machine"
+          text: "Uninstall Profiles from this machine"
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.body
@@ -366,7 +366,7 @@ Column {
           textFormat: Text.PlainText
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "Shows everything that would go first. Nothing is removed until you say so."
+          text: "Every profile, the plugin, everything it installed. Nothing is removed until you say so."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption

@@ -33,7 +33,7 @@ Column {
     }
     return n
   }
-  readonly property bool queueRunning: !!panel && (panel.fixQueue.length > 0 || panel.pendingSetup !== "")
+  readonly property bool queueRunning: !!panel && panel.fixingAll
 
   width: parent ? parent.width : implicitWidth
   spacing: Style.space(8)
@@ -55,7 +55,7 @@ Column {
     visible: view.fixableCount > 1
     enabled: !view.queueRunning
     text: view.queueRunning
-          ? ("Fixing… " + (panel ? panel.fixQueue.length + (panel.pendingSetup !== "" ? 1 : 0) : 0) + " left")
+          ? ("Fixing… " + view.fixableCount + " left")
           : ("Fix everything (" + view.fixableCount + ")")
     bordered: true
     foreground: view.foreground
