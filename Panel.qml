@@ -25,8 +25,8 @@ import qs.Ui
 // this popup, on every single switch.
 Panel {
   id: root
-  moduleName: "graveklar.profiles"
-  ipcTarget: "graveklar.profiles"
+  moduleName: "kalinewb.profiles"
+  ipcTarget: "kalinewb.profiles"
   manageIpc: false
 
   readonly property color foreground: bar ? bar.foreground : Color.foreground
@@ -37,7 +37,7 @@ Panel {
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/current.json"
-  readonly property string engine: home + "/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
+  readonly property string engine: home + "/.config/omarchy/plugins/kalinewb.profiles/bin/omarchy-profile"
 
   readonly property string indexPath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
     + "/omarchy-profiles/profiles.json"
@@ -72,7 +72,7 @@ Panel {
       }
       root.profiles = out
     } catch (e) {
-      console.warn("graveklar.profiles", "Ignoring bad profile index", root.indexPath, e)
+      console.warn("kalinewb.profiles", "Ignoring bad profile index", root.indexPath, e)
     }
   }
 
@@ -421,7 +421,7 @@ Panel {
   // changed index file, so the UI never holds a second copy of the truth.
   function runEngine(args) {
     if (!root.bar || typeof root.bar.run !== "function") {
-      console.warn("graveklar.profiles", "No bar facade to run the engine through")
+      console.warn("kalinewb.profiles", "No bar facade to run the engine through")
       return
     }
     root.bar.run(root.engine + " " + args)
@@ -1109,11 +1109,11 @@ Panel {
         if (arrived) { root.sessionError = ""; root.loadSession() }
         return
       }
-      console.warn("graveklar.profiles", "State file has no profile field", root.statePath)
+      console.warn("kalinewb.profiles", "State file has no profile field", root.statePath)
     } catch (e) {
       // Half-written file, or something that is not JSON. Keep the last known
       // profile rather than blanking the widget.
-      console.warn("graveklar.profiles", "Ignoring bad state file", root.statePath, e)
+      console.warn("kalinewb.profiles", "Ignoring bad state file", root.statePath, e)
     }
   }
 
@@ -1196,7 +1196,7 @@ Panel {
         var parsed = JSON.parse(t)
         if (Array.isArray(parsed)) root.overviewRows = parsed
       } catch (e) {
-        console.warn("graveklar.profiles", "Ignoring bad overview", root.overviewPath, e)
+        console.warn("kalinewb.profiles", "Ignoring bad overview", root.overviewPath, e)
       }
     }
     onLoadFailed: root.overviewRows = []
@@ -1217,7 +1217,7 @@ Panel {
         var parsed = JSON.parse(t)
         if (Array.isArray(parsed)) root.pluginCatalog = parsed
       } catch (e) {
-        console.warn("graveklar.profiles", "Ignoring bad plugin catalog", root.catalogPath, e)
+        console.warn("kalinewb.profiles", "Ignoring bad plugin catalog", root.catalogPath, e)
       }
     }
     onLoadFailed: root.pluginCatalog = []
@@ -1431,10 +1431,10 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
 
-    // omarchy-shell graveklar.profiles current
+    // omarchy-shell kalinewb.profiles current
     function current(): string { return root.currentProfile }
 
-    // omarchy-shell graveklar.profiles set dev
+    // omarchy-shell kalinewb.profiles set dev
     function set(name: string): string {
       var id = String(name || "")
       if (root.indexOf(id) < 0) return "unknown or hidden profile: " + id
@@ -1442,7 +1442,7 @@ Panel {
       return "ok"
     }
 
-    // omarchy-shell graveklar.profiles promptUnlock work
+    // omarchy-shell kalinewb.profiles promptUnlock work
     //
     // How a keybinding asks for a password: `next` has nowhere to type, so it
     // hands the profile here and stops. `login` uses it too.

@@ -103,7 +103,7 @@ ensure_config() {
   # setting — it is whether the profile has a password.
   jq -n '{
     version: 1, master: "master", master_switchable: true,
-    pinned_plugins: ["graveklar.profiles"], workspace_span: 10,
+    pinned_plugins: ["kalinewb.profiles"], workspace_span: 10,
     isolate: []
   }' >"$CONFIG_FILE"
 }
@@ -187,11 +187,11 @@ next_offset() {
 ROOT_STORE=/var/lib/omarchy-profiles
 HELPER_AUTH=/usr/local/bin/omarchy-profile-auth
 HELPER_PASSWD=/usr/local/bin/omarchy-profile-passwd
-POLICY_SRC="$PLUGIN_DIR/polkit/no.graveklar.profiles.policy"
-POLICY_DEST=/usr/share/polkit-1/actions/no.graveklar.profiles.policy
+POLICY_SRC="$PLUGIN_DIR/polkit/no.kalinewb.profiles.policy"
+POLICY_DEST=/usr/share/polkit-1/actions/no.kalinewb.profiles.policy
 # The single-action file this replaces. An install that leaves it registered
 # leaves a stale action behind, so it is removed by name as well as overwritten.
-POLICY_LEGACY=/usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
+POLICY_LEGACY=/usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
 
 profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; }
 
@@ -466,7 +466,7 @@ auth_entry() {
       refuse 1 helper_unavailable "pkcheck is not available, so the owner cannot be asked"
     local start
     start=$(proc_start_time)
-    if pkcheck --action-id no.graveklar.profiles.owner \
+    if pkcheck --action-id no.kalinewb.profiles.owner \
          --process "$$,${start:-0},$UID" --allow-user-interaction >/dev/null 2>&1; then
       audit "entered $name by owner authorisation (locked without a password)"
       return 0
@@ -1164,7 +1164,7 @@ hypr_reload_probe() {
       if [[ $kind == int ]]; then want=$((${v%.*} + 3))
       else want=$(awk -v x="$v" 'BEGIN { printf "%.3f", x + 0.17 }'); fi
 
-      printf '%s\n\n-- graveklar.profiles reload probe; removed again immediately\nhl.config({ %s = { %s = %s } })\n' \
+      printf '%s\n\n-- kalinewb.profiles reload probe; removed again immediately\nhl.config({ %s = { %s = %s } })\n' \
         "$content" "${key%%:*}" "${key##*:}" "$want" >"$work/looknfeel.lua" || continue
       rm -f "$target"
       ln -sn "$work/looknfeel.lua" "$target" || continue
@@ -1573,7 +1573,7 @@ cmd_shared() {
     echo "$id is now the same in every profile" ;;
   remove)
     [[ -n $id ]] || die "usage: omarchy-profile shared remove <plugin-id>"
-    [[ $id == graveklar.profiles ]] &&
+    [[ $id == kalinewb.profiles ]] &&
       die "the profile picker stays shared — a profile that could hide it would leave no way back"
     cfg_set --arg id "$id" '.pinned_plugins = ((.pinned_plugins // []) | map(select(. != $id)))' ||
       die "could not unpin '$id'"
@@ -3470,7 +3470,7 @@ prompt_unlock() {
   local name=$1 i
   command -v omarchy-shell >/dev/null || return 0
   for i in $(seq 1 10); do
-    omarchy-shell graveklar.profiles promptUnlock "$name" >/dev/null 2>&1 && return 0
+    omarchy-shell kalinewb.profiles promptUnlock "$name" >/dev/null 2>&1 && return 0
     sleep 1
   done
   warn "'$name' asks for a password and no panel answered the prompt"
@@ -4287,7 +4287,7 @@ cmd_next() {
   # otherwise sit on an invisible prompt with no way to answer it.
   if asks_auth "$next"; then
     if command -v omarchy-shell >/dev/null &&
-       omarchy-shell graveklar.profiles promptUnlock "$next" >/dev/null 2>&1; then
+       omarchy-shell kalinewb.profiles promptUnlock "$next" >/dev/null 2>&1; then
       return 0
     fi
     warn "'$next' asks for a password and there is no panel to ask in"
@@ -4345,7 +4345,7 @@ setup_row() {
 # outlives this process. The installed copy wins: a keybinding written from a
 # working tree would break the day that tree moved.
 engine_path() {
-  local installed="$CONFIG_HOME/omarchy/plugins/graveklar.profiles/bin/omarchy-profile"
+  local installed="$CONFIG_HOME/omarchy/plugins/kalinewb.profiles/bin/omarchy-profile"
   if [[ $PLUGIN_DIR == "$CONFIG_HOME/omarchy/plugins/"* ]]; then
     printf '%s\n' "$PLUGIN_DIR/bin/omarchy-profile"
   elif [[ -x $installed ]]; then
@@ -4464,7 +4464,7 @@ setup_row_apps() {
 
 KEYS_FILE="$CONFIG_HOME/hypr/profiles-keys.lua"
 HYPRLAND_LUA="$CONFIG_HOME/hypr/hyprland.lua"
-KEYS_REQUIRE='pcall(require, "hypr.profiles-keys") -- graveklar.profiles: managed, must stay after require("hypr.bindings")'
+KEYS_REQUIRE='pcall(require, "hypr.profiles-keys") -- kalinewb.profiles: managed, must stay after require("hypr.bindings")'
 
 # The whole file is generated, every time. `hl` and `o` are globals in Omarchy's
 # Lua state; the guard makes the file inert anywhere they are not, so a copy of
@@ -4476,7 +4476,7 @@ keys_file_content() {
   engine=${engine//\\/\\\\}
   engine=${engine//\"/\\\"}
   cat <<EOF
--- Managed by Profiles (graveklar.profiles). Setup regenerates this file; edits are overwritten.
+-- Managed by Profiles (kalinewb.profiles). Setup regenerates this file; edits are overwritten.
 if not (hl and o) then return end
 local engine = "$engine"
 for w = 1, 10 do
@@ -4514,12 +4514,12 @@ keys_handwritten() {
   for f in "$CONFIG_HOME"/hypr/*.lua; do
     [[ -f $f ]] || continue
     [[ $f == "$KEYS_FILE" ]] && continue
-    grep -nF 'graveklar.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
+    grep -nF 'kalinewb.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
       cut -d: -f1 | sed "s|^|$f:|"
   done
   for f in "$ISOLATE_DIR"/*/.config%hypr%bindings.lua; do
     [[ -f $f ]] || continue
-    grep -nF 'graveklar.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
+    grep -nF 'kalinewb.profiles/bin/omarchy-profile' -- "$f" 2>/dev/null |
       cut -d: -f1 | sed "s|^|$f:|"
   done
 }
@@ -4650,7 +4650,7 @@ keys_fix() {
 # The bar's workspace numbers have to be relabelled per profile, and there is no
 # hook for that — the widget has to be replaced. `omarchy plugin clone` makes a
 # copy of the stock one under an id derived from the username, which is why the
-# id is discovered and never written down: it is graveklar.workspaces here and
+# id is discovered and never written down: it is kalinewb.workspaces here and
 # alice.workspaces on someone else's machine.
 STOCK_WORKSPACES="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/bar/widgets/Workspaces.qml"
 
@@ -4851,10 +4851,10 @@ for h in omarchy-profile-auth omarchy-profile-passwd; do
   [ -f "$plugin/bin/$h" ] || { echo "missing $plugin/bin/$h" >&2; exit 1; }
   install -o root -g root -m 0755 "$plugin/bin/$h" "/usr/local/bin/$h"
 done
-policy=$plugin/polkit/no.graveklar.profiles.policy
+policy=$plugin/polkit/no.kalinewb.profiles.policy
 [ -f "$policy" ] || { echo "missing $policy" >&2; exit 1; }
-install -o root -g root -m 0644 "$policy" /usr/share/polkit-1/actions/no.graveklar.profiles.policy
-rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
+install -o root -g root -m 0644 "$policy" /usr/share/polkit-1/actions/no.kalinewb.profiles.policy
+rm -f /usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
 install -d -o root -g root -m 0711 /var/lib/omarchy-profiles
 install -d -o root -g root -m 0711 /var/lib/omarchy-profiles/passwords
 install -d -o root -g root -m 0755 /var/lib/omarchy-profiles/identity
@@ -4948,9 +4948,9 @@ face_answers_polkit() {
 
 policy_annotated() {
   command -v pkaction >/dev/null || return 2
-  pkaction --action-id no.graveklar.profiles.auth --verbose 2>/dev/null |
+  pkaction --action-id no.kalinewb.profiles.auth --verbose 2>/dev/null |
     grep -q 'exec.path.*omarchy-profile-auth' || return 1
-  pkaction --action-id no.graveklar.profiles.owner --verbose 2>/dev/null |
+  pkaction --action-id no.kalinewb.profiles.owner --verbose 2>/dev/null |
     grep -q 'exec.path.*omarchy-profile-passwd' || return 1
   return 0
 }
@@ -4958,7 +4958,7 @@ policy_annotated() {
 legacy_action_present() {
   [[ -e $POLICY_LEGACY ]] && return 0
   command -v pkaction >/dev/null || return 1
-  pkaction 2>/dev/null | grep -qx 'no.graveklar.profiles.unlock'
+  pkaction 2>/dev/null | grep -qx 'no.kalinewb.profiles.unlock'
 }
 
 # Only ever run after the annotation has been seen, so a status query can never
@@ -5237,7 +5237,7 @@ cmd_setup() {
 # backups they are put back from go. Each of those, done the other way round,
 # leaves something the user cannot recover without knowing what this plugin did.
 
-PURGE_PLUGIN_ID="graveklar.profiles"
+PURGE_PLUGIN_ID="kalinewb.profiles"
 
 # This copy of the plugin's own id, from its manifest — the same lookup the
 # indicator uses for the clone, and for the same reason: an id written down in
@@ -5859,7 +5859,7 @@ is in the panel: click the Profiles icon on the bar, then Manage.
 
 If the shell will not start, this switches profiles from a TTY:
 
-  ~/.config/omarchy/plugins/graveklar.profiles/bin/omarchy-profile set <name>
+  ~/.config/omarchy/plugins/kalinewb.profiles/bin/omarchy-profile set <name>
 
 A profile with a password asks for it on the terminal, with nothing echoed.
 

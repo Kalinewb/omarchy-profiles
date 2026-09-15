@@ -13,7 +13,7 @@
 
 set -euo pipefail
 
-ID="graveklar.profiles"
+ID="kalinewb.profiles"
 DEST="${XDG_CONFIG_HOME:-$HOME/.config}/omarchy/plugins/$ID"
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 

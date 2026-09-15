@@ -18,7 +18,7 @@
     auth_admin, and the no-prompt verifier would prompt — breaking every
     password entry. Modelled on omarchy-face's own policy.
   -->
-  <action id="no.graveklar.profiles.auth">
+  <action id="no.kalinewb.profiles.auth">
     <description>Check a profile's password</description>
     <message>Checking a profile password</message>
     <defaults>
@@ -35,7 +35,7 @@
     machine, and "you authorised something five minutes ago" is no evidence at
     all that you are the one standing here now.
   -->
-  <action id="no.graveklar.profiles.owner">
+  <action id="no.kalinewb.profiles.owner">
     <description>Manage profile passwords</description>
     <message>Authentication is required to manage profile passwords</message>
     <defaults>

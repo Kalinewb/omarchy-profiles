@@ -23,7 +23,7 @@ import qs.Ui
 // "which profile am I in" is recorded.
 BarWidget {
   id: root
-  moduleName: "graveklar.workspaces"
+  moduleName: "kalinewb.workspaces"
 
   readonly property string home: Quickshell.env("HOME") || ""
   readonly property string statePath: (Quickshell.env("XDG_STATE_HOME") || home + "/.local/state")
@@ -43,7 +43,7 @@ BarWidget {
       // Keep the last known offset. A half-written file would otherwise strand
       // the bar on another profile's block, which reads as every indicator
       // going dark at once.
-      console.warn("graveklar.workspaces", "Ignoring bad state file", root.statePath, e)
+      console.warn("kalinewb.workspaces", "Ignoring bad state file", root.statePath, e)
     }
   }
 

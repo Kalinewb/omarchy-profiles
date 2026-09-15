@@ -230,8 +230,8 @@ purge)
   #      here is safe, and doing it any earlier would leave the machine with a
   #      helper that could still be invoked while the store was half gone.
   rm -f /usr/local/bin/omarchy-profile-auth
-  rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.policy
-  rm -f /usr/share/polkit-1/actions/no.graveklar.profiles.unlock.policy
+  rm -f /usr/share/polkit-1/actions/no.kalinewb.profiles.policy
+  rm -f /usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
   rm -rf /var/lib/omarchy-profiles
   printf '{"ok":true}\n'
   # Not through log(): the log went with the store two lines ago.
