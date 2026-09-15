@@ -1089,8 +1089,20 @@ Panel {
   // Off master the flow cannot continue by itself: a switch restarts the shell,
   // which takes this panel with it. So this switches, and the user opens the
   // screen again — which is what the button says.
+  //
+  // If purgeOnMaster's own answer (built from the manifest, or purgeRaced) is
+  // stale or wrong while currentProfile — the one property every other view
+  // trusts outright — already says master, apply() would ask the engine to
+  // switch to where it already is. That returns {"ok":true,"already":true},
+  // which apply() treats as a normal successful switch and closes the whole
+  // panel on: no restart, no error, just gone, with nothing telling anyone
+  // why. Reopening only to find the exact same "Switch to master first" is
+  // what that looked like. Checked directly here instead of trusting the
+  // manifest to be caught up: re-reading the purge screen's own state is
+  // what it actually needs, not a switch to somewhere it already is.
   function purgeSwitchToMaster() {
     if (root.masterName === "") return
+    if (root.currentProfile === root.masterName) { root.openPurge(); return }
     root.apply(root.masterName)
   }
 
