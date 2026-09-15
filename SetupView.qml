@@ -45,6 +45,14 @@ Column {
     return "unknown"
   }
 
+  // helpers and polkit are the two rows a fix cannot finish by itself —
+  // both go through the one owner-authorised install call, which raises a
+  // system password dialog this panel never draws and cannot detect. Left
+  // as a plain "Fixing…" the whole screen looked stalled for however long
+  // that dialog sat unanswered, with nothing telling you to go look for it.
+  readonly property bool waitingOnPrompt: !!panel
+    && (panel.pendingSetup === "helpers" || panel.pendingSetup === "polkit")
+
   // One button for "do everything a button can do here" — clicking each
   // row's own Fix in turn is the same three or four polkit-free calls,
   // just slower to ask for. It runs them one at a time, same as a person
@@ -54,11 +62,11 @@ Column {
     width: parent.width
     visible: view.fixableCount > 1
     enabled: !view.queueRunning
-    text: view.queueRunning
-          ? ("Fixing… " + view.fixableCount + " left")
-          : ("Fix everything (" + view.fixableCount + ")")
+    text: !view.queueRunning ? ("Fix everything (" + view.fixableCount + ")")
+          : view.waitingOnPrompt ? "Waiting for your password… (check behind this window)"
+          : ("Fixing… " + view.fixableCount + " left")
     bordered: true
-    foreground: view.foreground
+    foreground: view.waitingOnPrompt ? Color.accent : view.foreground
     fontFamily: view.fontFamily
     onClicked: {
       if (!view.panel) return
@@ -157,19 +165,22 @@ Column {
           }
         }
 
-        // No terminal anywhere, and no pkexec either: a fix that needs root is
-        // the engine's to raise, through polkit's own agent. None of the rows
-        // that exist yet do, so the key glyph arrives with the ones that will.
+        // No terminal anywhere: a fix that needs root raises it through
+        // polkit's own agent, not a terminal this panel would have to open.
+        // helpers and polkit share that one owner-authorised call, and this
+        // panel has no way to know a system dialog is up — only that the
+        // call is taking longer than the ones that never raise one.
         Button {
           id: fixButton
           anchors.verticalCenter: parent.verticalCenter
           visible: row.fixable && (row.state === "needs_action" || row.state === "broken")
           enabled: !!view.panel && view.panel.pendingSetup === "" && !view.queueRunning
-          text: row.running
-                ? ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
-                : "Fix"
+          text: !row.running ? "Fix"
+                : (row.rowId === "helpers" || row.rowId === "polkit")
+                  ? "Check for a password prompt…"
+                  : ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
           bordered: true
-          foreground: view.foreground
+          foreground: (row.running && (row.rowId === "helpers" || row.rowId === "polkit")) ? Color.accent : view.foreground
           fontFamily: view.fontFamily
           fontSize: Style.font.caption
           onClicked: {
