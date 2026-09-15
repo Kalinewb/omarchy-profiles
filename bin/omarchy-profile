@@ -5161,7 +5161,18 @@ cmd_setup() {
       apply_app_visibility "$cur"
       echo "applied '$cur''s applications" ;;
     keys) keys_fix || exit 1 ;;
-    indicator) indicator_fix ;;
+    indicator)
+      # Cloning or enabling the indicator widget ends in omarchy-shell's own
+      # rescanPlugins (or an equivalent reload for enable/disable), which
+      # reloads every panel in the shell — this one included, the same way
+      # finishing an interrupted switch does (below). Detached, the actual
+      # clone/patch/enable/disable survives that reload instead of dying
+      # with the ask() call that started it; the row picks up the real
+      # result on the next status poll rather than this call reporting it
+      # directly, so a "did it work" from the GUI could still be wrong for
+      # the few hundred ms the reload takes.
+      echo "working on the workspace indicator"
+      detach indicator_fix ;;
     switch)
       # Filing a held path leaves it absent at the path, so the active profile's
       # own copy can be linked in afterwards — seeding a tier-3 one if that
