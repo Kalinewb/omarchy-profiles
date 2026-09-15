@@ -5690,6 +5690,31 @@ cmd_purge() {
   # ------------------------------------------------------------------ step 5
   local keys; keys=$(purge_keys)
 
+  # From here on every step either removes a plugin (the indicator's clone,
+  # then this one) or waits on the owner's password — and removing or
+  # enabling a plugin ends in omarchy-shell's own rescanPlugins (or the
+  # equivalent reload for enable/disable), which reloads every panel in the
+  # shell. This one included: as a plain, still-attached continuation of
+  # this function, killed here mid-reload, purge would die with the
+  # workspace keys and indicator already gone but the root store, the
+  # helpers and the plugin itself all still in place — exactly the
+  # half-finished state that read as needing a second Uninstall click to
+  # actually finish. detach (§4.9) already protects switch_stage2 and used
+  # to protect only the final self-removal here; the whole rest of the
+  # function from this point on needed the same guarantee, not just the
+  # last step of it. The state lock survives with it — a background job
+  # forked with `&` inherits fd 8, so it stays held until purge_finish
+  # itself exits, the same way switch_stage2 holds it across the restart
+  # a switch causes.
+  answer '{"ok":true,"finishing":true}' \
+    "removed. $moved window(s) moved, $restored file(s) put back — finishing the rest now."
+  detach purge_finish "$keep_indicator"
+  return 0
+}
+
+purge_finish() {
+  local keep_indicator=$1
+
   # ------------------------------------------------------------------ step 6
   local indicator=absent id
   id=$(indicator_id)
@@ -5713,9 +5738,9 @@ cmd_purge() {
   # ------------------------------------------------------------------ step 7
   #
   # After everything unprivileged, so a declined owner prompt cannot leave the
-  # rest undone — and never fatal: the answer is the exact commands to finish it
-  # with, and the purge carries on.
-  local root=absent commands='[]'
+  # rest undone — and never fatal: the exact commands to finish it with are
+  # logged, and the purge carries on.
+  local root=absent
   local root_cmds=(
     "rm -f $HELPER_AUTH $HELPER_PASSWD"
     "rm -f $POLICY_DEST $POLICY_LEGACY"
@@ -5729,7 +5754,6 @@ cmd_purge() {
       clear_secrets
     fi
     if [[ $root != removed ]]; then
-      commands=$(printf '%s\n' "${root_cmds[@]}" | jq -Rsc 'split("\n") | map(select(length > 0))')
       warn "the root-owned half was not removed. As root:"
       local c; for c in "${root_cmds[@]}"; do warn "  $c"; done
     fi
@@ -5738,40 +5762,19 @@ cmd_purge() {
   # ------------------------------------------------------------------ step 8
   rm -rf "${PROFILE_DIR:?}" "${STATE_DIR:?}" "${RUNTIME_DIR:?}" 2>/dev/null
 
+  echo "finished: keys=$keys indicator=$indicator root=$root"
+
   # ------------------------------------------------------------------ step 9
   #
-  # The answer goes out before the plugin is removed, because removing it
-  # reloads every panel in the shell — including the one waiting for this.
-  local plugin=absent pid; pid=$(purge_plugin_id)
-  [[ -d $PLUGIN_ROOT/$pid ]] && plugin=pending
-  answer "$(jq -nc --argjson w "$moved" --argjson s "$restored" \
-              --arg k "$keys" --arg i "$indicator" --arg r "$root" \
-              --argjson c "$commands" --arg p "$plugin" \
-              '{ok: true, windows_moved: $w, paths_restored: $s, keys: $k,
-                indicator: $i, root: $r, commands: $c,
-                plugin: (if $p == "pending" then "removed" else $p end)}')" \
-           "removed. $moved window(s) moved, $restored file(s) put back."
+  # Nothing is listening for this any more — the caller already got its
+  # answer before step 6, precisely because nothing past this point can be
+  # guaranteed to reach it. Logged for anyone reading $SWITCH_LOG, not
+  # reported anywhere else.
+  local pid; pid=$(purge_plugin_id)
+  [[ -d $PLUGIN_ROOT/$pid ]] || return 0
 
   # ----------------------------------------------------------------- step 10
-  [[ $plugin == pending ]] || return 0
   command -v omarchy >/dev/null || return 0
-  # `omarchy plugin remove` starts by telling the running shell to disable
-  # this exact plugin over IPC (setPluginEnabled false) before it moves a
-  # single file — which tears down this plugin's own QML, including the
-  # `ask()` Process that is this script's parent. A plain child dies with
-  # its parent's process group when that happens, landing mid-removal: the
-  # directory not yet moved to its backup name, still present under its own
-  # name, needing a second `remove` run by hand to actually finish. detach
-  # (§4.9) exists for exactly this shape of problem — forked into its own
-  # process group and disowned, it outlives whatever happens to the process
-  # that started it, the same guarantee switch_stage2 relies on to survive
-  # the shell restart a switch itself causes.
-  detach purge_remove_self "$pid"
-  return 0
-}
-
-purge_remove_self() {
-  local pid=$1
   omarchy plugin remove "$pid" --yes
 }
 
