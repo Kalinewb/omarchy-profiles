@@ -4736,16 +4736,6 @@ indicator_fix() {
     omarchy plugin disable omarchy.workspaces >/dev/null 2>&1 ||
       warn "could not disable the stock omarchy.workspaces widget"
   fi
-  # Each of the three calls above ends in omarchy-shell's own rescanPlugins
-  # (or the equivalent reload for enable/disable) on its own schedule, not
-  # ours — up to three partial reloads rather than one clean one, and
-  # whichever of them the row's own status happened to be read against.
-  # A deliberate restart here, last, after every file and enable/disable
-  # decision is already settled, replaces however many incidental ones
-  # already happened with exactly one — the same restart_shell a switch
-  # uses, and this function already runs detached (§4.9's detach), so it is
-  # not itself at risk from any of the reloads on the way here.
-  restart_shell
   return 0
 }
 
