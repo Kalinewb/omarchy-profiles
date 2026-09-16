@@ -120,7 +120,14 @@ machine, a desk left unattended for a minute.
 **Editing settings cannot take it off.** The password is stored hashed, in a place
 only the system can write, so changing a profile's configuration does not remove
 it. Changing or removing it needs that password or the machine's owner. The same
-goes for a face bound to a profile: only the owner can bind or change one.
+goes for a face bound to a profile: binding or changing one asks for the
+profile's password, or the owner.
+
+**Giving a profile its first password asks nobody.** A desk without one opens for
+anyone at the keyboard, so putting one on takes nothing away — and the person
+using a desk can protect it without fetching the owner. If someone locks a desk
+that was not theirs, the owner resets it — which also takes off any face bound
+with that password.
 
 **It is not a security boundary**, and no setting here makes it one:
 
@@ -136,7 +143,7 @@ and a separate login, and this is not that.
 A bound face is a **shortcut**, not a second lock. It saves typing the password;
 the password always works.
 
-**If face unlock answers system prompts.** Setting, resetting or clearing a password
+**If face unlock answers system prompts.** Resetting or clearing a password
 as the machine's owner goes through the system authentication prompt. If that prompt
 accepts your face, it accepts it for any program you run — so while you sit in front
 of the camera, a program could reset a profile's password without you typing

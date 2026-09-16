@@ -103,6 +103,8 @@ Panel {
   // Owned here, not by the manage view: a ConfirmDialog needs anchors, and a
   // Column child may not have them.
   property string pendingRemoval: ""
+  // {path, current, differs} while "Same as master" waits to be confirmed.
+  property var pendingShare: null
 
   // Which profile the settings view is editing.
   property string settingsProfile: ""
@@ -200,7 +202,31 @@ Panel {
     })
   }
 
+  // "Same as master" makes the active profile's copy the one every profile
+  // uses. The others are kept on disk and come back with "Separate", but that
+  // is invisible, so it asks first whenever another profile's copy differs.
   function isolateRemove(path) {
+    root.configError = ""
+    root.ask(["isolate", "differs", path, "--json"], "", function (ok, parsed) {
+      var others = (ok && parsed && Array.isArray(parsed.differs)) ? parsed.differs : []
+      if (others.length === 0) { root.isolateRemoveNow(path); return }
+      root.pendingShare = { path: path, current: String(parsed.current || ""), differs: others }
+    })
+  }
+
+  function shareMessage() {
+    var p = root.pendingShare
+    if (!p) return ""
+    var names = p.differs.map(function (n) { return root.label(n) })
+    var list = names.length === 1 ? names[0]
+      : names.slice(0, -1).join(", ") + " and " + names[names.length - 1]
+    var file = String(p.path).replace(/^.*\//, "")
+    return "Use " + root.label(p.current) + "'s " + file + " in every profile?\n\n"
+      + list + (names.length === 1 ? " has its own copy" : " have their own copies")
+      + ", which stop being used. They are kept, and come back if you choose Separate again."
+  }
+
+  function isolateRemoveNow(path) {
     root.configError = ""
     root.ask(["isolate", "remove", path, "--json"], "", function (ok, parsed) {
       if (!ok) {
@@ -644,6 +670,8 @@ Panel {
     else if (mode === "clear") args = ["password", "clear", id, "--json"]
     else if (mode === "remove") args = ["remove", id, "--json"]
     else if (mode === "rename") args = ["rename", id, root.passwordArg, "--json"]
+    else if (mode === "bind") args = ["identity", "bind", id, root.passwordArg, "--json"]
+    else if (mode === "unbind") args = ["identity", "clear", id, "--json"]
     if (!args) return
     root.passwordError = ""
     root.ask(args, secret, function (ok, parsed, code) {
@@ -700,24 +728,20 @@ Panel {
     })
   }
 
-  // Both of these are the owner's to decide, and polkit's agent draws that
-  // prompt for itself: nothing here collects it, and nothing here can proceed
-  // without it. The engine rewrites the index, so the binding arrives back the
+  // Both of these ask for the profile's own password, through the same prompt
+  // as everything else — whoever can open the desk can choose the face that
+  // opens it. The prompt also offers the owner's override, which polkit draws
+  // for itself. The engine rewrites the index, so the binding arrives back the
   // same way every other change does.
   function bindIdentity(profile, identity) {
     root.faceError = ""
-    root.ask(["identity", "bind", profile, identity, "--json"], "", function (ok, parsed) {
-      if (ok) return
-      root.faceError = root.faceRefusal(parsed)
-    })
+    root.passwordArg = identity
+    root.beginManage(profile, "bind")
   }
 
   function clearIdentity(profile) {
     root.faceError = ""
-    root.ask(["identity", "clear", profile, "--json"], "", function (ok, parsed) {
-      if (ok) return
-      root.faceError = root.faceRefusal(parsed)
-    })
+    root.beginManage(profile, "unbind")
   }
 
   function faceRefusal(parsed) {
@@ -777,6 +801,10 @@ Panel {
       root.loadSetup(true)
       root.pushView("setup")
       return
+    } else if (err === "face_absent" || err === "no_such_identity") {
+      root.passwordError = root.faceRefusal(parsed)
+    } else if (err === "already_set") {
+      root.passwordError = "It already has a password — change it instead"
     } else if (err === "stale_password") {
       root.passwordError = "A password is still stored under that name — clear it in Setup"
     } else if (err === "interrupted_switch" || err === "held_paths") {
@@ -828,8 +856,8 @@ Panel {
                   hint: "back returns to the list · closes itself if left alone" },
     "overview": { title: "What is open",    meta: "Nothing closes when you switch",
                   hint: "measured from each window's cgroup, not estimated" },
-    "config":   { title: "Configuration",   meta: "What a desk is, and what every desk shares",
-                  hint: "back returns to the list · the lower groups apply to every profile" },
+    "config":   { title: "Configuration",   meta: "This profile, and what all profiles share",
+                  hint: "back returns to the list · the top is this profile, the rest is all of them" },
     "setup":    { title: "Setup",           meta: "What has to be true before this works",
                   hint: "each row is one thing; Fix does it for you" },
     "edit":     { title: "Edit profile",    meta: "Its name, its icon, and the line under it",
@@ -1380,7 +1408,7 @@ Panel {
     // question waiting for an answer, and timing it out would dismiss it
     // without the user deciding.
     running: root.opened && !root.touchedSinceOpen
-             && root.pendingRemoval === "" && root.pendingClose === ""
+             && root.pendingRemoval === "" && root.pendingClose === "" && root.pendingShare === null
              && root.passwordFor === "" && root.pendingSetup === ""
              && root.view !== "purge"
     onTriggered: if (root.opened && !root.touchedSinceOpen) root.close()
@@ -1547,6 +1575,24 @@ Panel {
         root.ask(["remove", name, "--json"], "", function (ok, parsed, code) {
           if (!ok) root.handleAuthError(name, parsed, code)
         })
+      }
+    }
+
+    ConfirmDialog {
+      id: shareDialog
+      anchors.fill: parent
+      z: 10
+      opened: root.pendingShare !== null
+      message: root.shareMessage()
+      confirmText: root.pendingShare ? "Use " + root.label(root.pendingShare.current) + "'s copy" : "Confirm"
+      cancelText: "Cancel"
+      foreground: root.foreground
+      fontFamily: root.fontFamily
+      onCanceled: root.pendingShare = null
+      onConfirmed: {
+        var path = root.pendingShare ? root.pendingShare.path : ""
+        root.pendingShare = null
+        if (path !== "") root.isolateRemoveNow(path)
       }
     }
 

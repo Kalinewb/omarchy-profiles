@@ -11,7 +11,9 @@
     the authentication, and asking the machine owner for theirs on top would
     mean nobody could open their own desk without the owner standing there. The
     helper behind this action cannot do anything that is not gated by that
-    password — it cannot create a hash, reset one, bind a face or print one.
+    password, with one exception: giving a first password to a profile that has
+    none, which opens for anyone until then. It cannot replace a hash it was not
+    given the password for, bind a face without it, or print one.
 
     The exec.path annotations are not optional. Without them pkexec maps the
     call to its generic org.freedesktop.policykit.exec action, which is

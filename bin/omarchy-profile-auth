@@ -9,12 +9,22 @@
 # Unix user, polkit's auth_self means THE OWNER'S password, and the person
 # using a profile must be able to rotate their own password without borrowing
 # the owner. That is why the privileged code is split in two, and why this half
-# is physically incapable of the owner operations: it can never create a hash
-# where none exists, never reset one, never bind a face, and never print a hash.
+# is physically incapable of the owner operations: it can never replace a hash
+# it was not given the password for, and never print one.
+#
+# The one thing it does without a password is give a password to a profile
+# that has none. Such a desk opens for anyone at the keyboard already, so
+# locking it takes nothing from anybody — and asking the owner to authorise
+# every new password meant nobody could protect their own desk on their own.
+# A password somebody else put on a desk is undone by the owner's `reset`, which
+# also drops any face bound with it.
 #
 #   verify <p>            is this the profile's password
+#   set    <p>            new password on stdin, only where there is no hash
 #   change <p>            old\nnew on stdin, replaces the hash
 #   clear  <p>            deletes the hash
+#   bind   <p> <identity> password on stdin; record whose face opens it
+#   unbind <p>            password on stdin; forget it
 #   rename <old> <new>    moves hash, identity and counter together
 #   remove <p>            deletes hash, identity and counter
 #
@@ -225,6 +235,50 @@ verify)
   ok '{"ok":true}' verified
   ;;
 
+set)
+  # Never over an existing hash: that would be a reset, and a reset is the
+  # owner's. Checked under the lock, so two racing sets cannot both succeed.
+  read_secret
+  NEW_SECRET=$SECRET
+  SECRET=""
+  lock_for "$PROFILE" 9
+  if [[ -e $PASSWORDS/$PROFILE ]]; then fail 1 already_set; fi
+  make_hash
+  # A first password starts with no face. A binding left on a profile with no
+  # password is inert, and whoever sets the password binds one with it.
+  rm -f "$IDENTITY/$PROFILE"
+  write_hash "$PROFILE" "$NEW_HASH"
+  NEW_SECRET=""
+  rm -f "$ATTEMPTS/$PROFILE"
+  ok '{"ok":true}' set
+  ;;
+
+bind)
+  # Gated by the profile's own password, so a face can only be bound by
+  # someone who could already open the desk. Identity still lives root-side:
+  # the profile JSON is writable by anyone running as this user.
+  valid_identity "$ARG" || fail 1 bad_identity_name
+  read_secret
+  lock_for "$PROFILE" 9
+  check_password "$PROFILE"
+  SECRET=""
+  mkdir -p "$IDENTITY" 2>/dev/null || true
+  chmod 0755 "$IDENTITY" 2>/dev/null || true
+  tmp=$(mktemp "$IDENTITY/.$PROFILE.XXXXXX") || fail 1 store_unwritable
+  printf '%s\n' "$ARG" >"$tmp" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  chmod 0644 "$tmp"
+  mv -f "$tmp" "$IDENTITY/$PROFILE" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  ok '{"ok":true}' "bound to $ARG"
+  ;;
+
+unbind)
+  read_secret
+  lock_for "$PROFILE" 9
+  check_password "$PROFILE"
+  rm -f "$IDENTITY/$PROFILE"
+  ok '{"ok":true}' unbound
+  ;;
+
 change)
   read_secret_pair
   SECRET=$OLD_SECRET
@@ -248,7 +302,6 @@ clear)
 rename)
   valid_profile "$ARG" || fail 1 bad_profile_name
   if [[ $ARG == "$PROFILE" ]]; then fail 1 same_name; fi
-  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
   read_secret
   # Both counters, in name order, so two renames crossing each other cannot
   # deadlock waiting for one another's lock.
@@ -259,11 +312,17 @@ rename)
     lock_for "$ARG" 8
     lock_for "$PROFILE" 9
   fi
+  # Under both locks, not before them: `set` can create a hash under the new
+  # name without authentication, and a check made before the locks would let
+  # one land in between.
+  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
   check_password "$PROFILE"
   moved=""
   for d in "$PASSWORDS" "$IDENTITY" "$ATTEMPTS"; do
     [[ -e $d/$PROFILE ]] || continue
-    if mv -n "$d/$PROFILE" "$d/$ARG"; then
+    # `mv -n` exits 0 without moving when the target exists, so the result is
+    # checked rather than its exit status.
+    if mv -n "$d/$PROFILE" "$d/$ARG" && [[ ! -e $d/$PROFILE && -e $d/$ARG ]]; then
       moved="$moved $d"
     else
       # Partial failure puts everything back rather than leaving a profile

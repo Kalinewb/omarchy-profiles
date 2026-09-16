@@ -3,7 +3,8 @@ import qs.Commons
 import qs.Ui
 
 // Configuration: what a profile is, and what is allowed to differ between
-// profiles.
+// profiles. Every machine-wide row answers one question in the same two words,
+// "Same as master" or "Separate", explained once where that half begins.
 //
 // The first group is display only — theme, wallpaper, bar, counts — because
 // those things are always the profile's own and are changed where they live.
@@ -80,7 +81,7 @@ Column {
 
   PanelSectionHeader {
     width: parent.width
-    text: "THIS DESK"
+    text: "ONLY " + (view.panel ? String(view.panel.label(view.profile)).toUpperCase() : view.profile.toUpperCase())
     foreground: view.foreground
     fontFamily: view.fontFamily
   }
@@ -89,7 +90,7 @@ Column {
     textFormat: Text.PlainText
     width: parent.width
     wrapMode: Text.WordWrap
-    text: "These are what a profile is. They are always its own."
+    text: "Always this profile's own. Change them while you are in it and they are kept when you leave."
     color: view.dim
     font.family: view.fontFamily
     font.pixelSize: Style.font.caption
@@ -222,11 +223,15 @@ Column {
 
   PanelSeparator { foreground: view.foreground }
 
-  // --------------------------------------------------------- 2 · plugin data
+  // ------------------------------------------------- 2 · what profiles share
+  //
+  // Everything from here down is one decision for the whole machine, and every
+  // row answers the same question with the same two words. Said once, here,
+  // before the first row — not under the last one.
 
   PanelSectionHeader {
     width: parent.width
-    text: "PLUGIN DATA"
+    text: "ALL PROFILES"
     foreground: view.foreground
     fontFamily: view.fontFamily
   }
@@ -235,8 +240,37 @@ Column {
     textFormat: Text.PlainText
     width: parent.width
     wrapMode: Text.WordWrap
-    text: "Changes here apply to every profile."
+    text: "Everything below is set once for the whole machine, not per profile."
     color: view.accent
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.caption
+  }
+
+  Column {
+    width: parent.width
+    spacing: Style.space(2)
+
+    LegendRow { term: "Same as master"; meaning: "every profile uses master's copy — a change made in any of them changes it for all" }
+    LegendRow { term: "Separate";       meaning: "each profile keeps its own copy, and changes stay in that profile" }
+  }
+
+  Text {
+    textFormat: Text.PlainText
+    width: parent.width
+    topPadding: Style.space(6)
+    text: "Plugin data"
+    color: view.foreground
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.body
+    font.bold: true
+  }
+
+  Text {
+    textFormat: Text.PlainText
+    width: parent.width
+    wrapMode: Text.WordWrap
+    text: "Sign-ins and settings a plugin keeps in its own files. Separate means, for example, a different Spotify account in each profile."
+    color: view.dim
     font.family: view.fontFamily
     font.pixelSize: Style.font.caption
   }
@@ -269,22 +303,25 @@ Column {
   Text {
     textFormat: Text.PlainText
     width: parent.width
+    visible: view.rows.length === 0 && view.candidates.length === 0
     wrapMode: Text.WordWrap
-    text: "Per-profile: every desk keeps its own copy — each signs in separately."
+    text: "No installed plugin keeps data of its own."
     color: view.dim
     font.family: view.fontFamily
     font.pixelSize: Style.font.caption
   }
 
-  PanelSeparator { foreground: view.foreground }
-
   // ------------------------------------------------------------ 3 · Hyprland
 
-  PanelSectionHeader {
+  Text {
+    textFormat: Text.PlainText
     width: parent.width
-    text: "HYPRLAND"
-    foreground: view.foreground
-    fontFamily: view.fontFamily
+    topPadding: Style.space(6)
+    text: "Hyprland"
+    color: view.foreground
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.body
+    font.bold: true
   }
 
   Text {
@@ -316,7 +353,7 @@ Column {
     textFormat: Text.PlainText
     width: parent.width
     wrapMode: Text.WordWrap
-    text: "Applies live with hyprctl reload, which also re-runs startup commands that are not marked once and resets settings changed on the fly."
+    text: "Separate files are swapped in with hyprctl reload on every switch, which also re-runs startup commands not marked once and undoes settings changed on the fly."
     color: view.dim
     font.family: view.fontFamily
     font.pixelSize: Style.font.caption
@@ -326,27 +363,39 @@ Column {
     textFormat: Text.PlainText
     width: parent.width
     wrapMode: Text.WordWrap
-    text: "monitors.lua, hyprmoncfg-monitors.lua and profiles-keys.lua are not offered: hardware and Setup-managed files stay shared."
+    text: "Monitors and the workspace keys are always the same as master: they describe the hardware and are managed by Setup."
     color: view.dim
     font.family: view.fontFamily
     font.pixelSize: Style.font.caption
   }
 
-  PanelSeparator { foreground: view.foreground }
-
   // --------------------------------------------------------- 4 · custom path
 
-  PanelSectionHeader {
+  Text {
+    textFormat: Text.PlainText
     width: parent.width
-    text: "ANY OTHER FILE"
-    foreground: view.foreground
-    fontFamily: view.fontFamily
+    topPadding: Style.space(6)
+    text: "Other files and folders"
+    color: view.foreground
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.body
+    font.bold: true
+  }
+
+  Text {
+    textFormat: Text.PlainText
+    width: parent.width
+    wrapMode: Text.WordWrap
+    text: "Anything else is the same as master. Pick a file, or type a path and press Enter, to make it separate."
+    color: view.dim
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.caption
   }
 
   Dropdown {
     width: parent.width
     visible: view.candidates.length > 0
-    label: "Known files"
+    label: "Suggested"
     value: ""
     options: {
       var out = [{ value: "", label: "Pick one…" }]
@@ -434,9 +483,7 @@ Column {
         anchors.rightMargin: Style.space(8)
         anchors.verticalCenter: parent.verticalCenter
         textFormat: Text.PlainText
-        // A star on the one the active profile is using right now, the same
-        // mark `isolate list` prints in a terminal.
-        text: (modelData.active ? "* " : "  ") + String(modelData.path)
+        text: String(modelData.path)
         color: view.foreground
         font.family: view.fontFamily
         font.pixelSize: Style.font.caption
@@ -447,7 +494,7 @@ Column {
         id: removeButton
         anchors.right: parent.right
         anchors.verticalCenter: parent.verticalCenter
-        text: "Shared again"
+        text: "Same as master"
         bordered: true
         foreground: view.dim
         fontFamily: view.fontFamily
@@ -467,7 +514,7 @@ Column {
 
   PanelSectionHeader {
     width: parent.width
-    text: "EVERY PROFILE"
+    text: "SHARED WORKSPACE"
     foreground: view.foreground
     fontFamily: view.fontFamily
   }
@@ -658,7 +705,7 @@ Column {
       Text {
         width: parent.width
         textFormat: Text.PlainText
-        text: drow.entry ? String(drow.entry.path) : ""
+        text: drow.entry ? view.shorten(drow.entry.path) : ""
         color: view.dim
         font.family: view.fontFamily
         font.pixelSize: Style.font.caption
@@ -666,38 +713,62 @@ Column {
       }
     }
 
-    Row {
+    ScopeChoice {
       id: dataButtons
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      spacing: Style.space(6)
-
-      Button {
-        text: "Shared"
-        selected: !drow.on
-        foreground: drow.on ? view.dim : view.accent
-        fontFamily: view.fontFamily
-        fontSize: Style.font.caption
-        onClicked: {
-          if (!view.panel || !drow.on) return
-          view.panel.keepAlive()
-          view.panel.isolateRemove(String(drow.entry.path))
-        }
-      }
-
-      Button {
-        text: "Per-profile"
-        selected: drow.on
-        foreground: drow.on ? view.accent : view.dim
-        fontFamily: view.fontFamily
-        fontSize: Style.font.caption
-        onClicked: {
-          if (!view.panel || drow.on) return
-          view.panel.keepAlive()
-          view.panel.isolateAdd(String(drow.entry.path), "", "")
-        }
+      separate: drow.on
+      onPicked: function (separate) {
+        if (!view.panel || separate === drow.on) return
+        view.panel.keepAlive()
+        if (separate) view.panel.isolateAdd(String(drow.entry.path), "", "")
+        else view.panel.isolateRemove(String(drow.entry.path))
       }
     }
+  }
+
+  // "Same as master" or "Separate": the one choice every row on this page
+  // offers, in the same words, so no row needs its own legend.
+  component ScopeChoice: Row {
+    id: scope
+    property bool separate: false
+    property bool usable: true
+    signal picked(bool separate)
+
+    spacing: Style.space(6)
+    opacity: scope.usable ? 1 : 0.45
+
+    Button {
+      text: "Same as master"
+      selected: !scope.separate
+      enabled: scope.usable
+      foreground: scope.separate ? view.dim : view.accent
+      fontFamily: view.fontFamily
+      fontSize: Style.font.caption
+      onClicked: scope.picked(false)
+    }
+
+    Button {
+      text: "Separate"
+      selected: scope.separate
+      enabled: scope.usable
+      foreground: scope.separate ? view.accent : view.dim
+      fontFamily: view.fontFamily
+      fontSize: Style.font.caption
+      onClicked: scope.picked(true)
+    }
+  }
+
+  component LegendRow: Text {
+    property string term: ""
+    property string meaning: ""
+    width: view.width
+    textFormat: Text.StyledText
+    wrapMode: Text.WordWrap
+    text: "<b>" + term + "</b> — " + meaning
+    color: view.dim
+    font.family: view.fontFamily
+    font.pixelSize: Style.font.caption
   }
 
   // One Hyprland file: whether every profile has its own copy of it, and — if
@@ -763,22 +834,19 @@ Column {
       }
     }
 
-    ToggleSwitch {
+    ScopeChoice {
       id: hyprSwitch
       anchors.right: parent.right
       anchors.verticalCenter: parent.verticalCenter
-      checked: hrow.on
+      separate: hrow.on
       // Disabled with the reason above, never silently inert: tier 3 is the
       // one thing here that cannot be proven to work on every machine.
-      interactive: view.hyprUsable
-      opacity: view.hyprUsable ? 1 : 0.45
-      foreground: view.foreground
-      accent: view.accent
-      onToggled: {
-        if (!view.panel || !view.hyprUsable) return
+      usable: view.hyprUsable
+      onPicked: function (separate) {
+        if (!view.panel || !view.hyprUsable || separate === hrow.on) return
         view.panel.keepAlive()
-        if (hrow.on) view.panel.isolateRemove(hrow.path)
-        else view.panel.isolateAdd(hrow.path, "", "hypr")
+        if (separate) view.panel.isolateAdd(hrow.path, "", "hypr")
+        else view.panel.isolateRemove(hrow.path)
       }
     }
   }

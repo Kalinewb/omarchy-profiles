@@ -42,11 +42,13 @@ Item {
   readonly property bool wantsCurrent: view.mode === "enter" || view.mode === "change"
                                        || view.mode === "clear" || view.mode === "remove"
                                        || view.mode === "rename"
+                                       || view.mode === "bind" || view.mode === "unbind"
   readonly property bool wantsNew: view.mode === "set" || view.mode === "reset" || view.mode === "change"
-  // Every mode except entering one can be answered by the machine owner
-  // instead, through polkit's own dialog — which this panel never draws and
-  // never collects anything for.
+  // The modes that can be answered by the machine owner instead, through
+  // polkit's own dialog — which this panel never draws and never collects
+  // anything for.
   readonly property bool ownerAlternative: view.mode === "clear" || view.mode === "remove" || view.mode === "rename"
+                                           || view.mode === "bind" || view.mode === "unbind"
 
   readonly property bool locked: view.retryIn > 0
 
@@ -67,6 +69,8 @@ Item {
     case "clear": return "Remove the password from " + (panel ? panel.label(view.profile) : view.profile)
     case "remove": return "Remove " + (panel ? panel.label(view.profile) : view.profile)
     case "rename": return "Rename " + (panel ? panel.label(view.profile) : view.profile)
+    case "bind": return "Let " + (panel ? panel.passwordArg : "a face") + " open " + (panel ? panel.label(view.profile) : view.profile)
+    case "unbind": return "Stop a face opening " + (panel ? panel.label(view.profile) : view.profile)
     }
     return ""
   }
@@ -78,12 +82,14 @@ Item {
       return "Looking for " + view.identity + " — or type the password"
     switch (view.mode) {
     case "enter": return "This profile asks for its own password, not the machine's."
-    case "set": return "Your password is asked for once, to authorise it. The profile's own password is the one typed here."
+    case "set": return "Anyone entering this profile will be asked for it. It is not your machine password."
     case "reset": return "For a password nobody remembers. Your own password authorises it."
     case "change": return "The current password, then the new one."
     case "clear": return "After this the profile opens with no prompt."
     case "remove": return "Its windows move to the master only after this is answered."
     case "rename": return "The password and any bound face follow the new name."
+    case "bind": return "This profile's password, to show the desk is yours to change."
+    case "unbind": return "This profile's password. After this only the password opens it."
     }
     return ""
   }
@@ -94,7 +100,7 @@ Item {
       if (newField.text === "") return false
       if (newField.text !== confirmField.text) return false
     }
-    if (view.mode === "enter") return currentField.text !== ""
+    if (view.mode === "enter" || view.mode === "bind" || view.mode === "unbind") return currentField.text !== ""
     return true
   }
 
@@ -260,6 +266,7 @@ Item {
             text: view.locked ? ("Wait " + view.retryIn + "s")
                   : view.mode === "remove" ? "Remove"
                   : view.mode === "enter" ? "Open"
+                  : view.mode === "bind" ? "Allow"
                   : "Save"
             bordered: true
             enabled: view.ready()

@@ -375,6 +375,7 @@ auth_message() {
   rate_limited) echo "too many attempts — wait ${2:-a while} seconds and try again" ;;
   owner_declined) echo "not authorised" ;;
   no_password) echo "that profile has no password" ;;
+  already_set) echo "that profile already has a password — change it, or reset it as the owner" ;;
   empty_password) echo "a password is required" ;;
   helper_unavailable) echo "the password helpers are not installed yet — open Setup" ;;
   busy) echo "the profile is busy — try again in a moment" ;;
@@ -556,12 +557,19 @@ cmd_password() {
     answer "$(jq -nc --arg s "$(password_status "$name")" '{status: $s}')" "$(password_status "$name")" ;;
 
   set | reset)
-    # The owner authorises; the new password itself is typed by whoever will be
-    # using the profile, and travels on stdin like every other secret.
+    # The new password is typed by whoever will be using the profile, and
+    # travels on stdin like every other secret. A first password needs nobody's
+    # authorisation: the desk opens for anyone until it has one. Replacing one
+    # without knowing it is the owner's. A profile locked before passwords
+    # existed is sent to the owner too, so the panel never offers a way past
+    # that lock — though the lock lives in the profile's JSON, and like any
+    # setting there it is only as strong as that file (see the locks row).
     if [[ -t 0 ]]; then prompt_secret "New password for $name"; else read_secret; fi
     [[ -n $SECRET ]] || refuse 1 empty_password "a password is required"
     HELPER_STDIN=$SECRET
-    helper_or_refuse owner "$verb" "$name"
+    local who=owner
+    if [[ $verb == set ]] && ! { profile_locked "$name" && ! has_password "$name"; }; then who=auth; fi
+    helper_or_refuse "$who" "$verb" "$name"
     clear_secrets
     note_password_name "$name"
     set_locked "$name" true
@@ -609,8 +617,9 @@ cmd_password() {
   esac
 }
 
-# Which face opens which profile. The binding itself is root-side; this only
-# asks the owner helper to write it.
+# Which face opens which profile. The binding itself is root-side; this asks
+# the no-prompt helper to write it with the profile's password, or the owner
+# helper without one.
 cmd_identity() {
   local verb="" name="" identity="" a
   for a in "$@"; do
@@ -646,8 +655,18 @@ cmd_identity() {
     [[ -n $fbin && -x $fbin ]] || refuse 1 face_absent "omarchy-face is not installed, so a face cannot be bound"
     "$fbin" list 2>/dev/null | grep -qx -- "$identity" ||
       refuse 1 no_such_identity "no face enrolled as '$identity' — enrol it in Face Unlock first"
-    HELPER_STDIN=""
-    helper_or_refuse owner bind "$name" "$identity"
+    # The profile's own password decides, so whoever can open the desk can
+    # choose the face that opens it too. Empty stdin — or a profile with no
+    # password to give — is the owner's override, through polkit's dialog.
+    collect_secret "$name"
+    if [[ -n $SECRET ]] && has_password "$name"; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth bind "$name" "$identity"
+    else
+      HELPER_STDIN=""
+      helper_or_refuse owner bind "$name" "$identity"
+    fi
+    clear_secrets
     write_index
     audit "identity '$identity' bound to $name"
     answer '{"ok":true}' "$name also opens for the face enrolled as '$identity'" ;;
@@ -655,8 +674,15 @@ cmd_identity() {
   clear)
     [[ -n $name ]] || die "usage: omarchy-profile identity clear <profile>"
     exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
-    HELPER_STDIN=""
-    helper_or_refuse owner unbind "$name"
+    collect_secret "$name"
+    if [[ -n $SECRET ]] && has_password "$name"; then
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth unbind "$name"
+    else
+      HELPER_STDIN=""
+      helper_or_refuse owner unbind "$name"
+    fi
+    clear_secrets
     write_index
     audit "identity cleared on $name"
     answer '{"ok":true}' "$name no longer opens for a face of its own" ;;
@@ -1464,6 +1490,28 @@ cmd_isolate() {
     echo
     echo "* = currently pointed at the active profile's copy" ;;
   candidates) isolate_candidates_json ;;
+  differs)
+    # Which other profiles have a copy that is not what the active profile has.
+    # Asked before "Same as master", because that makes the active copy the one
+    # every profile uses: the others are kept, but nobody would know to look.
+    # A profile with no copy has nothing to lose and is not listed.
+    [[ -n $path ]] || die "usage: omarchy-profile isolate differs <path> --json"
+    local expanded=${path/#\~/$HOME} cur name store names=()
+    cur=$(current_profile)
+    while read -r name; do
+      [[ -n $name && $name != "$cur" ]] || continue
+      store=$(store_for "$name" "$expanded")
+      [[ -e $store || -L $store ]] || continue
+      if [[ ! -e $expanded ]]; then names+=("$name"); continue; fi
+      # -r through directories; symlinks compared as links, not followed.
+      diff -rq --no-dereference -- "$store" "$(readlink -f -- "$expanded")" >/dev/null 2>&1 ||
+        names+=("$name")
+    done < <(profile_names)
+    if [[ -n $JSON ]]; then
+      jq -nc --arg c "$cur" '{current: $c, differs: $ARGS.positional}' --args "${names[@]}"
+    else
+      ((${#names[@]})) && printf '%s\n' "${names[@]}" || echo "every copy matches $cur's"
+    fi ;;
   resolve)
     [[ -n $path ]] || die "usage: omarchy-profile isolate resolve <path> --json"
     isolate_resolve_json "$path" ;;
@@ -1519,7 +1567,7 @@ cmd_isolate() {
     # A rollback recorded against this file has nothing left to describe.
     hypr_errors_drop_path "$expanded"
     echo "no longer isolating ${expanded/#$HOME/\~}" ;;
-  *) die "unknown isolate verb '$verb' (list, add, remove, candidates, resolve)" ;;
+  *) die "unknown isolate verb '$verb' (list, add, remove, differs, candidates, resolve)" ;;
   esac
 }
 
@@ -2284,6 +2332,9 @@ switch_forward() {
   swap_isolated "$from" "$to"
 
   journal_set "$from" "$to" write
+  # First in this stage, so the outgoing desk's windows leave the screen before
+  # the theme change and the restart rather than after them.
+  focus_block "$to" 8>&-
   # 8>&- at the call site as well as on each command inside it. The commands
   # are the ones known to start something today; the closed descriptor here is
   # what makes a theme hook or a helper daemon added tomorrow harmless too.
@@ -2440,9 +2491,13 @@ apply_profile_files() {
   # them being shared, and are taken out of disabledPlugins whatever the
   # profile says. "The same in every profile" has to survive a stale capture,
   # or the guarantee is only true until the next time you save a profile.
-  local pinned_widgets pinned_all
+  local pinned_widgets pinned_all indicator=""
   pinned_widgets=$(pinned_bar_widgets | jq -R . | jq -sc .)
   pinned_all=$(cfg -c '.pinned_plugins // []')
+  # The profile-aware workspace widget takes the stock one's place in the
+  # layout — where the workspaces are, not appended on the right like other
+  # shared widgets — and the stock one stays off, or the bar shows both.
+  indicator=$(indicator_id 2>/dev/null) && indicator_pinned "$indicator" || indicator=""
 
   if [[ -n $bar || -n $disabled ]]; then
     (
@@ -2452,6 +2507,15 @@ apply_profile_files() {
               | (if \$bar == null then . else .bar = \$bar end)
               | (if \$disabled == null then . else .disabledPlugins = \$disabled end)
               | .disabledPlugins = (.disabledPlugins - \$pinned_all)
+              | (if \$indicator == \"\" then . else
+                   .disabledPlugins = ((.disabledPlugins + [\"omarchy.workspaces\"]) | unique)
+                   | ([.bar.layout.left, .bar.layout.center, .bar.layout.right]
+                      | map(map(.id)) | add | index(\$indicator)) as \$has
+                   | .bar.layout |= with_entries(.value |= ((. // []) | map(
+                       if .id == \"omarchy.workspaces\"
+                       then (if \$has == null then {id: \$indicator} else empty end)
+                       else . end)))
+                 end)
               | ([.bar.layout.left, .bar.layout.center, .bar.layout.right]
                  | map(map(.id)) | add) as \$present
               | .bar.layout.right = (
@@ -2460,7 +2524,7 @@ apply_profile_files() {
                   + .bar.layout.right)" \
         --argjson bar "${bar:-null}" --argjson disabled "${disabled:-null}" \
         --argjson pinned_widgets "${pinned_widgets:-[]}" \
-        --argjson pinned_all "${pinned_all:-[]}"
+        --argjson pinned_all "${pinned_all:-[]}" --arg indicator "$indicator"
     ) >/dev/null 2>&1 8>&- || warn "could not write bar/plugins to shell.json"
   fi
 
@@ -2537,6 +2601,53 @@ apply_profile_ipc() {
 # moved anything. Nothing reported an error because the exit code was dropped.
 hl_focus_workspace() {
   hyprctl dispatch "hl.dsp.focus({ workspace = \"$1\" })" >/dev/null
+}
+
+hl_focus_monitor() {
+  hyprctl dispatch "hl.dsp.focus({ monitor = \"$1\" })" >/dev/null
+}
+
+# Put every monitor on a workspace inside <profile>'s block.
+#
+# Without this a switch changed everything except what was on screen: the
+# monitors stayed on the outgoing block, so its windows sat there under the new
+# desk's bar until the first SUPER+n. Position is kept — a monitor on the
+# outgoing desk's third workspace lands on the incoming desk's third — and a
+# monitor already inside the block is left alone, which is what makes this
+# safe for recovery to repeat.
+focus_block() {
+  hypr_live || return 0
+  local offset span
+  read -r offset span < <(profile_block "$1")
+  local focused mon ws n=0 moved=0 used=" "
+  focused=$(hyprctl -j monitors 2>/dev/null | jq -r '.[] | select(.focused) | .name' | head -1)
+  # Names first, then each monitor's workspace read fresh: focusing a workspace
+  # that already lives on another monitor changes what that monitor shows.
+  while read -r mon; do
+    [[ -n $mon ]] || continue
+    n=$((n + 1))
+    ws=$(hyprctl -j monitors 2>/dev/null |
+      jq -r --arg m "$mon" '.[] | select(.name == $m) | .activeWorkspace.id // 0')
+    [[ $ws =~ ^-?[0-9]+$ ]] || ws=0
+    if ((ws > offset && ws <= offset + span)); then used+=" $((ws - offset)) "; continue; fi
+    local rel=0
+    # A special workspace has a negative id and no position to keep.
+    ((ws > 0)) && rel=$(((ws - 1) % span + 1))
+    # Two monitors must not be sent to the same workspace, or one takes it from
+    # the other and is left where it was.
+    if ((rel == 0)) || [[ $used == *" $rel "* ]]; then
+      rel=$n
+      while [[ $used == *" $rel "* ]] && ((rel < span)); do rel=$((rel + 1)); done
+    fi
+    used+=" $rel "
+    hl_focus_monitor "$mon" || warn "could not focus monitor $mon"
+    hl_focus_workspace "$((offset + rel))" || warn "could not show workspace $((offset + rel)) on $mon"
+    moved=1
+  done < <(hyprctl -j monitors 2>/dev/null | jq -r '.[] | select(.focused | not) | .name'
+           [[ -n $focused ]] && printf '%s\n' "$focused")
+  # Focus goes back to the monitor the person was using.
+  ((moved)) && [[ -n $focused ]] && hl_focus_monitor "$focused"
+  return 0
 }
 
 hl_move_window() {
@@ -3648,6 +3759,10 @@ cmd_create() {
   # exists. Creating on top of it would hand the new profile a password nobody
   # present knows, so it is refused and the `stale-hashes` Setup row clears it.
   if has_password "$name" || [[ -e $ROOT_STORE/identity/$name ]]; then
+    # Remembered, so Setup's stale-hashes row can see a name it would otherwise
+    # never learn: a hash made by calling the helper directly leaves no trace
+    # this side, and the password store itself cannot be listed.
+    note_password_name "$name"
     refuse 1 stale_password \
       "a password is still stored for a deleted profile called '$name' — clear it in Setup" \
       "$(jq -nc --arg p "$name" '{profile: $p}')"
@@ -3837,6 +3952,7 @@ cmd_rename() {
   [[ $old == "$new" ]] && { answer '{"ok":true}' "'$old' already has that name"; return 0; }
   exists "$new" && refuse 1 name_taken "a profile called '$new' already exists"
   if has_password "$new" || [[ -e $ROOT_STORE/identity/$new ]]; then
+    note_password_name "$new"
     refuse 1 stale_password \
       "a password is still stored for a deleted profile called '$new' — clear it in Setup" \
       "$(jq -nc --arg p "$new" '{profile: $p}')"
@@ -4672,6 +4788,10 @@ indicator_content() {
   sed "s|^\( *moduleName: \)\".*\"|\1\"$1\"|" "$PLUGIN_DIR/extras/Workspaces.qml"
 }
 
+indicator_pinned() {
+  cfg -c '.pinned_plugins // []' | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
+}
+
 indicator_enabled() {
   omarchy plugin list --json 2>/dev/null |
     jq -e --arg id "$1" 'any(.[]; .id == $id and (.enabled // false))' >/dev/null 2>&1
@@ -4700,6 +4820,11 @@ setup_row_indicator() {
   if ! indicator_enabled "$id"; then
     setup_row indicator "$label" needs_action \
       "'$id' is installed but switched off, so the bar is showing real workspace numbers. Fixing enables it." true
+    return
+  fi
+  if ! indicator_pinned "$id"; then
+    setup_row indicator "$label" needs_action \
+      "'$id' is only switched on in this profile, so other profiles — every clean one — show the wrong workspace numbers. Fixing turns it on in all of them." true
     return
   fi
   # A clone is a snapshot. If Omarchy's own widget has moved on since this
@@ -4736,6 +4861,15 @@ indicator_fix() {
     omarchy plugin disable omarchy.workspaces >/dev/null 2>&1 ||
       warn "could not disable the stock omarchy.workspaces widget"
   fi
+  # Pinned, because enabling it only enables it in the profile that is live
+  # now. A clean profile turns off every add-on that is not pinned, and the
+  # clone is an add-on as far as `plugin list` can tell — so every other desk
+  # came up with the stock numbers, or none at all. Pinning is also what puts
+  # it back into a profile whose saved plugin list predates this fix.
+  indicator_pinned "$id" ||
+    cfg_set --arg id "$id" '.pinned_plugins = (((.pinned_plugins // []) + [$id]) | unique)' ||
+    warn "could not make '$id' the same in every profile"
+  write_catalog
   return 0
 }
 

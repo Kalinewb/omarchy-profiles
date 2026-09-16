@@ -9,18 +9,23 @@
 # is a person at an unattended machine and "you authorised something five
 # minutes ago" is no evidence that you are the one standing here now.
 #
-#   set    <p>            create a hash where there is none (new password on stdin)
+#   set    <p>            create a hash where there is none (new password on stdin);
+#                         only for a profile locked before passwords existed —
+#                         any other profile's first password is set without
+#                         the owner, by omarchy-profile-auth
+#   bind   <p> <identity> record whose face opens this profile, without its
+#                         password — the owner's override
 #   reset  <p>            replace one without knowing the old (new password on stdin)
 #   clear  <p>            delete the hash
-#   bind   <p> <identity> record whose face opens this profile
-#   unbind <p>            forget it
+#   unbind <p>            forget it, likewise
 #   rename <old> <new>    move hash, identity and counter together
 #   remove <p>            delete all three
 #   purge                 remove the whole root store (uninstall)
 #
-# Identity lives here rather than in the profile's JSON because the JSON is
+# Identity lives root-side rather than in the profile's JSON because the JSON is
 # writable by the user: a partner with an enrolled face could otherwise bind it
-# to the owner's profile with a text editor.
+# to the owner's profile with a text editor. The no-prompt helper can bind one
+# too, but only when given that profile's password.
 #
 # One JSON object on stdout. Exit 0 ok, 1 error, 2 refused, 3 busy.
 
@@ -146,14 +151,16 @@ reset)
   make_hash
   write_hash "$PROFILE" "$NEW_HASH"
   # The way past a lockout somebody else triggered: the owner is not subject to
-  # the profile's counter, and clears it.
-  rm -f "$ATTEMPTS/$PROFILE"
+  # the profile's counter, and clears it. And the face goes with the old
+  # password: anyone who could set a first password could bind a face with it,
+  # so a reset that kept the binding would not undo what it is there to undo.
+  rm -f "$ATTEMPTS/$PROFILE" "$IDENTITY/$PROFILE"
   ok '{"ok":true}' reset
   ;;
 
 clear)
   lock_for "$PROFILE" 9
-  rm -f "$PASSWORDS/$PROFILE" "$ATTEMPTS/$PROFILE"
+  rm -f "$PASSWORDS/$PROFILE" "$ATTEMPTS/$PROFILE" "$IDENTITY/$PROFILE"
   ok '{"ok":true}' cleared
   ;;
 
@@ -178,7 +185,6 @@ unbind)
 rename)
   valid_profile "$ARG" || fail 1 bad_profile_name
   if [[ $ARG == "$PROFILE" ]]; then fail 1 same_name; fi
-  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
   if [[ $PROFILE < $ARG ]]; then
     lock_for "$PROFILE" 9
     lock_for "$ARG" 8
@@ -186,10 +192,16 @@ rename)
     lock_for "$ARG" 8
     lock_for "$PROFILE" 9
   fi
+  # Under both locks, not before them: `set` can create a hash under the new
+  # name without authentication, and a check made before the locks would let
+  # one land in between.
+  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
   moved=""
   for d in "$PASSWORDS" "$IDENTITY" "$ATTEMPTS"; do
     [[ -e $d/$PROFILE ]] || continue
-    if mv -n "$d/$PROFILE" "$d/$ARG"; then
+    # `mv -n` exits 0 without moving when the target exists, so the result is
+    # checked rather than its exit status.
+    if mv -n "$d/$PROFILE" "$d/$ARG" && [[ ! -e $d/$PROFILE && -e $d/$ARG ]]; then
       moved="$moved $d"
     else
       for b in $moved; do mv -n "$b/$ARG" "$b/$PROFILE" 2>/dev/null || true; done

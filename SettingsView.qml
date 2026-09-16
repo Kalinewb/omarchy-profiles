@@ -408,8 +408,9 @@ Column {
         width: nameCol.width
         visible: prow.pinned || !!(prow.plugin && prow.plugin.firstParty)
         textFormat: Text.PlainText
-        text: prow.pinned ? "Pinned — switching this off would leave no way back"
-                          : "An Omarchy default"
+        text: !prow.pinned ? "An Omarchy default"
+              : prow.plugin.id === "kalinewb.profiles" ? "Always on — switching this off would leave no way back"
+              : "Always on — on in every profile"
         color: prow.pinned ? root.accent : root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

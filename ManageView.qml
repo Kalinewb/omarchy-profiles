@@ -36,8 +36,8 @@ Column {
   signal passwordAction(string profile, string mode)
   signal createProfile(string name, bool fromMaster)
   signal openEdit(string profile)
-  // The face binding is the owner's to change, so these only ask; polkit draws
-  // the prompt and the engine writes it root-side.
+  // The face binding is changed with the profile's password, so these only
+  // ask; the panel raises the prompt and the engine writes it root-side.
   signal bindIdentity(string profile, string identity)
   signal clearIdentity(string profile)
   signal captureNow()
@@ -632,9 +632,9 @@ Column {
     // What the key button opens: the password itself, and nothing else.
     //
     // Each of these hands the profile back to the panel, which raises the
-    // prompt. Setting and resetting also raise polkit's own dialog for the
-    // owner — this panel never collects the owner's password, and could not
-    // do anything useful with it if it did.
+    // prompt. Only resetting raises polkit's own dialog for the owner — this
+    // panel never collects the owner's password, and could not do anything
+    // useful with it if it did.
     Column {
       width: stack.width
       visible: row.passwordOpen
@@ -710,6 +710,7 @@ Column {
         spacing: Style.space(4)
 
         Dropdown {
+          id: faceDropdown
           width: parent.width
           label: "Opens for a face"
           value: row.identity
@@ -730,6 +731,9 @@ Column {
           accent: root.accent
           fontFamily: root.fontFamily
           onChanged: function (value) {
+            // The pick only asks; the binding shows what is actually bound, so
+            // a cancelled prompt or a wrong password leaves the old face shown.
+            faceDropdown.value = Qt.binding(function () { return row.identity })
             if (String(value) === row.identity) return
             if (String(value) === "") root.clearIdentity(row.name)
             else root.bindIdentity(row.name, String(value))
@@ -740,7 +744,7 @@ Column {
           textFormat: Text.PlainText
           width: parent.width
           wrapMode: Text.WordWrap
-          text: "A shortcut, not a replacement — the password always works. Only the machine's owner can change this."
+          text: "A shortcut, not a replacement — the password always works. Changing this asks for the profile's password."
           color: root.dim
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
