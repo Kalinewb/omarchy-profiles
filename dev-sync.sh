@@ -19,7 +19,7 @@ SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 mkdir -p "$DEST"
 rsync -a --delete \
-  --exclude '.git' --exclude 'install.sh' --exclude '*.bak' --exclude '*.bak.*' \
+  --exclude '.git' --exclude 'dev-sync.sh' --exclude '*.bak' --exclude '*.bak.*' \
   "$SRC/" "$DEST/"
 
 chmod +x "$DEST/bin/omarchy-profile" \

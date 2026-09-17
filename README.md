@@ -158,7 +158,7 @@ remove as an administrator, and each protected profile needs its password set ag
 know about the profiles, their saved files, the hidden applications or the
 workspace keys, and it will not touch any of that. Removed that way, all of it is
 left behind. If you have already done this: everything is still exactly
-where it was, run `./uninstall.sh --yes` from the backed-up copy Plugin Manager
+where it was, run `bin/omarchy-profile purge --yes` from the backed-up copy Plugin Manager
 made (`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish
 the job properly.
 
@@ -175,9 +175,9 @@ else the button is **Switch to master first**.
 From a checkout, the same thing without a panel:
 
 ```bash
-./uninstall.sh --dry-run --json      # what would go
-./uninstall.sh --export ~/backup     # copy it out first
-./uninstall.sh --yes                 # do it
+bin/omarchy-profile purge --dry-run --json      # what would go
+bin/omarchy-profile purge --export ~/backup     # copy it out first
+bin/omarchy-profile purge --yes                 # do it
 ```
 
 One thing it will not do for you: if you bind workspace keys by hand in your own
