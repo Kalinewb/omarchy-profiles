@@ -4972,22 +4972,51 @@ setup_row_hypr_probe() {
 #
 # It runs under polkit's generic exec action (auth_admin), because the annotated
 # actions it is installing do not exist yet at that point — a real chicken and
-# egg, and the reason this one call is not covered by our own policy. What that
-# authorisation trusts is the plugin directory: it installs whatever
-# bin/omarchy-profile-auth contains at that moment, which is the trust model of
-# every install from a user checkout. Hence: only offered when `helpers` is not
-# already ok, and later drift is reported as broken rather than reinstalled.
+# egg, and the reason this one call is not covered by our own policy.
+#
+# The files it installs come from the plugin checkout, which the user can
+# write — and so can any program running as the user, right up to the moment
+# root reads them, including while the authorisation dialog is on screen. So
+# the path is not trusted: root reads each file once, bounded, into a staging
+# directory only root can write, checks those bytes against a SHA-256 fixed in
+# this text, and installs the checked copy. A file that was swapped, or a
+# checkout edited since release, fails the check and nothing is installed.
+#
+# The pins are generated, not typed: extras/update-pins.sh rewrites them from
+# the files, and extras/check-pins.sh (run by install.sh) refuses a stale one.
 SYSTEM_INSTALL='
 set -euo pipefail
-umask 022
+umask 077
 plugin=${1:?no plugin directory}
-for h in omarchy-profile-auth omarchy-profile-passwd; do
-  [ -f "$plugin/bin/$h" ] || { echo "missing $plugin/bin/$h" >&2; exit 1; }
-  install -o root -g root -m 0755 "$plugin/bin/$h" "/usr/local/bin/$h"
-done
-policy=$plugin/polkit/no.kalinewb.profiles.policy
-[ -f "$policy" ] || { echo "missing $policy" >&2; exit 1; }
-install -o root -g root -m 0644 "$policy" /usr/share/polkit-1/actions/no.kalinewb.profiles.policy
+PIN_AUTH=589051be24be10e17a036b7d0b3e7ef2f36236ca3350a430139a24805d1e9037
+PIN_PASSWD=665bc11b3ae17e5fbe2c6feca4e360e4f79126a1cd03f1cb82efd6fd6cec45a8
+PIN_POLICY=b5891d74fcafe600fdeff1622966ddc0135b62a9303799b93a3b443fb138b423
+
+stage=$(mktemp -d /run/omarchy-profiles-install.XXXXXX)
+trap '"'"'rm -rf -- "$stage"'"'"' EXIT
+
+# Read once, as root, into root-owned staging. From here on the bytes that are
+# checked are the bytes that are installed.
+stage_file() {
+  src=$1 name=$2 pin=$3
+  timeout 10 head -c 1048577 -- "$src" >"$stage/$name" || { echo "could not read $src" >&2; exit 1; }
+  if [ "$(stat -c %s -- "$stage/$name")" -gt 1048576 ]; then echo "$src is too large" >&2; exit 1; fi
+  got=$(sha256sum -- "$stage/$name")
+  got=${got%% *}
+  if [ "$got" != "$pin" ]; then
+    echo "$name is not the version this plugin was released with" >&2
+    exit 3
+  fi
+}
+
+stage_file "$plugin/bin/omarchy-profile-auth" omarchy-profile-auth "$PIN_AUTH"
+stage_file "$plugin/bin/omarchy-profile-passwd" omarchy-profile-passwd "$PIN_PASSWD"
+stage_file "$plugin/polkit/no.kalinewb.profiles.policy" no.kalinewb.profiles.policy "$PIN_POLICY"
+
+umask 022
+install -o root -g root -m 0755 "$stage/omarchy-profile-auth" /usr/local/bin/omarchy-profile-auth
+install -o root -g root -m 0755 "$stage/omarchy-profile-passwd" /usr/local/bin/omarchy-profile-passwd
+install -o root -g root -m 0644 "$stage/no.kalinewb.profiles.policy" /usr/share/polkit-1/actions/no.kalinewb.profiles.policy
 rm -f /usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
 install -d -o root -g root -m 0711 /var/lib/omarchy-profiles
 install -d -o root -g root -m 0711 /var/lib/omarchy-profiles/passwords
@@ -5008,6 +5037,11 @@ system_install() {
   rc=$?
   if ((rc == 126 || rc == 127)); then
     refuse 2 owner_declined "the install was not authorised — nothing was changed"
+  fi
+  if ((rc == 3)); then
+    [[ -n $out ]] && warn "$out"
+    refuse 1 helpers_modified \
+      "this copy of the plugin's password helpers differs from the released version, so nothing was installed — reinstall the plugin"
   fi
   if ((rc != 0)); then
     [[ -n $out ]] && warn "$out"

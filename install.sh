@@ -37,6 +37,10 @@ chmod +x "$DEST/bin/omarchy-profile" \
 # of whatever this checkout happens to hold, including an old single-action
 # policy, over the one Setup just installed and is checking against.
 
+# Stale pins would make Setup's password-helpers Fix refuse for everyone on this
+# commit, so they are caught here rather than in the panel.
+"$SRC/extras/check-pins.sh" || { echo "install.sh: run extras/update-pins.sh" >&2; exit 1; }
+
 if command -v omarchy >/dev/null; then
   omarchy plugin validate "$DEST" || { echo "install.sh: plugin failed validation" >&2; exit 1; }
 fi
