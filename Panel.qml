@@ -259,6 +259,10 @@ Panel {
   property string passwordFor: ""
   // "enter" | "set" | "change" | "reset" | "clear" | "rename" | "remove"
   property string passwordMode: ""
+  // The prompt is asking for the owner's login password rather than the
+  // profile's: a profile locked without a password, a reset, or the owner's
+  // override chosen from the prompt.
+  property bool passwordOwner: false
   property string passwordError: ""
   // Seconds; while it is above zero the field is read-only and counting down.
   property int passwordRetryIn: 0
@@ -625,9 +629,8 @@ Panel {
   //
   // Three cases, and only one of them shows a field straight away:
   //
-  //   locked with no password  there is nothing to type. Empty stdin makes the
-  //                            engine raise the owner's prompt, which polkit
-  //                            draws for itself.
+  //   locked with no password  nothing of the profile's to type, so the field
+  //                            asks for the owner's login password.
   //   a bound face             worth trying silently first, but never at the
   //                            cost of making the user wait: the field appears
   //                            at once and the face attempt runs beside it.
@@ -640,8 +643,8 @@ Panel {
     root.faceTrying = false
     root.faceProc = null
     var e = root.entry(id)
-    if (!e) return
-    if (e.locked && !e.hasPassword) { root.startSwitch(id, ""); return }
+    root.passwordOwner = !!(e && e.locked && !e.hasPassword)
+    if (!e || root.passwordOwner) return
     if (e.identity !== "" && root.faceInstalled) {
       root.faceTrying = true
       root.faceProc = root.startSwitch(id, "")
@@ -662,7 +665,7 @@ Panel {
 
   // Managing a password, removing a profile, renaming one: everything whose
   // secret is collected by the prompt but which is not a switch.
-  function submitManage(mode, id, secret) {
+  function submitManage(mode, id, secret, asOwner) {
     var args = null
     if (mode === "set") args = ["password", "set", id, "--json"]
     else if (mode === "reset") args = ["password", "reset", id, "--json"]
@@ -673,6 +676,9 @@ Panel {
     else if (mode === "bind") args = ["identity", "bind", id, root.passwordArg, "--json"]
     else if (mode === "unbind") args = ["identity", "clear", id, "--json"]
     if (!args) return
+    // set and reset decide for themselves whether the owner answers; the rest
+    // are told, because either password could be what was typed.
+    if (asOwner && mode !== "set" && mode !== "reset") args.push("--owner")
     root.passwordError = ""
     root.ask(args, secret, function (ok, parsed, code) {
       if (ok) {
@@ -682,6 +688,7 @@ Panel {
         if (mode === "rename" && root.editProfile === id) root.editProfile = root.passwordArg
         root.passwordFor = ""
         root.passwordMode = ""
+        root.passwordOwner = false
         root.passwordArg = ""
         root.passwordError = ""
         // Every one of these verbs rewrites the index itself; the watcher picks
@@ -698,6 +705,10 @@ Panel {
   function beginManage(id, mode) {
     root.passwordFor = id
     root.passwordMode = mode
+    var e = root.entry(id)
+    // A reset is the owner's by definition, and so is anything done to a
+    // profile locked without a password of its own.
+    root.passwordOwner = mode === "reset" || !!(e && e.locked && !e.hasPassword)
     root.passwordError = ""
     root.passwordRetryIn = 0
     root.faceTrying = false
@@ -730,8 +741,8 @@ Panel {
 
   // Both of these ask for the profile's own password, through the same prompt
   // as everything else — whoever can open the desk can choose the face that
-  // opens it. The prompt also offers the owner's override, which polkit draws
-  // for itself. The engine rewrites the index, so the binding arrives back the
+  // opens it. The prompt also offers the owner's override, with the login
+  // password. The engine rewrites the index, so the binding arrives back the
   // same way every other change does.
   function bindIdentity(profile, identity) {
     root.faceError = ""
@@ -746,10 +757,10 @@ Panel {
 
   function faceRefusal(parsed) {
     var err = parsed && parsed.error ? String(parsed.error) : "failed"
-    if (err === "owner_declined") return "Not authorised"
+    if (err === "owner_declined") return "That is not your login password"
     if (err === "face_absent") return "The face plugin is not installed"
     if (err === "no_such_identity") return "No face is enrolled under that name"
-    if (err === "helper_unavailable") return "The helpers are not installed — open Setup"
+    if (err === "helper_unavailable") return "This copy of the plugin is missing its password store — reinstall it"
     return "That did not work"
   }
 
@@ -758,6 +769,7 @@ Panel {
     root.faceTrying = false
     root.passwordFor = ""
     root.passwordMode = ""
+    root.passwordOwner = false
     root.passwordArg = ""
     root.passwordError = ""
     root.passwordRetryIn = 0
@@ -780,11 +792,13 @@ Panel {
       root.passwordRetryIn = parsed.retry_after || 30
       root.passwordError = ""
     } else if (err === "owner_declined") {
-      root.passwordError = "Not authorised"
-      // On a profile locked without a password there is no field to fall back
-      // to, so there is nothing left to show.
-      var e = root.entry(id)
-      if (!e || !e.hasPassword) { root.cancelPassword(); return }
+      root.passwordError = "That is not your login password"
+      root.passwordOwner = true
+    } else if (err === "needs_owner_password") {
+      root.passwordError = ""
+      root.passwordOwner = true
+    } else if (err === "owner_check_unavailable") {
+      root.passwordError = "Your login password cannot be checked on this machine (unix_chkpwd is missing)"
     } else if (err === "no_password") {
       // Not a refusal: the profile has no password at all. The index the panel
       // is holding is out of date.
@@ -794,12 +808,9 @@ Panel {
     } else if (err === "empty_password") {
       root.passwordError = "Type the password"
     } else if (err === "helper_unavailable") {
-      // Never "wrong password": the helper is missing or unregistered, which
-      // is the polkit row's business.
+      // Never "wrong password": the store script is missing from the plugin.
       root.passwordFor = ""
-      root.switchError = "The password helpers are not installed — open Setup"
-      root.loadSetup(true)
-      root.pushView("setup")
+      root.switchError = "This copy of the plugin is missing its password store — reinstall it"
       return
     } else if (err === "face_absent" || err === "no_such_identity") {
       root.passwordError = root.faceRefusal(parsed)
@@ -1014,9 +1025,7 @@ Panel {
   //
   // Taking the plugin off the machine. One question, one button: keep a copy
   // of your profile data first, then everything is removed in the one
-  // engine call that already does it all, root parts included — the owner's
-  // polkit prompt for those arrives as part of this same click, not a
-  // separate step. `purge --dry-run --json` still runs first, silently, only
+  // engine call that already does it all. `purge --dry-run --json` still runs first, silently, only
   // to answer "are we on master" and give a rough sense of size; nobody has
   // to read an itemised list to press one button.
   property var purgeManifest: null
@@ -1065,7 +1074,7 @@ Panel {
   }
 
   // The one button. Saves a copy first if asked to, then removes everything —
-  // engine, root store, helpers, polkit action, the plugin itself. The engine
+  // engine, stored passwords, the plugin itself. The engine
   // prints its result and only then removes the plugin, which reloads every
   // panel in the shell, so the final callback may simply never run — that is
   // success, not a hang.

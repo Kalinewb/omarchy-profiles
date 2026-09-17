@@ -6,8 +6,7 @@ import qs.Ui
 //
 // It renders whatever `setup status --json` returns and knows nothing about
 // which rows exist. That is deliberate: rows land with the phase that makes
-// them true, and a later phase adding one — helpers, polkit, the reload probe —
-// must not need a line changed here.
+// them true, and a later phase adding one must not need a line changed here.
 //
 // The tone table is the contract's (plan-merged.md §2 rule 5): ok is good,
 // needs_action and broken are bad, absent is dim, and anything else at all —
@@ -45,14 +44,6 @@ Column {
     return "unknown"
   }
 
-  // helpers and polkit are the two rows a fix cannot finish by itself —
-  // both go through the one owner-authorised install call, which raises a
-  // system password dialog this panel never draws and cannot detect. Left
-  // as a plain "Fixing…" the whole screen looked stalled for however long
-  // that dialog sat unanswered, with nothing telling you to go look for it.
-  readonly property bool waitingOnPrompt: !!panel
-    && (panel.pendingSetup === "helpers" || panel.pendingSetup === "polkit")
-
   // One button, two jobs depending on where the machine is: something left
   // to set up shows Install and does them one at a time (clicking each
   // row's own Fix in turn is the same calls, just slower to ask for, and
@@ -67,11 +58,10 @@ Column {
     enabled: !view.queueRunning
     text: view.fixableCount > 1
           ? (!view.queueRunning ? ("Install (" + view.fixableCount + ")")
-             : view.waitingOnPrompt ? "Waiting for your password… (check behind this window)"
              : ("Installing… " + view.fixableCount + " left"))
           : "Uninstall"
     bordered: true
-    foreground: view.waitingOnPrompt ? Color.accent : view.foreground
+    foreground: view.foreground
     fontFamily: view.fontFamily
     onClicked: {
       if (!view.panel) return
@@ -171,22 +161,16 @@ Column {
           }
         }
 
-        // No terminal anywhere: a fix that needs root raises it through
-        // polkit's own agent, not a terminal this panel would have to open.
-        // helpers and polkit share that one owner-authorised call, and this
-        // panel has no way to know a system dialog is up — only that the
-        // call is taking longer than the ones that never raise one.
+        // No terminal anywhere, and nothing a fix does needs root.
         Button {
           id: fixButton
           anchors.verticalCenter: parent.verticalCenter
           visible: row.fixable && (row.state === "needs_action" || row.state === "broken")
           enabled: !!view.panel && view.panel.pendingSetup === "" && !view.queueRunning
           text: !row.running ? "Fix"
-                : (row.rowId === "helpers" || row.rowId === "polkit")
-                  ? "Check for a password prompt…"
-                  : ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
+                : ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
           bordered: true
-          foreground: (row.running && (row.rowId === "helpers" || row.rowId === "polkit")) ? Color.accent : view.foreground
+          foreground: view.foreground
           fontFamily: view.fontFamily
           fontSize: Style.font.caption
           onClicked: {

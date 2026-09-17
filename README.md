@@ -40,12 +40,11 @@ omarchy plugin add https://github.com/Kalinewb/omarchy-profiles.git --enable
 
 Then click the Profiles icon on the bar. It opens on **Setup**, which is a list
 of everything that has to be true before profiles work — adopting this machine
-as your first desk, the workspace keys, the bar's workspace indicator, the two
-small programs that check a password. Each row says what it is for, and most
-carry a **Fix** that does it — the ones that do not are the ones about your own
-configuration, which this plugin does not edit. One Fix asks for your password
-once, because it installs outside your home directory; nothing else here needs
-anything typed. Adopting reads your desktop as it already is and changes nothing.
+as your first desk, the workspace keys, the bar's workspace indicator. Each row
+says what it is for, and most carry a **Fix** that does it — the ones that do not
+are the ones about your own configuration, which this plugin does not edit.
+Nothing here asks for a password or installs anything outside your home
+directory. Adopting reads your desktop as it already is and changes nothing.
 
 ## The panel, view by view
 
@@ -119,25 +118,26 @@ It gates **entering** a profile from the desktop. It stops the person sitting at
 the keyboard, which is the threat it was built for: a family laptop, a lent
 machine, a desk left unattended for a minute.
 
-**Editing settings cannot take it off.** The password is stored hashed, in a place
-only the system can write, so changing a profile's configuration does not remove
-it. Changing or removing it needs that password or the machine's owner. The same
-goes for a face bound to a profile: binding or changing one asks for the
-profile's password, or the owner.
+**Changing or removing it needs that password, or yours.** The password is stored
+hashed in your own state folder, `~/.local/state/omarchy-profiles/secrets`. Changing
+it asks for the current one; resetting one nobody remembers, or overriding a
+profile's password to remove or rename it, asks for **your login password** —
+checked by `unix_chkpwd`, the same Linux-PAM helper screen lockers use, which only
+answers yes or no. The same goes for a face bound to a profile: binding or changing
+one asks for the profile's password, or yours. A reset also takes off any face
+bound with the old password.
 
 **Giving a profile its first password asks nobody.** A desk without one opens for
 anyone at the keyboard, so putting one on takes nothing away — and the person
-using a desk can protect it without fetching the owner. If someone locks a desk
-that was not theirs, the owner resets it — which also takes off any face bound
-with that password.
+using a desk can protect it without fetching you.
 
 **It is not a security boundary**, and no setting here makes it one:
 
 - Every profile runs as the same Linux user, so another profile's files can be
   **read** without entering it.
-- The check is made by this plugin, which lives in your home directory. Someone
-  comfortable editing its files, or copying a profile's settings into place by
-  hand, can switch without being asked.
+- The check is made by this plugin, from files in your home directory. Someone
+  comfortable editing those files can take a password off, or switch without
+  being asked.
 
 If you need contents another person genuinely cannot read, you need encryption
 and a separate login, and this is not that.
@@ -145,20 +145,19 @@ and a separate login, and this is not that.
 A bound face is a **shortcut**, not a second lock. It saves typing the password;
 the password always works.
 
-**If face unlock answers system prompts.** Resetting or clearing a password
-as the machine's owner goes through the system authentication prompt. If that prompt
-accepts your face, it accepts it for any program you run — so while you sit in front
-of the camera, a program could reset a profile's password without you typing
-anything. Setup warns you when this is the case.
+**Nothing runs as root.** Profiles installs nothing outside your home directory and
+never asks for administrator rights. Versions before 1.3 kept passwords in a
+root-owned store; if Setup shows **Old password store**, it lists the files to
+remove as an administrator, and each protected profile needs its password set again
+(until then it opens with your login password).
 
 ## Removing it
 
 **Use this plugin's own screen, not Omarchy's Plugin Manager.** Plugin Manager's
 "Remove" only knows how to move a plugin's own folder aside — it has no way to
-know this plugin also has a root-owned password store, a polkit action and two
-helpers under `/usr/local/bin`, and it will not touch any of that. Removed that
-way, every profile, its saved theme and Hyprland files, and the whole root store
-are left behind. If you have already done this: everything is still exactly
+know about the profiles, their saved files, the hidden applications or the
+workspace keys, and it will not touch any of that. Removed that way, all of it is
+left behind. If you have already done this: everything is still exactly
 where it was, run `./uninstall.sh --yes` from the backed-up copy Plugin Manager
 made (`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish
 the job properly.
@@ -169,9 +168,8 @@ to `~/omarchy-profiles-export` before anything is removed), and one button,
 **Uninstall everything**. That one click hands the machine back as your master
 profile has it: windows on other desks move onto master's workspaces, every
 isolated file becomes a real file again, every hidden application comes back,
-the workspace keys and the widget go, the stored passwords and the two helpers
-go (the owner prompt for that arrives as part of the same click), and the
-plugin uninstalls itself. It has to run from the master profile; from anywhere
+the workspace keys and the widget go, the stored passwords go, and the plugin
+uninstalls itself. It has to run from the master profile; from anywhere
 else the button is **Switch to master first**.
 
 From a checkout, the same thing without a panel:
@@ -189,8 +187,8 @@ edits your configuration.
 
 ## Dependencies
 
-`jq` and `hyprctl`, both of which Omarchy already has. `pkexec` for anything
-involving a password. [omarchy-face] is optional and the dependency is one way:
+`jq`, `hyprctl` and `openssl`, which Omarchy already has, and `unix_chkpwd` from
+Linux-PAM for the login-password override. [omarchy-face] is optional and the dependency is one way:
 without it a profile can still have a password, and one bound to a face says so
 rather than becoming unopenable.
 

@@ -4,7 +4,7 @@
 #
 # Everything is in the engine — `purge` moves the windows, puts the isolated
 # files back as master's, un-hides every application, deletes the managed keys
-# file and the line that requires it, asks the owner for the root-owned half and
+# file and the line that requires it, deletes the stored passwords and
 # removes the plugin itself, in an order where each step is placed by what would
 # break if it ran later (plan-engine.md §9.2). None of that is repeated here,
 # because a second implementation of it is a second thing to get wrong.

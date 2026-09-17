@@ -632,9 +632,8 @@ Column {
     // What the key button opens: the password itself, and nothing else.
     //
     // Each of these hands the profile back to the panel, which raises the
-    // prompt. Only resetting raises polkit's own dialog for the owner — this
-    // panel never collects the owner's password, and could not do anything
-    // useful with it if it did.
+    // prompt. Resetting asks for the owner's login password there, checked by
+    // unix_chkpwd; nothing is run as root.
     Column {
       width: stack.width
       visible: row.passwordOpen
@@ -647,8 +646,8 @@ Column {
         text: row.passwordState === "set"
           ? "Anyone entering " + row.name + " is asked for this password. Your own password is not asked for and does not open it."
           : row.passwordState === "locked_no_password"
-            ? "Locked before passwords existed, so it asks the machine owner every time — and that is the one lock a settings edit can still switch off. Give it a password of its own."
-            : "A password is asked for when this profile is entered. It is kept where a program running as you cannot read it, and it is not your machine password."
+            ? "Locked without a password of its own, so it opens with your login password. Give it a password of its own."
+            : "A password is asked for when this profile is entered. It is stored hashed in your own state folder, and it is not your machine password."
         color: root.dim
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption

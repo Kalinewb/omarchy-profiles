@@ -26,6 +26,8 @@ Item {
   readonly property string error: panel ? panel.passwordError : ""
   readonly property int retryIn: panel ? panel.passwordRetryIn : 0
   readonly property bool faceTrying: panel ? panel.faceTrying : false
+  // The first field is the owner's login password rather than the profile's.
+  readonly property bool ownerMode: panel ? panel.passwordOwner : false
   readonly property string identity: {
     if (!panel || view.profile === "") return ""
     var e = panel.entry(view.profile)
@@ -43,12 +45,12 @@ Item {
                                        || view.mode === "clear" || view.mode === "remove"
                                        || view.mode === "rename"
                                        || view.mode === "bind" || view.mode === "unbind"
+                                       || view.ownerMode
   readonly property bool wantsNew: view.mode === "set" || view.mode === "reset" || view.mode === "change"
-  // The modes that can be answered by the machine owner instead, through
-  // polkit's own dialog — which this panel never draws and never collects
-  // anything for.
-  readonly property bool ownerAlternative: view.mode === "clear" || view.mode === "remove" || view.mode === "rename"
-                                           || view.mode === "bind" || view.mode === "unbind"
+  // The modes the owner can answer instead, with their login password.
+  readonly property bool ownerAlternative: !view.ownerMode &&
+    (view.mode === "clear" || view.mode === "remove" || view.mode === "rename"
+     || view.mode === "bind" || view.mode === "unbind")
 
   readonly property bool locked: view.retryIn > 0
 
@@ -80,10 +82,16 @@ Item {
       return "Too many attempts. The next one can be tried in " + view.retryIn + "s."
     if (view.faceTrying)
       return "Looking for " + view.identity + " — or type the password"
+    if (view.ownerMode && view.mode === "enter")
+      return "It has no password of its own yet, so your login password opens it."
+    if (view.ownerMode && view.mode === "set")
+      return "Locked without a password, so your login password authorises giving it one."
+    if (view.ownerMode && view.mode !== "reset")
+      return "Your login password, instead of the profile's."
     switch (view.mode) {
     case "enter": return "This profile asks for its own password, not the machine's."
     case "set": return "Anyone entering this profile will be asked for it. It is not your machine password."
-    case "reset": return "For a password nobody remembers. Your own password authorises it."
+    case "reset": return "For a password nobody remembers. Your login password authorises it."
     case "change": return "The current password, then the new one."
     case "clear": return "After this the profile opens with no prompt."
     case "remove": return "Its windows move to the master only after this is answered."
@@ -100,7 +108,7 @@ Item {
       if (newField.text === "") return false
       if (newField.text !== confirmField.text) return false
     }
-    if (view.mode === "enter" || view.mode === "bind" || view.mode === "unbind") return currentField.text !== ""
+    if (view.ownerMode || view.mode === "enter" || view.mode === "bind" || view.mode === "unbind") return currentField.text !== ""
     return true
   }
 
@@ -108,21 +116,24 @@ Item {
     if (!panel || !view.ready()) return
     if (view.mode === "enter") {
       panel.submitPassword(view.profile, currentField.text)
-    } else if (view.mode === "change") {
-      panel.submitManage("change", view.profile, currentField.text + "\n" + newField.text)
+    } else if (view.mode === "change" || (view.ownerMode && view.wantsNew)) {
+      // Two lines: the current password -- or the login password -- then the new one.
+      panel.submitManage(view.mode, view.profile, currentField.text + "\n" + newField.text, view.ownerMode)
     } else if (view.wantsNew) {
-      panel.submitManage(view.mode, view.profile, newField.text)
+      panel.submitManage(view.mode, view.profile, newField.text, false)
     } else {
-      panel.submitManage(view.mode, view.profile, currentField.text)
+      panel.submitManage(view.mode, view.profile, currentField.text, view.ownerMode)
     }
     view.reset()
   }
 
-  // Empty stdin is what asks the engine to raise the owner's prompt instead.
-  function submitAsOwner() {
+  // Switch the first field to the owner's login password. Nothing is sent.
+  function switchToOwner() {
     if (!panel) return
-    panel.submitManage(view.mode, view.profile, "")
+    panel.passwordOwner = true
+    panel.passwordError = ""
     view.reset()
+    Qt.callLater(function () { currentField.forceActiveFocus() })
   }
 
   function cancel() {
@@ -213,7 +224,8 @@ Item {
           visible: view.wantsCurrent
           password: true
           readOnly: view.locked
-          placeholderText: view.mode === "change" ? "Current password" : "Password"
+          placeholderText: view.ownerMode ? "Your login password"
+                           : view.mode === "change" ? "Current password" : "Password"
           foreground: view.foreground
           accent: view.accent
           font.family: view.fontFamily
@@ -286,14 +298,12 @@ Item {
           }
         }
 
-        // Not a second password field: this sends no password at all, and the
-        // empty stdin is what makes the engine ask polkit to draw the owner's
-        // own dialog.
+        // Sends nothing: it changes what the first field is asking for.
         Text {
           textFormat: Text.PlainText
           width: parent.width
           visible: view.ownerAlternative
-          text: "Authorise as owner instead"
+          text: "Use your login password instead"
           color: view.accent
           font.family: view.fontFamily
           font.pixelSize: Style.font.caption
@@ -301,7 +311,7 @@ Item {
           MouseArea {
             anchors.fill: parent
             cursorShape: Qt.PointingHandCursor
-            onClicked: view.submitAsOwner()
+            onClicked: view.switchToOwner()
           }
         }
       }

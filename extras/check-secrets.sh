@@ -9,7 +9,7 @@
 # part of them a grep can hold:
 #
 #   1. every `openssl passwd` carries -stdin, so no password is ever positional
-#   2. every pkexec call that carries a secret is fed by a pipe from bash's
+#   2. every call that pipes a secret to the store or unix_chkpwd is fed by bash's
 #      builtin printf — not echo, not /usr/bin/printf, not a here-string
 #   3. no secret-shaped variable appears inside audit, logger, warn, die or echo
 #
@@ -22,7 +22,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.." || exit 1
 fail=0
 report() { printf '%s\n' "$*" >&2; fail=1; }
 
-files=(bin/omarchy-profile bin/omarchy-profile-auth bin/omarchy-profile-passwd)
+files=(bin/omarchy-profile bin/omarchy-profile-store)
 
 # file:line:content -> content, so a comment is recognisable as one.
 body() { local h=${1#*:}; printf '%s' "${h#*:}"; }
@@ -36,27 +36,25 @@ while IFS= read -r hit; do
   report "openssl passwd without -stdin: $hit"
 done < <(grep -n 'openssl passwd' "${files[@]}")
 
-# 2. a pkexec call carrying a secret must be fed by builtin printf through a
-#    pipe. Any other producer either writes the secret to disk or forks a
-#    program whose argv holds it.
+# 2. a call to the store carrying a secret must be fed by builtin printf through
+#    a pipe, and so must unix_chkpwd. Any other producer either writes the
+#    secret to disk or forks a program whose argv holds it.
 while IFS= read -r hit; do
   [[ -n $hit ]] || continue
   line=$(body "$hit")
   is_comment "$hit" && continue
-  [[ $line == *'pkexec'* ]] || continue
-  # `||` is not a pipe. A call with no stdin at all is fine; one that is piped
-  # into must be piped from the builtin.
   local_pipes=${line//||/}
-  if [[ $local_pipes == *'|'* && $line != *'printf'*'|'*pkexec* ]]; then
-    report "pkexec fed by something other than builtin printf: $hit"
+  [[ $local_pipes == *'|'* ]] || continue
+  if [[ $line != *'printf'*'|'* ]]; then
+    report "a secret fed by something other than builtin printf: $hit"
   fi
-  if [[ $line == *'/usr/bin/printf'* || $line == *'echo '*'|'*pkexec* ]]; then
-    report "pkexec fed by a forked printf or echo: $hit"
+  if [[ $line == *'/usr/bin/printf'* || $line == *'echo '*'|'* ]]; then
+    report "a secret fed by a forked printf or echo: $hit"
   fi
   if [[ $line == *'<<<'* ]]; then
-    report "pkexec fed by a here-string (which is a temp file): $hit"
+    report "a secret fed by a here-string (which is a temp file): $hit"
   fi
-done < <(grep -n 'pkexec' "${files[@]}")
+done < <(grep -nE 'STORE_BIN|CHKPWD' "${files[@]}" | grep -E '\|')
 
 # 3. a secret-shaped variable may never be an argument to anything that says
 #    something out loud.

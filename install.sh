@@ -23,23 +23,10 @@ rsync -a --delete \
   "$SRC/" "$DEST/"
 
 chmod +x "$DEST/bin/omarchy-profile" \
-         "$DEST/bin/omarchy-profile-auth" \
-         "$DEST/bin/omarchy-profile-passwd"
+         "$DEST/bin/omarchy-profile-store"
 
-# Nothing privileged happens here, deliberately.
-#
-# This script only syncs the working tree into the plugin directory, which is
-# entirely the user's. The two root-owned helpers and the polkit actions are
-# installed by Setup's `helpers`/`polkit` rows, through one pkexec call the
-# engine owns — the same path a marketplace install takes, which never runs
-# this file at all. Installing the policy here as well would mean the dev tree
-# and Setup disagreeing about what is registered: every sync would push a copy
-# of whatever this checkout happens to hold, including an old single-action
-# policy, over the one Setup just installed and is checking against.
-
-# Stale pins would make Setup's password-helpers Fix refuse for everyone on this
-# commit, so they are caught here rather than in the panel.
-"$SRC/extras/check-pins.sh" || { echo "install.sh: run extras/update-pins.sh" >&2; exit 1; }
+# Nothing privileged happens here, and nothing in the plugin is privileged
+# either: passwords live in the user's own state directory.
 
 if command -v omarchy >/dev/null; then
   omarchy plugin validate "$DEST" || { echo "install.sh: plugin failed validation" >&2; exit 1; }

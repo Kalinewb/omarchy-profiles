@@ -1,0 +1,324 @@
+#!/bin/bash
+
+# omarchy-profile-store — every profile password, face binding and attempt
+# counter, kept in the user's own state directory.
+#
+# Nothing here runs as root, and nothing here can be made to. Earlier versions
+# kept the hashes in a root-owned store behind two privileged helpers, so that
+# editing a file could not take a password off. That bought little: the check
+# that reads the hash is this plugin, which lives in a folder the user can
+# write, so anyone comfortable editing files could already switch without being
+# asked. And it cost a privileged install that a same-user program could
+# subvert. The honest model is the one the README states: a profile password
+# stops the person at the keyboard, not someone editing files.
+#
+#   profile verify <p>             stdin: the profile's password
+#   profile set    <p>             stdin: a new password, only where none exists
+#   profile change <p>             stdin: current\nnew
+#   profile clear  <p>             stdin: the profile's password
+#   profile bind   <p> <identity>  stdin: the profile's password
+#   profile unbind <p>             stdin: the profile's password
+#   profile rename <old> <new>     stdin: the profile's password
+#   profile remove <p>             stdin: the profile's password
+#
+#   owner check                    stdin: the login password
+#   owner reset  <p>               stdin: login password\nnew profile password
+#   owner set    <p>               stdin: login password\nnew profile password
+#   owner clear|unbind|remove <p>  stdin: the login password
+#   owner bind   <p> <identity>    stdin: the login password
+#   owner rename <old> <new>       stdin: the login password
+#
+# "Owner" is the account this runs as, proved by its login password. The check
+# is unix_chkpwd, Linux-PAM's own helper for exactly this: it compares against
+# /etc/shadow for the calling account only, and it is what screen lockers use.
+# It is not a privilege escalation and grants nothing; it answers yes or no.
+#
+# Secrets arrive on stdin and nowhere else: a password in argv is readable
+# through /proc/<pid>/cmdline by every process on the machine.
+#
+# One JSON object on stdout. Exit 0 ok, 1 error, 2 refused by authentication,
+# 3 busy.
+
+set -euo pipefail
+set +x
+umask 077
+unset IFS BASH_ENV ENV
+
+STATE_HOME=${XDG_STATE_HOME:-$HOME/.local/state}
+ROOT=$STATE_HOME/omarchy-profiles/secrets
+PASSWORDS=$ROOT/passwords
+IDENTITY=$ROOT/identity
+ATTEMPTS=$ROOT/attempts
+CHKPWD=/usr/bin/unix_chkpwd
+# The owner's counter lives beside the profiles' and cannot collide with one: a
+# profile name may not start with a dot.
+OWNER_KEY=.owner
+
+MODE=${1:-}
+VERB=${2:-}
+PROFILE=${3:-}
+ARG=${4:-}
+
+SECRET=""
+OLD_SECRET=""
+NEW_SECRET=""
+trap 'SECRET=""; OLD_SECRET=""; NEW_SECRET=""' EXIT
+
+ok() {
+  printf '%s\n' '{"ok":true}'
+  exit 0
+}
+
+# fail <exit code> <error> [<extra JSON, leading comma>]
+fail() {
+  printf '{"error":"%s"%s}\n' "$2" "${3:-}"
+  exit "$1"
+}
+
+valid_profile() { [[ $1 =~ ^[a-zA-Z0-9_-]{1,64}$ ]]; }
+valid_identity() { [[ $1 =~ ^[a-z0-9_-]{1,32}$ ]]; }
+
+# ------------------------------------------------------------------- stdin
+
+# Bounded, and exactly one trailing newline stripped: the caller's printf adds
+# one, and a password may legitimately end in a space.
+read_one() {
+  local LC_ALL=C blob
+  blob=$(head -c 1025; printf .) || blob="."
+  blob=${blob%.}
+  if ((${#blob} > 1024)); then fail 1 too_long; fi
+  SECRET=${blob%$'\n'}
+}
+
+# Two lines: OLD_SECRET, then NEW_SECRET.
+read_two() {
+  local LC_ALL=C blob rest
+  blob=$(head -c 2051; printf .) || blob="."
+  blob=${blob%.}
+  if ((${#blob} > 2050)); then fail 1 too_long; fi
+  OLD_SECRET=${blob%%$'\n'*}
+  rest=${blob#*$'\n'}
+  if [[ $rest == "$blob" ]]; then rest=""; fi
+  NEW_SECRET=${rest%%$'\n'*}
+}
+
+# ------------------------------------------------------------------- store
+
+ensure_store() {
+  mkdir -p "$PASSWORDS" "$IDENTITY" "$ATTEMPTS" 2>/dev/null || fail 1 store_unwritable
+  chmod 0700 "$ROOT" "$PASSWORDS" "$IDENTITY" "$ATTEMPTS" 2>/dev/null || true
+}
+
+# One comparison at a time per profile, so parallel callers cannot outrun the
+# lockout schedule.
+lock_for() {
+  local key=$1 fd=$2
+  ensure_store
+  : >>"$ATTEMPTS/$key.lock" 2>/dev/null || fail 1 store_unwritable
+  case $fd in 8 | 9) ;; *) fail 1 internal ;; esac
+  eval "exec $fd>\"\$ATTEMPTS/\$key.lock\"" || fail 1 store_unwritable
+  flock -w 5 "$fd" || fail 3 busy
+}
+
+write_file() { # write_file <path> <content>
+  local path=$1 tmp
+  tmp=$(mktemp "${path%/*}/.${path##*/}.XXXXXX") || fail 1 store_unwritable
+  printf '%s\n' "$2" >"$tmp" || { rm -f "$tmp"; fail 1 store_unwritable; }
+  chmod 0600 "$tmp"
+  mv -f "$tmp" "$path" || { rm -f "$tmp"; fail 1 store_unwritable; }
+}
+
+# ------------------------------------------------------------- the counter
+
+# Five free attempts, then 30 s doubling to 15 minutes. Assumes the lock is held.
+# Sets FAILS and UNTIL; refuses from the main shell when locked out.
+FAILS=0
+UNTIL=0
+counter_read() {
+  local key=$1 now
+  FAILS=0 UNTIL=0
+  if [[ -s $ATTEMPTS/$key ]]; then read -r FAILS UNTIL <"$ATTEMPTS/$key" || true; fi
+  [[ ${FAILS:-} =~ ^[0-9]+$ ]] || FAILS=0
+  [[ ${UNTIL:-} =~ ^[0-9]+$ ]] || UNTIL=0
+  now=$(date +%s)
+  if ((now < UNTIL)); then fail 2 rate_limited ",\"retry_after\":$((UNTIL - now))"; fi
+}
+
+counter_ok() { write_file "$ATTEMPTS/$1" "0 0"; }
+
+counter_fail() { # counter_fail <key> <error code>
+  local key=$1 code=$2 now backoff
+  now=$(date +%s)
+  FAILS=$((FAILS + 1))
+  UNTIL=0
+  if ((FAILS >= 5)); then
+    backoff=900
+    if ((FAILS - 5 <= 5)); then
+      backoff=$((30 * (2 ** (FAILS - 5))))
+      ((backoff > 900)) && backoff=900
+    fi
+    UNTIL=$((now + backoff))
+  fi
+  write_file "$ATTEMPTS/$key" "$FAILS $UNTIL"
+  if ((UNTIL > now)); then fail 2 rate_limited ",\"retry_after\":$((UNTIL - now))"; fi
+  fail 2 "$code"
+}
+
+# ------------------------------------------------------ the two questions
+
+# Is SECRET this profile's password? Assumes the profile's lock is held. No hash
+# at all is not an authentication failure, and an empty secret is not a guess.
+check_profile() {
+  local p=$1 stored salt cand
+  if [[ ! -e $PASSWORDS/$p ]]; then fail 1 no_password; fi
+  counter_read "$p"
+  if [[ -z $SECRET ]]; then fail 2 needs_password; fi
+  stored=$(<"$PASSWORDS/$p")
+  salt=${stored#*\$}
+  salt=${salt#*\$}
+  salt=${salt%%\$*}
+  cand=$(printf '%s\n' "$SECRET" | openssl passwd -6 -salt "$salt" -stdin 2>/dev/null) || cand=""
+  if [[ -n $cand && $cand == "$stored" ]]; then
+    counter_ok "$p"
+    return 0
+  fi
+  counter_fail "$p" bad_password
+}
+
+# Is SECRET the login password of the account running this? Takes the owner's
+# own lock and counter, so the login password cannot be guessed faster here
+# than a profile's can.
+check_owner() {
+  lock_for "$OWNER_KEY" 8
+  counter_read "$OWNER_KEY"
+  if [[ -z $SECRET ]]; then fail 2 needs_owner_password; fi
+  [[ -x $CHKPWD ]] || fail 1 owner_check_unavailable
+  local who
+  who=$(id -un 2>/dev/null) || fail 1 owner_check_unavailable
+  # unix_chkpwd reads the password up to a NUL. Exit 0 is a match; anything
+  # else, including a helper that refused to run, is a no.
+  if printf '%s\0' "$SECRET" | "$CHKPWD" "$who" nonull >/dev/null 2>&1; then
+    counter_ok "$OWNER_KEY"
+    return 0
+  fi
+  counter_fail "$OWNER_KEY" owner_declined
+}
+
+# Sets NEW_HASH, refusing from the main shell rather than a command
+# substitution, where a `fail` would only exit the subshell.
+NEW_HASH=""
+make_hash() {
+  if [[ -z $NEW_SECRET ]]; then fail 1 empty_password; fi
+  NEW_HASH=$(printf '%s\n' "$NEW_SECRET" | openssl passwd -6 -stdin 2>/dev/null) || NEW_HASH=""
+  case $NEW_HASH in
+  '$6$'*) ;;
+  *) fail 1 hash_failed ;;
+  esac
+}
+
+# ------------------------------------------------------------------- verbs
+
+do_rename() {
+  valid_profile "$ARG" || fail 1 bad_profile_name
+  if [[ $ARG == "$PROFILE" ]]; then fail 1 same_name; fi
+  local d moved=""
+  # Both counters, in name order, so two renames crossing cannot deadlock --
+  # and the target checked only once both are held.
+  if [[ $PROFILE < $ARG ]]; then lock_for "$PROFILE" 9; lock_for "$ARG" 8
+  else lock_for "$ARG" 8; lock_for "$PROFILE" 9; fi
+  if [[ -e $PASSWORDS/$ARG || -e $IDENTITY/$ARG ]]; then fail 1 stale_password; fi
+  "$@"
+  for d in "$PASSWORDS" "$IDENTITY" "$ATTEMPTS"; do
+    [[ -e $d/$PROFILE ]] || continue
+    if mv -n "$d/$PROFILE" "$d/$ARG" && [[ ! -e $d/$PROFILE && -e $d/$ARG ]]; then
+      moved="$moved $d"
+    else
+      for d in $moved; do mv -n "$d/$ARG" "$d/$PROFILE" 2>/dev/null || true; done
+      fail 1 rename_failed
+    fi
+  done
+  mv -n "$ATTEMPTS/$PROFILE.lock" "$ATTEMPTS/$ARG.lock" 2>/dev/null || true
+  rm -f "$ATTEMPTS/$PROFILE.lock"
+  ok
+}
+
+write_identity() {
+  valid_identity "$ARG" || fail 1 bad_identity_name
+  write_file "$IDENTITY/$PROFILE" "$ARG"
+}
+
+case $MODE in
+profile)
+  valid_profile "$PROFILE" || fail 1 bad_profile_name
+  case $VERB in
+  verify)
+    read_one; lock_for "$PROFILE" 9; check_profile "$PROFILE"; ok ;;
+  set)
+    # Nobody's authorisation: a desk without a password opens for anyone at the
+    # keyboard already. Never over an existing hash -- that is a reset.
+    read_one; NEW_SECRET=$SECRET; SECRET=""
+    lock_for "$PROFILE" 9
+    if [[ -e $PASSWORDS/$PROFILE ]]; then fail 1 already_set; fi
+    make_hash
+    # A first password starts with no face: whoever sets it binds one with it.
+    rm -f "$IDENTITY/$PROFILE" "$ATTEMPTS/$PROFILE"
+    write_file "$PASSWORDS/$PROFILE" "$NEW_HASH"
+    ok ;;
+  change)
+    read_two; SECRET=$OLD_SECRET
+    lock_for "$PROFILE" 9; check_profile "$PROFILE"; SECRET=""
+    make_hash; write_file "$PASSWORDS/$PROFILE" "$NEW_HASH"; ok ;;
+  clear)
+    read_one; lock_for "$PROFILE" 9; check_profile "$PROFILE"
+    rm -f "$PASSWORDS/$PROFILE" "$ATTEMPTS/$PROFILE" "$IDENTITY/$PROFILE"; ok ;;
+  bind)
+    valid_identity "$ARG" || fail 1 bad_identity_name
+    read_one; lock_for "$PROFILE" 9; check_profile "$PROFILE"; write_identity; ok ;;
+  unbind)
+    read_one; lock_for "$PROFILE" 9; check_profile "$PROFILE"
+    rm -f "$IDENTITY/$PROFILE"; ok ;;
+  rename)
+    read_one; do_rename check_profile "$PROFILE" ;;
+  remove)
+    read_one; lock_for "$PROFILE" 9; check_profile "$PROFILE"
+    rm -f "$PASSWORDS/$PROFILE" "$IDENTITY/$PROFILE" "$ATTEMPTS/$PROFILE"; ok ;;
+  *) fail 1 unknown_verb ;;
+  esac
+  ;;
+
+owner)
+  if [[ $VERB == check ]]; then read_one; check_owner; ok; fi
+  valid_profile "$PROFILE" || fail 1 bad_profile_name
+  case $VERB in
+  reset | set)
+    read_two; SECRET=$OLD_SECRET; OLD_SECRET=""
+    check_owner; SECRET=""
+    lock_for "$PROFILE" 9
+    if [[ $VERB == set && -e $PASSWORDS/$PROFILE ]]; then fail 1 already_set; fi
+    make_hash
+    # A reset takes the face off with the old password: anyone who could set a
+    # password could have bound a face with it.
+    rm -f "$ATTEMPTS/$PROFILE" "$IDENTITY/$PROFILE"
+    write_file "$PASSWORDS/$PROFILE" "$NEW_HASH"
+    ok ;;
+  clear)
+    read_one; check_owner; lock_for "$PROFILE" 9
+    rm -f "$PASSWORDS/$PROFILE" "$ATTEMPTS/$PROFILE" "$IDENTITY/$PROFILE"; ok ;;
+  bind)
+    valid_identity "$ARG" || fail 1 bad_identity_name
+    read_one; check_owner; lock_for "$PROFILE" 9; write_identity; ok ;;
+  unbind)
+    read_one; check_owner; lock_for "$PROFILE" 9; rm -f "$IDENTITY/$PROFILE"; ok ;;
+  rename)
+    read_one; check_owner; do_rename true ;;
+  remove)
+    read_one; check_owner; lock_for "$PROFILE" 9
+    rm -f "$PASSWORDS/$PROFILE" "$IDENTITY/$PROFILE" "$ATTEMPTS/$PROFILE"; ok ;;
+  *) fail 1 unknown_verb ;;
+  esac
+  ;;
+
+*)
+  fail 1 unknown_mode
+  ;;
+esac

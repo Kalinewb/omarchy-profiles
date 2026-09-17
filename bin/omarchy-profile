@@ -156,63 +156,62 @@ next_offset() {
 
 # ------------------------------------------------- passwords and the gate
 #
-# A profile is protected by a password of its own, not by the machine owner's.
+# A profile is protected by a password of its own, not by the machine owner's:
+# a partner has to be able to open THEIR own desk without the owner standing
+# there. The owner -- the account this runs as, proved by its login password --
+# is asked only for what is genuinely theirs: resetting a password somebody has
+# forgotten, and overriding one.
 #
-# The owner's password was the wrong question: a partner could not open THEIR
-# own desk without the owner standing there. So each profile carries its own
-# hash, and the owner is only asked for the things that are genuinely the
-# owner's — creating a password, resetting one somebody has forgotten, and
-# deciding whose face opens a profile.
+# Everything lives in the user's own state directory, kept by
+# bin/omarchy-profile-store:
 #
-# The hash is root-owned and this script is not privileged, so the gate reads
-# root-owned state and asks a root helper to do anything with it:
+#   secrets/passwords/<p>   0600   the hash
+#   secrets/identity/<p>    0600   whose face opens it
+#   secrets/attempts/<p>    0600   the rate-limit counter
 #
-#   /var/lib/omarchy-profiles/passwords/<p>   root:root 0600   the hash
-#   /var/lib/omarchy-profiles/identity/<p>    root:root 0644   whose face opens it
-#   /var/lib/omarchy-profiles/attempts/<p>    root:root 0600   the rate-limit counter
-#
-# passwords/ is 0711: execute without read. This script can ask whether a hash
-# exists for a name it already knows — which is all `hasPassword` needs — and
-# cannot list the directory or open a hash. Profile names are not secret; they
-# are file names in ~/.config/omarchy/profiles.
-#
-# What this does and does not hold. Root ownership closes exactly one hole:
-# switching a lock off by editing a setting. It also makes the password itself
-# unreadable and unforgeable. It does NOT make the gate a security boundary —
-# the gate is decided by this script, which lives in a directory the user can
-# write, and every profile is the same Unix user, so anyone willing to edit
-# files can enter any profile and read any profile's data without entering it
-# at all. It stops a person at the keyboard using the desktop as intended.
+# Nothing here runs as root. An earlier version kept these in a root-owned store
+# behind privileged helpers, so that editing a file could not take a password off.
+# It bought little -- the gate is decided by this script, in a folder the user
+# can write -- and its install was a privileged step a same-user program could
+# subvert. What the gate is, and is not, is in the README: it stops the person at
+# the keyboard using the desktop as intended, not someone editing files.
 
-ROOT_STORE=/var/lib/omarchy-profiles
-HELPER_AUTH=/usr/local/bin/omarchy-profile-auth
-HELPER_PASSWD=/usr/local/bin/omarchy-profile-passwd
-POLICY_SRC="$PLUGIN_DIR/polkit/no.kalinewb.profiles.policy"
-POLICY_DEST=/usr/share/polkit-1/actions/no.kalinewb.profiles.policy
-# The single-action file this replaces. An install that leaves it registered
-# leaves a stale action behind, so it is removed by name as well as overwritten.
-POLICY_LEGACY=/usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
+SECRETS_DIR="$STATE_DIR/secrets"
+STORE_BIN="$PLUGIN_DIR/bin/omarchy-profile-store"
+
+# What an earlier version installed as root. Never used; only detected, so Setup
+# can say how to take it off.
+LEGACY_ROOT_STORE=/var/lib/omarchy-profiles
+LEGACY_HELPERS=(/usr/local/bin/omarchy-profile-auth /usr/local/bin/omarchy-profile-passwd)
+LEGACY_POLICIES=(/usr/share/polkit-1/actions/no.kalinewb.profiles.policy
+                 /usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
+                 /usr/share/polkit-1/actions/no.graveklar.profiles.policy)
+
+legacy_root_present() {
+  local f
+  [[ -e $LEGACY_ROOT_STORE ]] && return 0
+  for f in "${LEGACY_HELPERS[@]}" "${LEGACY_POLICIES[@]}"; do [[ -e $f ]] && return 0; done
+  return 1
+}
 
 profile_locked() { jq -e '.locked // false' "$(file_for "$1")" >/dev/null 2>&1; }
 
-# The three questions the gate asks, and the only three. `hasPassword` is never
-# stored as truth anywhere the user can write: write_index puts a derived copy
-# in profiles.json for the panel to render, and this is where it comes from.
-has_password() { [[ -e $ROOT_STORE/passwords/$1 ]]; }
+# write_index puts a derived copy of this in profiles.json for the panel to
+# render; this is where it comes from.
+has_password() { [[ -e $SECRETS_DIR/passwords/$1 ]]; }
 
-# `locked` without a hash is the migration state — a profile locked under the
-# old owner-identity model. It falls back to the owner prompt and the `locks`
-# Setup row names it. In that state only, and nowhere else, editing the profile
-# JSON can remove the gate.
+# `locked` without a hash is the migration state: a profile locked under an older
+# model, or one whose password was kept in the old root store. It asks for the
+# owner's login password until it is given a password of its own, and the
+# `locks` Setup row names it.
 asks_auth() { has_password "$1" || profile_locked "$1"; }
 
-# Whose face opens a profile. Root-side, written only by the owner helper: a
-# partner with an enrolled face can no longer bind it to somebody else's
-# profile by editing a JSON file.
+# Whose face opens a profile. Written by the store only with that profile's
+# password or the owner's.
 bound_identity() {
-  [[ -r $ROOT_STORE/identity/$1 ]] || return 1
+  [[ -r $SECRETS_DIR/identity/$1 ]] || return 1
   local v
-  v=$(head -c 64 "$ROOT_STORE/identity/$1" 2>/dev/null | head -1)
+  v=$(head -c 64 "$SECRETS_DIR/identity/$1" 2>/dev/null | head -1)
   [[ -n $v ]] || return 1
   printf '%s\n' "$v"
 }
@@ -242,8 +241,7 @@ face_installed() { face_identity >/dev/null 2>&1; }
 # `journalctl --user -t omarchy-profile` shows it.
 #
 # Advisory only, and labelled as such: this goes through logger as the user, so
-# any process running as the user can write to it. The helpers' root-owned log
-# at /var/lib/omarchy-profiles/log is the record to trust.
+# any process running as the user can write to it.
 audit() { logger -t omarchy-profile -p user.notice -- "$*" 2>/dev/null || true; }
 
 # ----------------------------------------------------------------- secrets
@@ -303,65 +301,44 @@ prompt_secret() {
   return 0
 }
 
-# The one way a secret is collected for a profile, whichever side called.
+# The one way a secret is collected for a profile, whichever side called. With
+# --owner it is the login password instead of the profile's.
+OWNER=""
 collect_secret() {
   local name=$1
   SECRET=""
   if [[ -t 0 ]]; then
+    if [[ -n $OWNER ]] || { profile_locked "$name" && ! has_password "$name"; }; then
+      prompt_secret "Your login password"; return 0
+    fi
     has_password "$name" || return 0
-    prompt_secret "Password for $name (empty to authorise as the owner)"
+    prompt_secret "Password for $name"
     return 0
   fi
   read_secret
 }
 
-# ------------------------------------------------------------- the helpers
+# ------------------------------------------------------------- the store
 #
-# Two of them, because the two halves answer to different people:
-#
-#   omarchy-profile-auth    allow_active, no dialog. Everything it does is
-#                           gated by the profile's own password, which is why
-#                           it needs no prompt of its own.
-#   omarchy-profile-passwd  auth_self. The owner's operations: create a
-#                           password, reset one, bind a face, purge.
-#
-# The secret is piped in with bash's builtin printf — never /usr/bin/printf,
-# never echo from a subshell, never a here-string, all of which would put it
-# somewhere another process can read.
+# bin/omarchy-profile-store, called directly: `profile` verbs are authorised by
+# the profile's password and `owner` verbs by the login password. The secret is
+# piped in with bash's builtin printf -- never /usr/bin/printf, never echo from
+# a subshell, never a here-string, all of which would put it somewhere another
+# process can read.
 
 HELPER_OUT=""
 
 helper_call() {
   local which=$1
   shift
-  local bin rc
-  if [[ $which == owner ]]; then bin=$HELPER_PASSWD; else bin=$HELPER_AUTH; fi
-
-  if [[ ! -x $bin ]]; then
+  local mode=profile rc
+  [[ $which == owner ]] && mode=owner
+  if [[ ! -x $STORE_BIN ]]; then
     HELPER_OUT='{"error":"helper_unavailable"}'
     return 1
   fi
-  if ! command -v pkexec >/dev/null; then
-    HELPER_OUT='{"error":"helper_unavailable"}'
-    return 1
-  fi
-
-  HELPER_OUT=$(printf '%s\n' "$HELPER_STDIN" | pkexec "$bin" "$@" 2>/dev/null)
+  HELPER_OUT=$(printf '%s\n' "$HELPER_STDIN" | "$STORE_BIN" "$mode" "$@" 2>/dev/null)
   rc=$?
-
-  # pkexec's own codes, which are not the helper's. 126 is a dismissed dialog
-  # and 127 is not authorised.
-  if ((rc == 126 || rc == 127)); then
-    if [[ $which == owner ]]; then
-      HELPER_OUT='{"error":"owner_declined"}'
-      return 2
-    fi
-    # From the no-prompt helper these mean the action is missing or
-    # unannotated, so pkexec fell back to its generic admin action and there
-    # was nobody to answer it. That is never "wrong password".
-    HELPER_OUT='{"error":"helper_unavailable"}'
-    return 1
-  fi
   [[ -n $HELPER_OUT ]] || HELPER_OUT=$(jq -nc --argjson c "$rc" '{error: "failed", code: $c}')
   return $rc
 }
@@ -373,11 +350,13 @@ auth_message() {
   needs_password) echo "that profile asks for its password" ;;
   bad_password) echo "wrong password" ;;
   rate_limited) echo "too many attempts — wait ${2:-a while} seconds and try again" ;;
-  owner_declined) echo "not authorised" ;;
+  owner_declined) echo "that is not your login password" ;;
+  needs_owner_password) echo "your login password is needed" ;;
+  owner_check_unavailable) echo "unix_chkpwd is not available, so the login password cannot be checked" ;;
   no_password) echo "that profile has no password" ;;
   already_set) echo "that profile already has a password — change it, or reset it as the owner" ;;
   empty_password) echo "a password is required" ;;
-  helper_unavailable) echo "the password helpers are not installed yet — open Setup" ;;
+  helper_unavailable) echo "bin/omarchy-profile-store is missing from this copy of the plugin" ;;
   busy) echo "the profile is busy — try again in a moment" ;;
   stale_password) echo "a password is still stored under that name" ;;
   *) echo "the password check failed ($1)" ;;
@@ -459,20 +438,14 @@ auth_entry() {
   fi
 
   if profile_locked "$name"; then
-    # Locked from before passwords existed: there is no profile password to
-    # type, so the owner answers. pkcheck asks polkit for a decision without
-    # running anything as root — an authorisation question, not a privileged
-    # action, and it should not have to become one.
-    command -v pkcheck >/dev/null ||
-      refuse 1 helper_unavailable "pkcheck is not available, so the owner cannot be asked"
-    local start
-    start=$(proc_start_time)
-    if pkcheck --action-id no.kalinewb.profiles.owner \
-         --process "$$,${start:-0},$UID" --allow-user-interaction >/dev/null 2>&1; then
-      audit "entered $name by owner authorisation (locked without a password)"
-      return 0
-    fi
-    refuse 2 owner_declined "not authorised — '$name' is locked without a password of its own"
+    # Locked without a password of its own: there is nothing of the profile's to
+    # type, so the owner answers with their login password.
+    [[ -n $SECRET ]] || refuse 2 needs_owner_password "'$name' has no password of its own — your login password opens it"
+    HELPER_STDIN=$SECRET
+    helper_or_refuse owner check
+    clear_secrets
+    audit "entered $name by the owner's login password (locked without a password)"
+    return 0
   fi
 
   return 0
@@ -544,6 +517,7 @@ cmd_password() {
   for a in "$@"; do
     case $a in
     --json) JSON=1 ;;
+    --owner) OWNER=1 ;;
     -*) die "unknown option '$a'" ;;
     *) if [[ -z $verb ]]; then verb=$a; elif [[ -z $name ]]; then name=$a; fi ;;
     esac
@@ -560,16 +534,30 @@ cmd_password() {
     # The new password is typed by whoever will be using the profile, and
     # travels on stdin like every other secret. A first password needs nobody's
     # authorisation: the desk opens for anyone until it has one. Replacing one
-    # without knowing it is the owner's. A profile locked before passwords
-    # existed is sent to the owner too, so the panel never offers a way past
-    # that lock — though the lock lives in the profile's JSON, and like any
-    # setting there it is only as strong as that file (see the locks row).
-    if [[ -t 0 ]]; then prompt_secret "New password for $name"; else read_secret; fi
-    [[ -n $SECRET ]] || refuse 1 empty_password "a password is required"
-    HELPER_STDIN=$SECRET
-    local who=owner
-    if [[ $verb == set ]] && ! { profile_locked "$name" && ! has_password "$name"; }; then who=auth; fi
-    helper_or_refuse "$who" "$verb" "$name"
+    # without knowing it is the owner's, and so is giving a password to a profile
+    # locked without one -- that lock already answers to the owner.
+    #
+    # The owner's form carries two lines: the login password, then the new one.
+    local who=profile
+    if [[ $verb == reset ]] || { profile_locked "$name" && ! has_password "$name"; }; then who=owner; fi
+    if [[ $who == owner ]]; then
+      if [[ -t 0 ]]; then
+        prompt_secret "Your login password"; OLD_SECRET=$SECRET
+        prompt_secret "New password for $name"; NEW_SECRET=$SECRET
+        SECRET=""
+      else
+        read_secret_pair
+      fi
+      [[ -n $OLD_SECRET ]] || refuse 2 needs_owner_password "your login password is needed"
+      [[ -n $NEW_SECRET ]] || refuse 1 empty_password "a password is required"
+      HELPER_STDIN="$OLD_SECRET"$'\n'"$NEW_SECRET"
+      helper_or_refuse owner "$verb" "$name"
+    else
+      if [[ -t 0 ]]; then prompt_secret "New password for $name"; else read_secret; fi
+      [[ -n $SECRET ]] || refuse 1 empty_password "a password is required"
+      HELPER_STDIN=$SECRET
+      helper_or_refuse auth set "$name"
+    fi
     clear_secrets
     note_password_name "$name"
     set_locked "$name" true
@@ -597,12 +585,11 @@ cmd_password() {
 
   clear)
     collect_secret "$name"
-    if [[ -n $SECRET ]]; then
-      HELPER_STDIN=$SECRET
-      helper_or_refuse auth clear "$name"
-    else
-      HELPER_STDIN=""
+    HELPER_STDIN=$SECRET
+    if [[ -n $OWNER ]]; then
       helper_or_refuse owner clear "$name"
+    else
+      helper_or_refuse auth clear "$name"
     fi
     clear_secrets
     # Only once the helper has succeeded, and on EVERY clear path: otherwise
@@ -617,14 +604,14 @@ cmd_password() {
   esac
 }
 
-# Which face opens which profile. The binding itself is root-side; this asks
-# the no-prompt helper to write it with the profile's password, or the owner
-# helper without one.
+# Which face opens which profile. The store writes the binding with the
+# profile's password, or with the owner's login password.
 cmd_identity() {
   local verb="" name="" identity="" a
   for a in "$@"; do
     case $a in
     --json) JSON=1 ;;
+    --owner) OWNER=1 ;;
     -*) die "unknown option '$a'" ;;
     *)
       if [[ -z $verb ]]; then verb=$a
@@ -656,14 +643,13 @@ cmd_identity() {
     "$fbin" list 2>/dev/null | grep -qx -- "$identity" ||
       refuse 1 no_such_identity "no face enrolled as '$identity' — enrol it in Face Unlock first"
     # The profile's own password decides, so whoever can open the desk can
-    # choose the face that opens it too. Empty stdin — or a profile with no
-    # password to give — is the owner's override, through polkit's dialog.
+    # choose the face that opens it too. --owner is the override, with the
+    # login password.
     collect_secret "$name"
-    if [[ -n $SECRET ]] && has_password "$name"; then
-      HELPER_STDIN=$SECRET
+    HELPER_STDIN=$SECRET
+    if [[ -z $OWNER ]] && has_password "$name"; then
       helper_or_refuse auth bind "$name" "$identity"
     else
-      HELPER_STDIN=""
       helper_or_refuse owner bind "$name" "$identity"
     fi
     clear_secrets
@@ -675,11 +661,10 @@ cmd_identity() {
     [[ -n $name ]] || die "usage: omarchy-profile identity clear <profile>"
     exists "$name" || refuse 1 no_such_profile "no such profile '$name'"
     collect_secret "$name"
-    if [[ -n $SECRET ]] && has_password "$name"; then
-      HELPER_STDIN=$SECRET
+    HELPER_STDIN=$SECRET
+    if [[ -z $OWNER ]] && has_password "$name"; then
       helper_or_refuse auth unbind "$name"
     else
-      HELPER_STDIN=""
       helper_or_refuse owner unbind "$name"
     fi
     clear_secrets
@@ -3758,7 +3743,7 @@ cmd_create() {
   # A hash or a binding left over from a profile of this name that no longer
   # exists. Creating on top of it would hand the new profile a password nobody
   # present knows, so it is refused and the `stale-hashes` Setup row clears it.
-  if has_password "$name" || [[ -e $ROOT_STORE/identity/$name ]]; then
+  if has_password "$name" || [[ -e $SECRETS_DIR/identity/$name ]]; then
     # Remembered, so Setup's stale-hashes row can see a name it would otherwise
     # never learn: a hash made by calling the helper directly leaves no trace
     # this side, and the password store itself cannot be listed.
@@ -3860,22 +3845,21 @@ cmd_remove() {
   # password still emptied the profile's block — the deletion was refused and
   # the damage was done anyway. Nothing below runs unless the password (or the
   # owner) has answered.
-  if has_password "$name" || [[ -e $ROOT_STORE/identity/$name ]]; then
+  if has_password "$name" || [[ -e $SECRETS_DIR/identity/$name ]]; then
     collect_secret "$name"
-    if [[ -n $SECRET ]]; then
-      HELPER_STDIN=$SECRET
-      helper_or_refuse auth remove "$name"
-    else
-      HELPER_STDIN=""
+    HELPER_STDIN=$SECRET
+    if [[ -n $OWNER ]] || ! has_password "$name"; then
       helper_or_refuse owner remove "$name"
+    else
+      helper_or_refuse auth remove "$name"
     fi
     clear_secrets
-    audit "root-side password and identity removed with $name"
+    audit "password and face binding removed with $name"
   elif profile_locked "$name"; then
-    # Locked with no hash: the owner is the only one who can answer, exactly as
-    # entering it would.
-    SECRET=""
+    # Locked with no hash: the owner answers, exactly as entering it would.
+    collect_secret "$name"
     auth_entry "$name"
+    clear_secrets
   fi
 
   # Its windows have to go somewhere.
@@ -3951,22 +3935,21 @@ cmd_rename() {
   [[ $new =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || refuse 1 bad_name "profile names may use letters, digits, - and _ only"
   [[ $old == "$new" ]] && { answer '{"ok":true}' "'$old' already has that name"; return 0; }
   exists "$new" && refuse 1 name_taken "a profile called '$new' already exists"
-  if has_password "$new" || [[ -e $ROOT_STORE/identity/$new ]]; then
+  if has_password "$new" || [[ -e $SECRETS_DIR/identity/$new ]]; then
     note_password_name "$new"
     refuse 1 stale_password \
       "a password is still stored for a deleted profile called '$new' — clear it in Setup" \
       "$(jq -nc --arg p "$new" '{profile: $p}')"
   fi
 
-  # Step 2: the root files, before anything of ours moves.
-  if has_password "$old" || [[ -e $ROOT_STORE/identity/$old ]]; then
+  # Step 2: the password and face binding, before anything else moves.
+  if has_password "$old" || [[ -e $SECRETS_DIR/identity/$old ]]; then
     collect_secret "$old"
-    if [[ -n $SECRET ]]; then
-      HELPER_STDIN=$SECRET
-      helper_or_refuse auth rename "$old" "$new"
-    else
-      HELPER_STDIN=""
+    HELPER_STDIN=$SECRET
+    if [[ -n $OWNER ]] || ! has_password "$old"; then
       helper_or_refuse owner rename "$old" "$new"
+    else
+      helper_or_refuse auth rename "$old" "$new"
     fi
     clear_secrets
   fi
@@ -4960,239 +4943,26 @@ setup_row_hypr_probe() {
   esac
 }
 
-# ------------------------------------------------- rows: helpers and polkit
+# -------------------------------------------------- row: old root parts
 #
-# `omarchy plugin add --enable` clones files and enables the plugin. It installs
-# nothing under /usr/local/bin and registers no polkit action, so the two
-# privileged pieces this phase depends on are missing on a fresh install. These
-# two rows close that gap from the panel, with one dialog between them.
+# Versions before 1.3 kept passwords in a root-owned store behind two privileged
+# helpers and a polkit policy. Nothing uses them now, and this plugin runs
+# nothing as root, so it cannot take them off either: the row says exactly what
+# to run. The hashes in that store cannot be read without root and are not
+# carried over; each profile that had one is `locked` without a password until
+# it is given a new one, and opens for the owner's login password meanwhile.
 
-# The script the owner authorises, fixed and embedded here rather than a path
-# passed to a shell: what runs as root is this text, whatever else is on disk.
-#
-# It runs under polkit's generic exec action (auth_admin), because the annotated
-# actions it is installing do not exist yet at that point — a real chicken and
-# egg, and the reason this one call is not covered by our own policy.
-#
-# The files it installs come from the plugin checkout, which the user can
-# write — and so can any program running as the user, right up to the moment
-# root reads them, including while the authorisation dialog is on screen. So
-# the path is not trusted: root reads each file once, bounded, into a staging
-# directory only root can write, checks those bytes against a SHA-256 fixed in
-# this text, and installs the checked copy. A file that was swapped, or a
-# checkout edited since release, fails the check and nothing is installed.
-#
-# The pins are generated, not typed: extras/update-pins.sh rewrites them from
-# the files, and extras/check-pins.sh (run by install.sh) refuses a stale one.
-SYSTEM_INSTALL='
-set -euo pipefail
-umask 077
-plugin=${1:?no plugin directory}
-PIN_AUTH=589051be24be10e17a036b7d0b3e7ef2f36236ca3350a430139a24805d1e9037
-PIN_PASSWD=665bc11b3ae17e5fbe2c6feca4e360e4f79126a1cd03f1cb82efd6fd6cec45a8
-PIN_POLICY=b5891d74fcafe600fdeff1622966ddc0135b62a9303799b93a3b443fb138b423
-
-stage=$(mktemp -d /run/omarchy-profiles-install.XXXXXX)
-trap '"'"'rm -rf -- "$stage"'"'"' EXIT
-
-# Read once, as root, into root-owned staging. From here on the bytes that are
-# checked are the bytes that are installed.
-stage_file() {
-  src=$1 name=$2 pin=$3
-  timeout 10 head -c 1048577 -- "$src" >"$stage/$name" || { echo "could not read $src" >&2; exit 1; }
-  if [ "$(stat -c %s -- "$stage/$name")" -gt 1048576 ]; then echo "$src is too large" >&2; exit 1; fi
-  got=$(sha256sum -- "$stage/$name")
-  got=${got%% *}
-  if [ "$got" != "$pin" ]; then
-    echo "$name is not the version this plugin was released with" >&2
-    exit 3
-  fi
-}
-
-stage_file "$plugin/bin/omarchy-profile-auth" omarchy-profile-auth "$PIN_AUTH"
-stage_file "$plugin/bin/omarchy-profile-passwd" omarchy-profile-passwd "$PIN_PASSWD"
-stage_file "$plugin/polkit/no.kalinewb.profiles.policy" no.kalinewb.profiles.policy "$PIN_POLICY"
-
-umask 022
-install -o root -g root -m 0755 "$stage/omarchy-profile-auth" /usr/local/bin/omarchy-profile-auth
-install -o root -g root -m 0755 "$stage/omarchy-profile-passwd" /usr/local/bin/omarchy-profile-passwd
-install -o root -g root -m 0644 "$stage/no.kalinewb.profiles.policy" /usr/share/polkit-1/actions/no.kalinewb.profiles.policy
-rm -f /usr/share/polkit-1/actions/no.kalinewb.profiles.unlock.policy
-install -d -o root -g root -m 0711 /var/lib/omarchy-profiles
-install -d -o root -g root -m 0711 /var/lib/omarchy-profiles/passwords
-install -d -o root -g root -m 0755 /var/lib/omarchy-profiles/identity
-install -d -o root -g root -m 0700 /var/lib/omarchy-profiles/attempts
-[ -e /var/lib/omarchy-profiles/log ] || : >/var/lib/omarchy-profiles/log
-chown root:root /var/lib/omarchy-profiles/log
-chmod 0640 /var/lib/omarchy-profiles/log
-echo installed
-'
-
-system_install() {
-  command -v pkexec >/dev/null || die "pkexec is not available, so this cannot be installed"
-  [[ -f $PLUGIN_DIR/bin/omarchy-profile-auth && -f $PLUGIN_DIR/bin/omarchy-profile-passwd ]] ||
-    die "this copy of the plugin has no helpers in bin/ to install"
-  local out rc
-  out=$(pkexec /bin/bash -c "$SYSTEM_INSTALL" install-system "$PLUGIN_DIR" 2>&1)
-  rc=$?
-  if ((rc == 126 || rc == 127)); then
-    refuse 2 owner_declined "the install was not authorised — nothing was changed"
-  fi
-  if ((rc == 3)); then
-    [[ -n $out ]] && warn "$out"
-    refuse 1 helpers_modified \
-      "this copy of the plugin's password helpers differs from the released version, so nothing was installed — reinstall the plugin"
-  fi
-  if ((rc != 0)); then
-    [[ -n $out ]] && warn "$out"
-    refuse 1 install_failed "the privileged install did not finish"
-  fi
-  # polkit reads the actions directory itself; nothing to reload. The helper
-  # binaries are in place from the moment install(1) returns.
-  echo "installed the password helpers and the polkit actions"
-}
-
-# 1 missing, 2 wrong owner or mode, 3 content drift.
-helper_state() {
-  local name=$1 f=/usr/local/bin/$1 src="$PLUGIN_DIR/bin/$1"
-  [[ -f $f ]] || return 1
-  [[ $(stat -c '%U %G %a' "$f" 2>/dev/null) == "root root 755" ]] || return 2
-  [[ -f $src ]] || return 0
-  cmp -s "$f" "$src" || return 3
-  return 0
-}
-
-# The store's modes are what make hasPassword computable without privilege
-# while a hash stays unreadable, so a wrong mode is not cosmetic.
-root_store_state() {
-  [[ -d $ROOT_STORE ]] || return 1
-  local want
-  for want in "$ROOT_STORE 711" "$ROOT_STORE/passwords 711" "$ROOT_STORE/identity 755" "$ROOT_STORE/attempts 700"; do
-    local dir=${want% *} mode=${want#* }
-    [[ -d $dir ]] || return 1
-    [[ $(stat -c '%U %a' "$dir" 2>/dev/null) == "root $mode" ]] || return 2
-  done
-  return 0
-}
-
-setup_row_helpers() {
-  local label="Password helpers" a p store
-  helper_state omarchy-profile-auth; a=$?
-  helper_state omarchy-profile-passwd; p=$?
-  root_store_state; store=$?
-
-  if ((a == 1 && p == 1 && store == 1)); then
-    setup_row helpers "$label" needs_action \
-      "Protecting a profile with a password needs two small programs installed outside your home directory, and a root-owned place to keep the password hashes. Nothing here can be read by a program running as you — that is the point of it. Fixing asks for your password once and installs both." true
+setup_row_legacy_root() {
+  local label="Old password store"
+  if ! legacy_root_present; then
+    setup_row legacy-root "$label" ok "Nothing from the old root-owned password store is on this machine." false
     return
   fi
-  if ((a == 0 && p == 0 && store == 0)); then
-    setup_row helpers "$label" ok \
-      "Both helpers are installed and match this copy of the plugin, and the password store has the permissions it should." false
-    return
-  fi
-  local why=""
-  ((a == 1 || p == 1)) && why="one of the two helpers is missing"
-  ((a == 2 || p == 2)) && why="a helper is installed with the wrong owner or permissions"
-  ((a == 3 || p == 3)) && why="an installed helper no longer matches this copy of the plugin"
-  ((store == 1)) && why="${why:+$why, and }the password store is missing"
-  ((store == 2)) && why="${why:+$why, and }the password store has the wrong permissions"
-  setup_row helpers "$label" broken \
-    "Passwords cannot be checked as things stand: $why. Fixing reinstalls both helpers and the store from this copy of the plugin." true
-}
-
-# Does a face answer the OWNER prompt on this machine? 0 yes, 1 no, 2 cannot tell.
-face_answers_polkit() {
-  [[ -r /etc/pam.d/polkit-1 ]] || return 2
-  grep -q 'omarchy-face-verify' /etc/pam.d/polkit-1 2>/dev/null || return 1
-  local fc=/etc/omarchy-face/config
-  if [[ -e $fc ]]; then
-    [[ -r $fc ]] || return 2
-    # The gate honours this key; an absent file means its default, which is on.
-    grep -Eq '^[[:space:]]*polkit[[:space:]]*=[[:space:]]*(false|no|0)' "$fc" && return 1
-  fi
-  return 0
-}
-
-policy_annotated() {
-  command -v pkaction >/dev/null || return 2
-  pkaction --action-id no.kalinewb.profiles.auth --verbose 2>/dev/null |
-    grep -q 'exec.path.*omarchy-profile-auth' || return 1
-  pkaction --action-id no.kalinewb.profiles.owner --verbose 2>/dev/null |
-    grep -q 'exec.path.*omarchy-profile-passwd' || return 1
-  return 0
-}
-
-legacy_action_present() {
-  [[ -e $POLICY_LEGACY ]] && return 0
-  command -v pkaction >/dev/null || return 1
-  pkaction 2>/dev/null | grep -qx 'no.kalinewb.profiles.unlock'
-}
-
-# Only ever run after the annotation has been seen, so a status query can never
-# be the thing that pops an admin dialog. Any of needs_password, no_password,
-# rate_limited or busy proves the helper ran without prompting.
-polkit_probe() {
-  [[ -x $HELPER_AUTH ]] || return 1
-  local out err
-  out=$(printf '' | timeout 15 pkexec "$HELPER_AUTH" verify "$(cfg .master)" 2>/dev/null)
-  err=$(jq -r '.error // ""' <<<"$out" 2>/dev/null) || err=""
-  case $err in
-  needs_password | no_password | rate_limited | busy) return 0 ;;
-  esac
-  return 1
-}
-
-setup_row_polkit() {
-  local label="Password permissions"
-
-  if [[ ! -e $POLICY_DEST ]]; then
-    setup_row polkit "$label" needs_action \
-      "The rules that say who may check a profile password are not registered yet. Fixing installs them together with the helpers — one password prompt for both." true
-    return
-  fi
-  if ! cmp -s "$POLICY_SRC" "$POLICY_DEST"; then
-    setup_row polkit "$label" broken \
-      "The registered rules are not the ones this copy of the plugin ships. Fixing installs the current ones." true
-    return
-  fi
-  if legacy_action_present; then
-    setup_row polkit "$label" broken \
-      "An old 'enter a locked profile' rule from before per-profile passwords is still registered. It gates nothing now and should not be left behind. Fixing removes it." true
-    return
-  fi
-  policy_annotated
-  local ann=$?
-  if ((ann == 2)); then
-    setup_row polkit "$label" unknown "pkaction is not available, so what polkit has registered cannot be read." false
-    return
-  fi
-  if ((ann == 1)); then
-    setup_row polkit "$label" broken \
-      "The rules are registered without the annotation that ties them to the helpers, so checking a profile password would ask for the machine password instead. Fixing reinstalls them." true
-    return
-  fi
-  if ! polkit_probe; then
-    setup_row polkit "$label" broken \
-      "The password checker did not answer when it was asked. Fixing reinstalls the helpers and the rules." true
-    return
-  fi
-
-  face_answers_polkit
-  local face=$?
-  if ((face == 2)); then
-    setup_row polkit "$label" unknown \
-      "Face Unlock's configuration could not be read, so whether a face can answer the owner's prompt is not something this can say." false
-    return
-  fi
-  if ((face == 0)); then
-    # Reported, not fixed: Profiles does not rewire another plugin's PAM stack.
-    setup_row polkit "$label" needs_action \
-      "Face unlock answers the owner's prompt, so any program you run can reset a profile password or rebind a face while you are in front of the camera. Turn face off for polkit in Face Unlock. Everything else about passwords is set up correctly." false
-    return
-  fi
-  setup_row polkit "$label" ok \
-    "Checking a profile's password asks nobody else, and managing one asks you." false
+  local present=() f
+  [[ -e $LEGACY_ROOT_STORE ]] && present+=("$LEGACY_ROOT_STORE")
+  for f in "${LEGACY_HELPERS[@]}" "${LEGACY_POLICIES[@]}"; do [[ -e $f ]] && present+=("$f"); done
+  setup_row legacy-root "$label" needs_action \
+    "An older version installed these as root, and nothing uses them now: $(printf '%s, ' "${present[@]}" | sed 's/, $//'). Profiles no longer runs anything as root, so remove them yourself from a terminal as an administrator: rm -rf $(printf '%s ' "${present[@]}")— then set each protected profile's password again from its Manage row; until then it opens with your login password." false
 }
 
 # ------------------------------------------------------- rows: locks, hashes
@@ -5211,61 +4981,33 @@ setup_row_locks() {
   fi
   local detail=""
   [[ -n $migrating ]] &&
-    detail="Locked without a password of their own:${migrating}. They were locked under the old model, so they ask for the machine owner every time — and a lock with no password is the one thing a settings edit can still switch off. Set a password on each from its Manage row."
+    detail="Locked without a password of their own:${migrating}. They open with your login password until each is given one from its Manage row."
   [[ -n $legacy ]] &&
-    detail="${detail:+$detail } A face was bound to${legacy} in a file you can edit, which is exactly what the new binding exists to prevent, so it is ignored and removed. Bind the face again from the profile's Manage row and it will be kept where only the owner can change it."
+    detail="${detail:+$detail } A face was bound to${legacy} by an older version and is ignored. Bind it again from the profile's Manage row."
   setup_row locks "$label" needs_action "$detail" false
 }
 
-# Every name the root store might hold something under.
-#
-# passwords/ is deliberately not listable without root — the modes are what make
-# `hasPassword` answerable while a hash stays unreadable — so the names have to
-# come from everywhere else that remembers one: identity/ (which is 0755 and
-# does list), every profile, every store, every session record, and the hint
-# file this engine writes when it gives a password out. A name is a candidate,
-# never a fact: everything below checks it against the store itself.
-root_name_hints() {
-  {
-    profile_names
-    [[ -d $ROOT_STORE/identity ]] && find "$ROOT_STORE/identity" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null
-    [[ -d $ISOLATE_DIR ]] && find "$ISOLATE_DIR" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null
-    [[ -d $STATE_DIR/sessions ]] && find "$STATE_DIR/sessions" -maxdepth 1 -name '*.txt' -printf '%f\n' 2>/dev/null | sed 's/\.txt$//'
-    [[ -s $PASSWORD_NAMES ]] && cat "$PASSWORD_NAMES"
-    # And if the store ever IS listable, believe it over the hint.
-    [[ -d $ROOT_STORE/passwords ]] && find "$ROOT_STORE/passwords" -maxdepth 1 -type f -printf '%f\n' 2>/dev/null
-  } | sort -u | while read -r n; do
-    [[ -n $n ]] || continue
-    [[ $n =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || continue
-    printf '%s\n' "$n"
-  done
-}
-
-# Root files whose profile is gone.
-#
-# A hash under a name nothing else remembers is invisible until somebody tries
-# to create that profile again, which is refused with `stale_password` and
-# points here.
+# Stored passwords and face bindings whose profile is gone. They stop a new
+# profile being created under the same name.
 stale_root_names() {
-  root_name_hints | while read -r n; do
-    exists "$n" && continue
-    if has_password "$n" || [[ -e $ROOT_STORE/identity/$n ]]; then printf '%s\n' "$n"; fi
+  {
+    [[ -d $SECRETS_DIR/passwords ]] && find "$SECRETS_DIR/passwords" -maxdepth 1 -type f ! -name '.*' -printf '%f\n' 2>/dev/null
+    [[ -d $SECRETS_DIR/identity ]] && find "$SECRETS_DIR/identity" -maxdepth 1 -type f ! -name '.*' -printf '%f\n' 2>/dev/null
+  } | sort -u | while read -r n; do
+    [[ $n =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || continue
+    exists "$n" || printf '%s\n' "$n"
   done
 }
 
 setup_row_stale_hashes() {
   local label="Leftover passwords" names
-  if [[ ! -d $ROOT_STORE ]]; then
-    setup_row stale-hashes "$label" ok "There is no password store yet, so there is nothing left over in it." false
-    return
-  fi
   names=$(stale_root_names | paste -sd', ')
   if [[ -z $names ]]; then
     setup_row stale-hashes "$label" ok "Every stored password belongs to a profile that still exists." false
     return
   fi
   setup_row stale-hashes "$label" needs_action \
-    "A password or a face binding is still stored for profiles that no longer exist: $names. Nothing can use them, and they stop a new profile being created under the same name. Fixing asks for your password and deletes them." true
+    "A password or a face binding is still stored for profiles that no longer exist: $names. Nothing can use them, and they stop a new profile being created under the same name. Fixing deletes them." true
 }
 
 # ------------------------------------------------------------ status and fix
@@ -5278,8 +5020,7 @@ setup_status() {
   setup_row_indicator
   setup_row_switch
   setup_row_hypr_probe
-  setup_row_helpers
-  setup_row_polkit
+  setup_row_legacy_root
   setup_row_locks
   setup_row_stale_hashes
 
@@ -5301,7 +5042,7 @@ cmd_setup() {
   case $verb in
   status) setup_status ;;
   fix)
-    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch|hypr-reload-probe|helpers|polkit|stale-hashes>"
+    [[ -n $id ]] || die "usage: omarchy-profile setup fix <adopt|apps|keys|indicator|switch|hypr-reload-probe|stale-hashes>"
     # Every fix takes the state lock: each of them writes something a switch
     # also writes.
     lock_or_busy
@@ -5364,9 +5105,7 @@ cmd_setup() {
         exit 0
       fi
       echo "nothing to repair" ;;
-    # One call, one dialog, both rows: the helpers and the actions that make
-    # them reachable are installed together or not at all.
-    helpers | polkit) system_install ;;
+    legacy-root) die "the old root-owned files have to be removed as an administrator — the row lists them" ;;
     hypr-reload-probe)
       local probed; probed=$(hypr_reload_probe) || exit 1
       case $probed in
@@ -5379,12 +5118,11 @@ cmd_setup() {
       stale=$(stale_root_names)
       [[ -n $stale ]] || { echo "nothing left over"; return 0; }
       while read -r name; do
-        [[ -n $name ]] || continue
-        # Deleting root-owned files is the owner's to authorise, and only ever
-        # for a name that has no profile of its own.
+        [[ -n $name && $name =~ ^[a-zA-Z0-9_-]{1,64}$ ]] || continue
+        # Only ever for a name that has no profile of its own.
         exists "$name" && continue
-        HELPER_STDIN=""
-        helper_or_refuse owner remove "$name"
+        rm -f "$SECRETS_DIR/passwords/$name" "$SECRETS_DIR/identity/$name" \
+              "$SECRETS_DIR/attempts/$name" "$SECRETS_DIR/attempts/$name.lock"
         echo "cleared the leftover password for '$name'"
         n=$((n + 1))
       done <<<"$stale"
@@ -5557,26 +5295,17 @@ purge_keys_json() {
     '{managed_file: $m, hand_written: $h}'
 }
 
-# What is in the root store, counted the only way an unprivileged process can.
-#
-# passwords/ is 0711: a name can be tested with -e, but the directory cannot be
-# listed. So the names come from root_name_hints() — the same enumerator the
-# `stale-hashes` row solved this with — and each is tested against the store.
-# identity/ is 0755 and lists for itself, so it is counted directly and its
-# names are folded into the hint list by that function.
+# The stored passwords and face bindings, and whether an older version's root
+# parts are still on the machine (which purge cannot remove).
 purge_root_json() {
-  local helpers=false policy=false passwords=0 identities=0 n
-  [[ -e $HELPER_AUTH || -e $HELPER_PASSWD ]] && helpers=true
-  [[ -e $POLICY_DEST || -e $POLICY_LEGACY ]] && policy=true
-  while read -r n; do
-    [[ -n $n ]] || continue
-    has_password "$n" && passwords=$((passwords + 1))
-  done < <(root_name_hints)
-  [[ -d $ROOT_STORE/identity ]] &&
-    identities=$(find "$ROOT_STORE/identity" -maxdepth 1 -type f 2>/dev/null | wc -l)
-  jq -nc --argjson h "$helpers" --argjson p "$policy" \
-         --argjson pw "$passwords" --argjson id "${identities:-0}" \
-    '{helpers: $h, policy: $p, passwords: $pw, identities: $id}'
+  local passwords=0 identities=0 legacy=false
+  [[ -d $SECRETS_DIR/passwords ]] &&
+    passwords=$(find "$SECRETS_DIR/passwords" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)
+  [[ -d $SECRETS_DIR/identity ]] &&
+    identities=$(find "$SECRETS_DIR/identity" -maxdepth 1 -type f ! -name '.*' 2>/dev/null | wc -l)
+  legacy_root_present && legacy=true
+  jq -nc --argjson pw "${passwords:-0}" --argjson id "${identities:-0}" --argjson l "$legacy" \
+    '{helpers: false, policy: false, passwords: $pw, identities: $id, legacy_root: $l}'
 }
 
 # Everything the confirmation lists, in one document (plan-engine.md §9.1).
@@ -5905,26 +5634,16 @@ purge_finish() {
 
   # ------------------------------------------------------------------ step 7
   #
-  # After everything unprivileged, so a declined owner prompt cannot leave the
-  # rest undone — and never fatal: the exact commands to finish it with are
-  # logged, and the purge carries on.
+  # The passwords go with the state directory in step 8. An older version's
+  # root-owned parts are not this plugin's to remove -- it runs nothing as root
+  # -- so they are named in the log for an administrator to take off.
   local root=absent
-  local root_cmds=(
-    "rm -f $HELPER_AUTH $HELPER_PASSWD"
-    "rm -f $POLICY_DEST $POLICY_LEGACY"
-    "rm -rf $ROOT_STORE"
-  )
-  if [[ -e $HELPER_AUTH || -e $HELPER_PASSWD || -e $POLICY_DEST || -e $POLICY_LEGACY || -d $ROOT_STORE ]]; then
+  if legacy_root_present; then
     root=incomplete
-    if [[ -x $HELPER_PASSWD ]] && command -v pkexec >/dev/null; then
-      HELPER_STDIN=""
-      if helper_call owner purge; then root=removed; fi
-      clear_secrets
-    fi
-    if [[ $root != removed ]]; then
-      warn "the root-owned half was not removed. As root:"
-      local c; for c in "${root_cmds[@]}"; do warn "  $c"; done
-    fi
+    local f
+    warn "an older version's root-owned files are still installed; remove them as an administrator:"
+    [[ -e $LEGACY_ROOT_STORE ]] && warn "  rm -rf $LEGACY_ROOT_STORE"
+    for f in "${LEGACY_HELPERS[@]}" "${LEGACY_POLICIES[@]}"; do [[ -e $f ]] && warn "  rm -f $f"; done
   fi
 
   # ------------------------------------------------------------------ step 8
@@ -5954,36 +5673,12 @@ cmd_capabilities() {
   # the compositor's settings, and it does not wait a second to answer. Until
   # the probe has run — or on a Hyprland this machine has not been measured on
   # — it is `unknown`, which disables the Hyprland toggles with the reason.
-  local reload face=absent polkit=absent helpers=absent
+  local reload face=absent passwords=ok
   reload=$(hypr_reload_state)
-
   face_installed && face=ok
-
-  # Installed, owned by root, and the same bytes this copy of the plugin ships.
-  # Anything else is broken rather than absent: something is there and it is not
-  # what the gate is about to rely on.
-  local a p store
-  helper_state omarchy-profile-auth; a=$?
-  helper_state omarchy-profile-passwd; p=$?
-  root_store_state; store=$?
-  if ((a == 0 && p == 0 && store == 0)); then helpers=ok
-  elif ((a == 1 && p == 1)); then helpers=absent
-  else helpers=broken; fi
-
-  # Never the probe here: capabilities is a status query, and a status query
-  # does not run anything through pkexec.
-  if [[ -e $POLICY_DEST ]]; then
-    policy_annotated
-    case $? in
-    0) polkit=ok ;;
-    2) polkit=unknown ;;
-    *) polkit=broken ;;
-    esac
-    legacy_action_present && polkit=broken
-  fi
-
-  jq -nc --arg r "$reload" --arg f "$face" --arg p "$polkit" --arg h "$helpers" \
-    '{hyprland_reload: $r, face: $f, polkit: $p, helpers: $h}'
+  [[ -x $STORE_BIN && -x /usr/bin/unix_chkpwd ]] || passwords=broken
+  jq -nc --arg r "$reload" --arg f "$face" --arg p "$passwords" \
+    '{hyprland_reload: $r, face: $f, passwords: $p}'
 }
 
 ensure_config
