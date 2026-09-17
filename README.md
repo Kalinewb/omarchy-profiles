@@ -3,6 +3,8 @@
 Several desks on one machine. Each one keeps its own apps, theme, bar,
 plugins and workspaces — and hands the machine back exactly as you left it.
 
+![Profiles: several desks on one machine, each with its own apps, theme, bar and workspaces](preview.png)
+
 ## What it is for
 
 **The family PC.** The kid's desk has the browser, Minecraft and the homework
