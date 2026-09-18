@@ -96,8 +96,8 @@ Column {
       id: row
       required property var modelData
 
-      readonly property string state: String(modelData.state || "")
-      readonly property string tone: view.toneFor(row.state)
+      readonly property string rowState: String(modelData.state || "")
+      readonly property string tone: view.toneFor(row.rowState)
       readonly property bool fixable: !!modelData.fixable
       readonly property string rowId: String(modelData.id || "")
       readonly property bool running: !!view.panel && view.panel.pendingSetup === row.rowId
@@ -152,7 +152,7 @@ Column {
               var d = String(row.modelData.detail || "")
               if (row.tone === "unknown")
                 return d !== "" ? "Could not be determined — " + d : "Could not be determined."
-              return d !== "" ? d : row.state
+              return d !== "" ? d : row.rowState
             }
             color: view.dim
             font.family: view.fontFamily
@@ -165,7 +165,7 @@ Column {
         Button {
           id: fixButton
           anchors.verticalCenter: parent.verticalCenter
-          visible: row.fixable && (row.state === "needs_action" || row.state === "broken")
+          visible: row.fixable && (row.rowState === "needs_action" || row.rowState === "broken")
           enabled: !!view.panel && view.panel.pendingSetup === "" && !view.queueRunning
           text: !row.running ? "Fix"
                 : ("Fixing… " + (view.panel ? view.panel.setupElapsed : 0) + "s")
@@ -187,7 +187,7 @@ Column {
           visible: !!view.panel && view.panel.lastFixedRow === row.rowId
           anchors.verticalCenter: parent.verticalCenter
           text: "✓ Fixed"
-          color: Color.good
+          color: view.foreground
           font.family: view.fontFamily
           font.pixelSize: Style.font.caption
           font.bold: true

@@ -177,8 +177,14 @@ check_profile() {
   salt=${stored#*\$}
   salt=${salt#*\$}
   salt=${salt%%\$*}
+  # Without openssl there is no way to hash the candidate, and every correct
+  # password would read as a wrong one -- locking the owner out of their own
+  # profile through the rate limiter, with a message blaming them. It is its own
+  # answer, and it does not count as an attempt.
+  command -v openssl >/dev/null 2>&1 || fail 1 hash_unavailable
   cand=$(printf '%s\n' "$SECRET" | openssl passwd -6 -salt "$salt" -stdin 2>/dev/null) || cand=""
-  if [[ -n $cand && $cand == "$stored" ]]; then
+  if [[ -z $cand ]]; then fail 1 hash_unavailable; fi
+  if [[ $cand == "$stored" ]]; then
     counter_ok "$p"
     return 0
   fi
@@ -209,6 +215,7 @@ check_owner() {
 NEW_HASH=""
 make_hash() {
   if [[ -z $NEW_SECRET ]]; then fail 1 empty_password; fi
+  command -v openssl >/dev/null 2>&1 || fail 1 hash_unavailable
   NEW_HASH=$(printf '%s\n' "$NEW_SECRET" | openssl passwd -6 -stdin 2>/dev/null) || NEW_HASH=""
   case $NEW_HASH in
   '$6$'*) ;;

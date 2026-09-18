@@ -75,7 +75,7 @@ holding, and can ask a whole desk to close.
 already signed in where the master is — or clean, which starts with nothing and
 makes fresh state for every plugin.
 
-At the foot: **Remove Profiles from this machine**.
+At the foot: **Uninstall Profiles from this machine**.
 
 ### A profile's apps and plugins
 
@@ -153,20 +153,23 @@ remove as an administrator, and each protected profile needs its password set ag
 
 ## Removing it
 
-**Use this plugin's own screen, not Omarchy's Plugin Manager.** Plugin Manager's
-"Remove" only knows how to move a plugin's own folder aside — it has no way to
-know about the profiles, their saved files, the hidden applications or the
-workspace keys, and it will not touch any of that. Removed that way, all of it is
-left behind. If you have already done this: everything is still exactly
-where it was, run `bin/omarchy-profile purge --yes` from the backed-up copy Plugin Manager
-made (`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish
-the job properly.
+**Use this plugin's own screen, not Omarchy's Plugin Manager.** Plugin Manager
+takes the plugin off the bar properly — the folder, the bar entry, the
+enablement — but it has no way to know about your profiles, their saved files,
+the hidden applications, the per-profile browser data or the workspace keys, and
+it will not touch any of that. Removed that way, all of it is left behind, and
+`SUPER + 1..0` keeps calling a script that is gone. If you have already done
+this: nothing is lost, run `bin/omarchy-profile purge --yes` from the backed-up
+copy Plugin Manager made
+(`~/.config/omarchy/plugins/.kalinewb.profiles.bak.<timestamp>`) to finish the
+job properly.
 
 The right way: Manage → **Uninstall Profiles from this machine**. One toggle,
 **Keep a copy of my profiles** (off by default — turn it on to save everything
 to `~/omarchy-profiles-export` before anything is removed), and one button,
 **Uninstall everything**. That one click hands the machine back as your master
-profile has it: windows on other desks move onto master's workspaces, every
+profile has it — and everything that is *not* master's is discarded, which is
+what the "keep a copy" toggle is there for: windows on other desks move onto master's workspaces, every
 isolated file becomes a real file again, every hidden application comes back,
 the workspace keys and the widget go, the stored passwords go, and the plugin
 uninstalls itself. It has to run from the master profile; from anywhere
@@ -185,10 +188,29 @@ Hyprland config, that block calls this plugin and will stop working. It is
 listed on the confirmation screen, and taking it out is yours — nothing here
 edits your configuration.
 
+## What it writes
+
+Switching profiles is not a read-only act, so it is worth knowing where it
+reaches:
+
+| Path | What for |
+|---|---|
+| `~/.config/omarchy/profiles/` | one file per profile: its apps, plugins, theme, bar and workspace block |
+| `~/.config/omarchy/shell.json` | rewritten on every switch — the bar and plugin list are part of a profile |
+| `~/.local/share/applications/` | hiding an app from a profile means a `.desktop` entry of its own here, tagged as this plugin's. This is your launcher directory, so it is the widest reach the plugin has |
+| `~/.local/state/omarchy-profiles/` | isolated per-profile files, sessions, password hashes, the switch log |
+| `~/.local/share/omarchy-profiles/browser/` | per-profile browser data, when a profile names its own browser |
+| `~/.config/hypr/profiles-keys.lua` | the workspace keybinds, plus one `require` line in `hyprland.lua` |
+
+Uninstalling takes all of it back off (see Removing it, below). Nothing is
+written outside your home directory, and nothing runs as root.
+
 ## Dependencies
 
 `jq`, `hyprctl` and `openssl`, which Omarchy already has, and `unix_chkpwd` from
-Linux-PAM for the login-password override. [omarchy-face] is optional and the dependency is one way:
+Linux-PAM for the login-password override. Each is checked for rather than
+assumed: without `openssl` or `unix_chkpwd` the password controls are switched
+off and say why, instead of failing at the prompt. [omarchy-face] is optional and the dependency is one way:
 without it a profile can still have a password, and one bound to a face says so
 rather than becoming unopenable.
 

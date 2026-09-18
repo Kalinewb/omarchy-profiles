@@ -25,6 +25,11 @@ set -uo pipefail
 CONFIG_HOME="${XDG_CONFIG_HOME:-$HOME/.config}"
 STATE_HOME="${XDG_STATE_HOME:-$HOME/.local/state}"
 DATA_HOME="${XDG_DATA_HOME:-$HOME/.local/share}"
+# Per-profile browser data. Created on a switch (see apply_profile_ipc) and
+# removed with the profile, so it is named here rather than spelled out at each
+# site -- a store that is created in one place and deleted in none is how a
+# purge leaves a signed-in browser session behind.
+BROWSER_DIR="$DATA_HOME/omarchy-profiles/browser"
 
 PROFILE_DIR="$CONFIG_HOME/omarchy/profiles"
 CONFIG_FILE="$PROFILE_DIR/config.json"
@@ -44,6 +49,12 @@ THEME_NAME_FILE="$STATE_HOME/omarchy/current/theme.name"
 LOCK_FILE="$STATE_DIR/.lock"
 JOURNAL="$STATE_DIR/switch.json"
 SWITCH_LOG="$STATE_DIR/switch.log"
+# What went wrong after the caller stopped listening. Everything a detached
+# switch or purge says goes to SWITCH_LOG, where nobody looks -- so a switch
+# that failed to set the theme reported success. Warnings raised while detached
+# are collected here as well, and shown once at the end.
+NOTICES="$STATE_DIR/last-run-notices"
+DETACHED=0
 
 # Application visibility writes XDG hidden entries here. Deliberately the
 # literal path and not "$DATA_HOME/applications": Omarchy's hidden-entries.sh
@@ -57,7 +68,12 @@ APP_TAG_HIDDEN="X-OmarchyProfiles-Hidden"
 APP_TAG_MODIFIED="X-OmarchyProfiles-Modified"
 
 die() { echo "omarchy-profile: $*" >&2; exit 1; }
-warn() { echo "omarchy-profile: $*" >&2; }
+warn() {
+  echo "omarchy-profile: $*" >&2
+  # While detached, stderr is the log. Keep a copy for the person.
+  ((DETACHED)) && printf '%s\n' "$*" >>"$NOTICES" 2>/dev/null
+  return 0
+}
 
 # A --json verb prints ONE JSON document on stdout and nothing else, and every
 # word meant for a person goes to stderr. Set by the verbs that take the flag,
@@ -353,6 +369,7 @@ auth_message() {
   owner_declined) echo "that is not your login password" ;;
   needs_owner_password) echo "your login password is needed" ;;
   owner_check_unavailable) echo "unix_chkpwd is not available, so the login password cannot be checked" ;;
+  hash_unavailable) echo "openssl is not installed, so profile passwords cannot be checked or set" ;;
   no_password) echo "that profile has no password" ;;
   already_set) echo "that profile already has a password — change it, or reset it as the owner" ;;
   empty_password) echo "a password is required" ;;
@@ -2350,6 +2367,10 @@ switch_forward() {
   # Last, not after write_state: a switch that died after the restart still has
   # its do-not-disturb, idle, wallpaper and launcher set finished by recovery.
   journal_clear
+
+  # A switch that could not set the theme used to report success and say so only
+  # in a log file.
+  report_notices "Profile switched, with problems"
 }
 
 # Runs under the state lock, so a journal found here means stage 2 is dead — a
@@ -2401,6 +2422,10 @@ detach() {
   [[ -e $SWITCH_LOG ]] && size=$(stat -c %s "$SWITCH_LOG" 2>/dev/null || echo 0)
   ((size > 1048576)) && : >"$SWITCH_LOG"
   exec 0</dev/null 1>>"$SWITCH_LOG" 2>&1
+  # From here every warning is also kept for the person, and shown by
+  # report_notices when the work is done.
+  DETACHED=1
+  : >"$NOTICES" 2>/dev/null
 
   # Job control, so the job gets its own process group. NOT setsid: that execs
   # a new program, which would need a callable "already authenticated" entry
@@ -2409,6 +2434,22 @@ detach() {
   set -m
   "$@" &
   disown
+}
+
+# Say, once, what went wrong while nobody could see. Called at the end of every
+# detached job: without it a half-applied profile reports success and the user
+# finds out by noticing their theme did not change.
+report_notices() {
+  local what=$1 lines count
+  [[ -s $NOTICES ]] || return 0
+  count=$(grep -c . "$NOTICES" 2>/dev/null || echo 0)
+  ((count > 0)) || return 0
+  lines=$(head -n 4 "$NOTICES")
+  ((count > 4)) && lines+=$'\n'"and $((count - 4)) more — see $SWITCH_LOG"
+  if command -v notify-send >/dev/null 2>&1; then
+    notify-send -a Profiles -u normal "$what" "$lines" >/dev/null 2>&1 || true
+  fi
+  return 0
 }
 
 # ------------------------------------------------------------------ apply
@@ -2566,7 +2607,7 @@ apply_profile_ipc() {
     omarchy toggle idle allow-idle >/dev/null 2>&1 8>&- || warn "could not allow idling"
   fi
 
-  [[ $browser != default ]] && mkdir -p "$DATA_HOME/omarchy-profiles/browser/$browser"
+  [[ $browser != default ]] && mkdir -p "$BROWSER_DIR/$browser"
 
   local wallpaper
   wallpaper=$(jq -r '.wallpaper // ""' "$file")
@@ -2659,13 +2700,19 @@ hl_close_window() {
 # profile at once. Two copies of "which windows belong to a profile" is how one
 # of them ends up wrong, and the wrong one strands windows on a block no key can
 # reach any more.
+# Exit 2 means "Hyprland is here but would not answer", which is NOT the same
+# as "no windows to move" and must never be read as one: purge deletes the
+# workspace keys straight after this, and a window left above 10 is then
+# reachable by mouse scroll alone. The list is fetched once and reused, so the
+# count and the moves can't disagree about what was open.
 migrate_block_windows() {
-  local from=$1 span=$2 to=$3 live addr ws
+  local from=$1 span=$2 to=$3 live addr ws clients
   command -v hyprctl >/dev/null || { echo 0; return 0; }
-  live=$(hyprctl -j clients 2>/dev/null |
-    jq --argjson o "$from" --argjson s "$span" \
-       '[.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))] | length')
-  [[ $live =~ ^[0-9]+$ ]] || live=0
+  clients=$(hyprctl -j clients 2>/dev/null) || { echo 0; return 2; }
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$clients" || { echo 0; return 2; }
+  live=$(jq --argjson o "$from" --argjson s "$span" \
+       '[.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))] | length' <<<"$clients") || { echo 0; return 2; }
+  [[ $live =~ ^[0-9]+$ ]] || { echo 0; return 2; }
   ((live > 0)) || { echo 0; return 0; }
   # follow = false, so the screen does not jump through every workspace being
   # emptied on the way past.
@@ -2673,10 +2720,9 @@ migrate_block_windows() {
     [[ -n $addr ]] || continue
     hl_move_window "$((to + ws - from))" "$addr" false ||
       warn "could not move window $addr off workspace $ws"
-  done < <(hyprctl -j clients 2>/dev/null |
-    jq -r --argjson o "$from" --argjson s "$span" \
+  done < <(jq -r --argjson o "$from" --argjson s "$span" \
        '.[] | select(.workspace.id > $o and .workspace.id <= ($o + $s))
-            | "\(.address) \(.workspace.id)"')
+            | "\(.address) \(.workspace.id)"' <<<"$clients")
   echo "$live"
 }
 
@@ -3880,12 +3926,23 @@ cmd_remove() {
   master_offset=$(jq -r '.workspaces.offset // 0' "$(file_for "$master")" 2>/dev/null)
   [[ $master_offset =~ ^[0-9]+$ ]] || master_offset=0
 
-  live=$(migrate_block_windows "$offset" "$span" "$master_offset")
+  # Same rule as purge: if Hyprland is running but will not say what is open,
+  # stop before the profile's file goes. Its block's keys disappear with it, so
+  # a window left there would be reachable by mouse scroll alone.
+  local rc=0
+  live=$(migrate_block_windows "$offset" "$span" "$master_offset") || rc=$?
+  if ((rc == 2)); then
+    refuse 1 windows_unknown \
+      "Hyprland did not say what is open, so \"$name\" was left alone — nothing was removed. Try again in a moment." \
+      "$(jq -nc --arg p "$name" '{profile: $p, step: "move-windows"}')"
+  fi
   [[ ${live:-0} -gt 0 ]] && echo "moved $live window(s) to $master"
   rm -f "$(file_for "$name")"
   # Its isolated plugin state goes too. Leaving it behind would accumulate
   # silently, and one of those files is a signed-in Spotify session.
   rm -rf "${ISOLATE_DIR:?}/${name:?}"
+  # Its browser data too: that is where a signed-in session lives.
+  rm -rf "${BROWSER_DIR:?}/${name:?}"
 
   # Removing the last visible profile would leave nothing to switch to, so the
   # master comes back into the picker rather than the user being stranded with
@@ -5408,17 +5465,22 @@ purge_export() {
 # Step 1, the second half: windows above 10 that no profile's block covers.
 # They belong to nobody, and after step 5 no key reaches them, so master's
 # workspace 10 is where they go.
+# Exit 2 as above: a query that failed is not an empty screen.
 purge_move_strays() {
-  local blocks=$1 to=$2 n=0 addr ws
+  local blocks=$1 to=$2 n=0 addr ws clients
   command -v hyprctl >/dev/null || { echo 0; return 0; }
+  clients=$(hyprctl -j clients 2>/dev/null) || { echo 0; return 2; }
+  jq -e 'type == "array"' >/dev/null 2>&1 <<<"$clients" || { echo 0; return 2; }
   while read -r addr ws; do
     [[ -n $addr ]] || continue
-    hl_move_window "$((to + 10))" "$addr" false || warn "could not move window $addr off workspace $ws"
-    n=$((n + 1))
-  done < <(hyprctl -j clients 2>/dev/null | jq -r --argjson b "$blocks" '
+    # Only a window that actually moved is counted, or the figure the user is
+    # shown promises more than happened.
+    if hl_move_window "$((to + 10))" "$addr" false; then n=$((n + 1))
+    else warn "could not move window $addr off workspace $ws"; fi
+  done < <(jq -r --argjson b "$blocks" '
     .[] | .workspace.id as $w
         | select($w > 10 and (($b | any($w > .offset and $w <= (.offset + .span))) | not))
-        | "\(.address) \(.workspace.id)"')
+        | "\(.address) \(.workspace.id)"' <<<"$clients")
   echo "$n"
 }
 
@@ -5562,15 +5624,28 @@ cmd_purge() {
   # Before the keys go, never after: without profiles-keys.lua SUPER+1..0
   # address 1-10 and nothing else, so a window left on 27 is reachable by mouse
   # scroll alone.
-  local moved=0 n name off span
+  #
+  # If Hyprland is running but will not say what is open, stop here. Carrying on
+  # would delete the keys without having moved anything, and "it answered with
+  # no windows" and "it did not answer" are the same 0 to a caller that doesn't
+  # check.
+  local moved=0 n name off span rc=0
   while read -r name; do
     [[ -n $name && $name != "$master" ]] || continue
     read -r off span < <(profile_block "$name")
-    n=$(migrate_block_windows "$off" "$span" "$master_offset")
+    n=$(migrate_block_windows "$off" "$span" "$master_offset") || rc=$?
+    ((rc == 2)) && break
     moved=$((moved + n))
   done < <(profile_names)
-  n=$(purge_move_strays "$blocks" "$master_offset")
-  moved=$((moved + n))
+  if ((rc != 2)); then
+    n=$(purge_move_strays "$blocks" "$master_offset") || rc=$?
+    ((rc == 2)) || moved=$((moved + n))
+  fi
+  if ((rc == 2)); then
+    refuse 1 windows_unknown \
+      "Hyprland did not say what is open, so purge stopped before touching anything — nothing was removed. Try again in a moment." \
+      "$(jq -nc '{step: "move-windows"}')"
+  fi
   ((moved)) && echo "moved $moved window(s) into $master's workspaces" >&2
 
   # ------------------------------------------------------------------ step 3
@@ -5646,8 +5721,13 @@ purge_finish() {
     for f in "${LEGACY_HELPERS[@]}" "${LEGACY_POLICIES[@]}"; do [[ -e $f ]] && warn "  rm -f $f"; done
   fi
 
+  # Before step 8, which takes the state directory the notices live in. Step 7's
+  # "remove these as an administrator" is the one message here the user has to
+  # see, and it was going to a log that is deleted three lines below.
+  report_notices "Profiles removed, with problems"
+
   # ------------------------------------------------------------------ step 8
-  rm -rf "${PROFILE_DIR:?}" "${STATE_DIR:?}" "${RUNTIME_DIR:?}" 2>/dev/null
+  rm -rf "${PROFILE_DIR:?}" "${STATE_DIR:?}" "${RUNTIME_DIR:?}" "${BROWSER_DIR:?}" 2>/dev/null
 
   echo "finished: keys=$keys indicator=$indicator root=$root"
 
@@ -5676,7 +5756,11 @@ cmd_capabilities() {
   local reload face=absent passwords=ok
   reload=$(hypr_reload_state)
   face_installed && face=ok
+  # openssl hashes every profile password: without it they can be neither set
+  # nor checked, so the controls have to be off rather than failing at the
+  # prompt.
   [[ -x $STORE_BIN && -x /usr/bin/unix_chkpwd ]] || passwords=broken
+  command -v openssl >/dev/null 2>&1 || passwords=broken
   jq -nc --arg r "$reload" --arg f "$face" --arg p "$passwords" \
     '{hyprland_reload: $r, face: $f, passwords: $p}'
 }
