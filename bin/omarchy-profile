@@ -2209,8 +2209,10 @@ lock_or_busy() {
 # Is anyone holding it? Asked on a second descriptor and given straight back:
 # a status query must never be the thing a switch waits on.
 state_lock_free() {
-  mkdir -p "$STATE_DIR" || return 1
-  exec 9>"$LOCK_FILE" || return 1
+  # No lock file means nobody has ever taken it. Opened for reading, so asking
+  # creates nothing: Setup's status is read-only.
+  [[ -e $LOCK_FILE ]] || return 0
+  exec 9<"$LOCK_FILE" || return 1
   if flock -n 9; then exec 9>&-; return 0; fi
   exec 9>&-
   return 1
@@ -4514,7 +4516,9 @@ engine_path() {
 # --------------------------------------------------------------- row: adopt
 
 setup_row_adopt() {
-  local master; master=$(cfg .master)
+  # No config.json yet is the normal state before adoption, and status may not
+  # write one: the name is the one ensure_config would give the master.
+  local master; master=$(cfg .master); master=${master:-master}
   if exists "$master"; then
     setup_row adopt "This machine is adopted" ok \
       "'$master' is the master profile: it sees every application, and new profiles are copied from it." false
@@ -5765,7 +5769,10 @@ cmd_capabilities() {
     '{hyprland_reload: $r, face: $f, passwords: $p}'
 }
 
-ensure_config
+# Status queries read and never write: the panel polls them, including on a
+# machine where Profiles has not been set up, and a poll must not be the thing
+# that creates config.json and the state lock.
+[[ ${1:-} == setup && ${2:-status} == status || ${1:-} == capabilities ]] || ensure_config
 
 case "${1:-}" in
 catalog) write_catalog ;;
