@@ -85,6 +85,19 @@ hidden behind anything — it is not in the launcher, not in the menu, not in
 search, for as long as that desk is the one you are in. The master sees
 everything by definition, so it has no list.
 
+Some plugins are on in every desk, with a locked switch that says why:
+
+- **Ones you shared**, and Profiles itself.
+- **A clone in use**, such as Face ID's lock screen standing in for Omarchy's.
+  The clone stays on and the built-in it replaces stays off, so no desk ever
+  runs two lock screens or two menus.
+- **The notch's own**, when [the notch] is installed: it lists the plugins it
+  keeps on, and its bar, in a `suite.json` Profiles reads (the [contract]).
+  A desk saved before the notch keeps the notch as its bar.
+
+[the notch]: https://github.com/Kalinewb/omarchy-notch
+[contract]: https://github.com/Kalinewb/omarchy-notch/blob/master/SURFACE-HOSTING.md#suite-pins
+
 ### Configuration
 
 The wrench. The top is what that desk *is* — theme, wallpaper, bar, how many
