@@ -35,8 +35,7 @@ set -uo pipefail
 GREEN=$'\e[32m'; RED=$'\e[31m'; DIM=$'\e[2m'; BOLD=$'\e[1m'; RESET=$'\e[0m'
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 QMLLINT=/usr/lib/qt6/bin/qmllint
-SHELL_PATH=$(systemctl --user show-environment 2>/dev/null | sed -n 's/^OMARCHY_PATH=//p' | tail -n 1)
-: "${SHELL_PATH:=${OMARCHY_PATH:-/usr/share/omarchy}}"
+SHELL_PATH=${OMARCHY_PATH:-/usr/share/omarchy}
 [[ -x $QMLLINT ]] || { echo "lint: $QMLLINT is not installed (qt6-declarative)" >&2; exit 1; }
 [[ -d $SHELL_PATH/shell ]] || { echo "lint: no Omarchy shell at $SHELL_PATH/shell" >&2; exit 1; }
 
