@@ -408,8 +408,12 @@ Column {
         width: nameCol.width
         visible: prow.pinned || !!(prow.plugin && prow.plugin.firstParty)
         textFormat: Text.PlainText
+        // Who keeps it on, when it is not the user: the notch's suite list, or
+        // a clone standing in for a built-in (`shared` from the catalog).
         text: !prow.pinned ? "An Omarchy default"
               : prow.plugin.id === "kalinewb.profiles" ? "Always on — switching this off would leave no way back"
+              : prow.plugin.shared === "suite" ? "Always on — the notch keeps this on in every profile"
+              : prow.plugin.shared === "clone" ? "Always on — it stands in for " + String(prow.plugin.sharedFor || "a built-in") + " in every profile"
               : "Always on — on in every profile"
         color: prow.pinned ? root.accent : root.dim
         font.family: root.fontFamily

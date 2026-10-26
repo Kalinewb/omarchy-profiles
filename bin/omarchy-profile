@@ -860,8 +860,59 @@ drop_isolate_path() {
   '
 }
 
+# ------------------------------------------------------------ suite pins
+#
+# The notch ships suite.json in its own folder: the plugins it keeps on in every
+# profile, and the bar it is. Data, not code -- this knows nothing about the
+# notch beyond where the file lives, and that is Omarchy's fixed plugins folder,
+# which names a plugin's folder after its id whatever XDG_CONFIG_HOME says. The
+# file counts if it parses and `version` is a number of at least 1. Only `bar`
+# and `pinned` are read, so a later version can add fields without dropping a
+# pin. Missing or unreadable, and nothing changes: the notch is not installed.
+SUITE_FILE="$HOME/.config/omarchy/plugins/kalinewb.notch/suite.json"
+
+# {bar, pinned} as compact JSON, or nothing.
+suite_pins() {
+  [[ -s $SUITE_FILE ]] || return 0
+  jq -c 'select(type == "object" and (.version | type) == "number" and .version >= 1)
+         | {bar: (.bar | strings // ""), pinned: [.pinned | arrays // [] | .[] | strings]}' \
+    "$SUITE_FILE" 2>/dev/null
+  return 0
+}
+
+# Pinned: the user's own pins and the suite's, as one JSON array, the user's
+# first. No profile operation puts one of these into disabledPlugins.
+pinned_ids() {
+  local own suite
+  own=$(cfg -c '.pinned_plugins // []'); suite=$(suite_pins)
+  jq -nc --argjson own "${own:-[]}" --argjson suite "${suite:-null}" \
+    '$own + ((($suite // {}).pinned // []) - $own)'
+}
+
+# A clone stands in for a built-in (`clonedFrom`), and Omarchy switches the
+# built-in off when the clone goes on. A profile captured before the clone, or a
+# clean one, turned that pair round -- or left both on: two lock screens, two
+# menus. So a clone in use counts as pinned and its source stays off, with or
+# without the notch. A bar option is left out: Omarchy runs the one bar
+# `bar.id` names, and disabledPlugins does not apply to it.
+#
+# The test, for a row of `omarchy plugin list --json`.
+IN_USE_CLONE='def in_use_clone: (.clonedFrom // "") != "" and (.enabled // false)
+                               and ((.kinds // []) | index("bar") | not);'
+
+# {id: clonedFrom} for every installed clone that is not a bar option, in use or
+# not: the apply decides "in use" from the shell.json it is about to write.
+installed_clones() {
+  local out=""
+  command -v omarchy >/dev/null &&
+    out=$(omarchy plugin list --json 2>/dev/null | jq -c '
+      [ .[] | select((.clonedFrom // "") != "" and ((.kinds // []) | index("bar") | not)) ]
+      | map({key: .id, value: .clonedFrom}) | from_entries' 2>/dev/null)
+  printf '%s\n' "${out:-"{}"}"
+}
+
 plugin_is_shared() {
-  cfg -c '.pinned_plugins // []' | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
+  pinned_ids | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
 }
 
 # Pinned plugins that render in the bar.
@@ -877,7 +928,7 @@ pinned_bar_widgets() {
   # array, so a bare `.id` there indexes an array with a string and jq aborts.
   # Same mistake as write_catalog had; it fails loudly there and silently here,
   # which is why it survived — an empty list just looks like "nothing pinned".
-  jq -r --argjson pinned "$(cfg -c '.pinned_plugins // []')" '
+  jq -r --argjson pinned "$(pinned_ids)" '
     .[] | . as $p
         | select(($pinned | index($p.id)) != null)
         | select($p.kinds | index("bar-widget"))
@@ -1590,7 +1641,7 @@ cmd_shared() {
       [[ -n $p ]] || continue
       any=1
       printf '  %s\n' "$p"
-    done < <(cfg -c '.pinned_plugins // []' | jq -r '.[]')
+    done < <(pinned_ids | jq -r '.[]')
     ((any)) || echo "nothing shared"
     echo
     echo "These are in every profile's bar, cannot be switched off by a profile,"
@@ -1625,6 +1676,8 @@ cmd_shared() {
     [[ -n $id ]] || die "usage: omarchy-profile shared remove <plugin-id>"
     [[ $id == kalinewb.profiles ]] &&
       die "the profile picker stays shared — a profile that could hide it would leave no way back"
+    suite_pins | jq -e --arg id "$id" '.pinned | index($id) != null' >/dev/null 2>&1 &&
+      die "'$id' is pinned by the notch — it stays the same in every profile while the notch is installed"
     cfg_set --arg id "$id" '.pinned_plugins = ((.pinned_plugins // []) | map(select(. != $id)))' ||
       die "could not unpin '$id'"
     # Anything parked in shared_paths goes back to being isolated, with the same
@@ -1750,8 +1803,9 @@ write_index() {
 write_catalog() {
   mkdir -p "$STATE_DIR"
   command -v omarchy >/dev/null || return 0
-  local tmp pinned state meta
-  pinned=$(cfg -c '.pinned_plugins // []')
+  local tmp pinned state meta suite
+  pinned=$(pinned_ids)
+  suite=$(suite_pins)
 
   # Two sources, because neither alone is enough:
   #   plugin list --json  what is enabled, what may be disabled
@@ -1772,9 +1826,11 @@ write_catalog() {
   tmp=$(mktemp "$STATE_DIR/plugins.json.XXXXXX") || return 1
   jq -nc --argjson state "${state:-[]}" --argjson meta "${meta:-[]}" \
          --argjson declared "${declared:-[]}" \
-         --argjson pinned "${pinned:-[]}" '
+         --argjson pinned "${pinned:-[]}" --argjson suite "${suite:-null}" "$IN_USE_CLONE"'
     ($meta | map({key: .id, value: .}) | from_entries) as $by_id
-    | [ $state[] | . as $p | ($by_id[$p.id] // {}) as $m | {
+    | ($state | map({key: .id, value: (.name // .id)}) | from_entries) as $names
+    | (($suite // {}).pinned // []) as $suite_ids
+    | [ $state[] | . as $p | ($by_id[$p.id] // {}) as $m | ($p | in_use_clone) as $clone | {
         id: $p.id,
         name: ($p.name // $p.id),
         kinds: ($p.kinds // []),
@@ -1783,7 +1839,12 @@ write_catalog() {
         firstParty: ($p.firstParty // false),
         # $p.id, not .id: after `$pinned |` the input is the array, so `.id`
         # would try to index it with a string.
-        pinned: (($pinned | index($p.id)) != null),
+        pinned: ((($pinned | index($p.id)) != null) or $clone),
+        # Why it is pinned, when it is not the user'"'"'s own doing: the notch
+        # names it, or it stands in for the built-in `sharedFor` names.
+        shared: (if ($suite_ids | index($p.id)) != null then "suite"
+                 elif $clone then "clone" else "" end),
+        sharedFor: (if $clone then ($names[$p.clonedFrom] // $p.clonedFrom) else "" end),
         # State of its own outside shell.json, which is what the config page
         # offers to give every profile a copy of.
         profileData: [ $declared[] | select(.id == $p.id) | .path ],
@@ -2519,20 +2580,34 @@ apply_profile_files() {
   # them being shared, and are taken out of disabledPlugins whatever the
   # profile says. "The same in every profile" has to survive a stale capture,
   # or the guarantee is only true until the next time you save a profile.
-  local pinned_widgets pinned_all indicator=""
+  local pinned_widgets pinned_all indicator="" suite clones
   pinned_widgets=$(pinned_bar_widgets | jq -R . | jq -sc .)
-  pinned_all=$(cfg -c '.pinned_plugins // []')
+  pinned_all=$(pinned_ids)
+  suite=$(suite_pins)
+  clones=$(installed_clones)
   # The profile-aware workspace widget takes the stock one's place in the
   # layout — where the workspaces are, not appended on the right like other
   # shared widgets — and the stock one stays off, or the bar shows both.
   indicator=$(indicator_id 2>/dev/null) && indicator_pinned "$indicator" || indicator=""
 
+  # With the notch installed, two more rules, both from its suite.json:
+  #   - its bar stays. A profile saved before the notch names another bar, and
+  #     applying it would throw away the notch's settings with the bar object.
+  #   - a pinned widget the profile lacks goes back where it was live -- the
+  #     notch's menu sits in the centre -- rather than on the right.
+  # And one rule always: a clone the result uses stays on and its source off
+  # (IN_USE_CLONE above), computed from the shell.json being written, so a
+  # clone that is off now but on in this profile gets its source off as well.
   if [[ -n $bar || -n $disabled ]]; then
     (
       # shellcheck disable=SC1091
       source /usr/share/omarchy/bin/omarchy-shell-config
       commit "$NORMALIZE
-              | (if \$bar == null then . else .bar = \$bar end)
+              | . as \$live
+              | (if \$bar == null then .
+                 elif \$suite != null and \$suite.bar != \"\" and \$live.bar.id == \$suite.bar
+                      and (\$bar.id // \"omarchy.bar\") != \$suite.bar then .
+                 else .bar = \$bar end)
               | (if \$disabled == null then . else .disabledPlugins = \$disabled end)
               | .disabledPlugins = (.disabledPlugins - \$pinned_all)
               | (if \$indicator == \"\" then . else
@@ -2546,13 +2621,26 @@ apply_profile_files() {
                  end)
               | ([.bar.layout.left, .bar.layout.center, .bar.layout.right]
                  | map(map(.id)) | add) as \$present
-              | .bar.layout.right = (
-                  (\$pinned_widgets
-                   | map(. as \$id | select((\$present | index(\$id)) == null) | {id: \$id}))
-                  + .bar.layout.right)" \
+              | (\$pinned_widgets | map(. as \$id | select((\$present | index(\$id)) == null)))
+                as \$missing
+              | (if \$suite == null then [] else
+                   [\$missing[] as \$id
+                    | first(\"left\", \"center\", \"right\" | . as \$s | \$live.bar.layout[\$s] | to_entries[]
+                            | select((.value | if type == \"object\" then .id else . end) == \$id)
+                            | {id: \$id, s: \$s, i: .key, e: .value})]
+                   | sort_by(.i) end) as \$back
+              | reduce \$back[] as \$w (.; .bar.layout[\$w.s] |= .[:\$w.i] + [\$w.e] + .[\$w.i:])
+              | .bar.layout.right = ((\$missing - [\$back[].id] | map({id: .})) + .bar.layout.right)
+              | ([.bar.layout.left[], .bar.layout.center[], .bar.layout.right[], .plugins[]]
+                 | map(if type == \"object\" then .id else . end)) as \$refs
+              | [\$clones | to_entries[] | select(.key as \$k | (\$refs | index(\$k)) != null)] as \$used
+              | ([\$used[].value] - \$pinned_all) as \$sources
+              | .disabledPlugins = ((.disabledPlugins - [\$used[].key]) as \$d
+                                    | \$d + (\$sources - \$d | unique))" \
         --argjson bar "${bar:-null}" --argjson disabled "${disabled:-null}" \
         --argjson pinned_widgets "${pinned_widgets:-[]}" \
-        --argjson pinned_all "${pinned_all:-[]}" --arg indicator "$indicator"
+        --argjson pinned_all "${pinned_all:-[]}" --arg indicator "$indicator" \
+        --argjson suite "${suite:-null}" --argjson clones "${clones:-"{}"}"
     ) >/dev/null 2>&1 8>&- || warn "could not write bar/plugins to shell.json"
   fi
 
@@ -3822,10 +3910,13 @@ cmd_create() {
     # pinned ones. Everything remains individually switchable afterwards;
     # this only decides where a new profile starts.
     local all_off
+    # A clone in use stays too, or the clean profile would turn it off and put
+    # back the built-in it stands in for.
     all_off=$(omarchy plugin list --json 2>/dev/null |
-      jq -c --argjson pinned "$(cfg -c '.pinned_plugins // []')" '
+      jq -c --argjson pinned "$(pinned_ids)" "$IN_USE_CLONE"'
         [ .[] | . as $p | select(($pinned | index($p.id)) == null)
               | select(.firstParty // false | not)
+              | select(in_use_clone | not)
               | select(.canDisable // true) | .id ]') || all_off="[]"
     jq -n --arg d "Clean profile" --argjson o "$offset" --argjson off "${all_off:-[]}" '{
       _description: $d, master: false, hidden: false, icon: "󰆼",
@@ -4288,9 +4379,10 @@ cmd_plugin() {
     local category=${3:-}
     local ids
     ids=$(omarchy plugin list --json 2>/dev/null |
-      jq -r --argjson pinned "$(cfg -c '.pinned_plugins // []')" --arg cat "$category" '
+      jq -r --argjson pinned "$(pinned_ids)" --arg cat "$category" --arg verb "$verb" "$IN_USE_CLONE"'
         .[] | . as $p
         | select(($pinned | index($p.id)) == null)
+        | select($verb == "enable-all" or (in_use_clone | not))
         | select(.canDisable // true)
         | select($cat == "" or (
             if ($p.kinds | index("bar-widget")) then "Bar widgets"
@@ -4322,9 +4414,15 @@ cmd_plugin() {
     echo "$verb${category:+ ($category)} in $name" ;;
   enable | disable)
     [[ -n $id ]] || die "usage: omarchy-profile plugin $name $verb <plugin-id>"
-    if [[ $verb == disable ]] && cfg '.pinned_plugins // []' | jq -e --arg i "$id" 'index($i)' >/dev/null 2>&1; then
+    if [[ $verb == disable ]] && pinned_ids | jq -e --arg i "$id" 'index($i)' >/dev/null 2>&1; then
       die "'$id' is pinned and cannot be disabled — disabling it would leave no way back into another profile"
     fi
+    local stands_for=""
+    [[ $verb == disable ]] && command -v omarchy >/dev/null &&
+      stands_for=$(omarchy plugin list --json 2>/dev/null |
+        jq -r --arg i "$id" "$IN_USE_CLONE"'.[] | select(.id == $i and in_use_clone) | .clonedFrom' 2>/dev/null)
+    [[ -n $stands_for ]] &&
+      die "'$id' stands in for $stands_for in every profile — switching it off here would bring $stands_for back"
     local tmp; tmp=$(mktemp "$file.XXXXXX")
     if [[ $verb == disable ]]; then
       jq --arg i "$id" '.plugins = ((.plugins // {}) | .disabled = (((.disabled // []) + [$i]) | unique))' "$file" >"$tmp"
@@ -4833,7 +4931,7 @@ indicator_content() {
 }
 
 indicator_pinned() {
-  cfg -c '.pinned_plugins // []' | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
+  pinned_ids | jq -e --arg id "$1" 'index($id) != null' >/dev/null 2>&1
 }
 
 indicator_enabled() {
